@@ -1,0 +1,33 @@
+.experiment-result-chart{min-width:0;margin:20px 0}
+.result-chart-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px}
+.result-chart-toolbar p{margin:0!important;font-size:13px;color:#5e7367}
+.result-chart-toolbar>div{display:flex;gap:6px;flex-shrink:0}
+.result-chart-toolbar button{min-height:36px;min-width:36px;justify-content:center}
+.result-chart-layout{display:grid;grid-template-columns:54px minmax(0,1fr);min-width:0}
+.result-chart-axis{position:relative;height:180px;margin-top:38px;padding-right:8px;text-align:right;color:#5e7367;font-size:12px;font-variant-numeric:tabular-nums}
+.result-chart-axis span{position:absolute;left:0;right:8px;transform:translateY(-50%)}
+.result-chart-scroll{min-width:0;max-width:100%;overflow-x:auto;overscroll-behavior-x:contain;padding:3px 3px 12px;scrollbar-color:#8ea89e #eef2ed;scrollbar-width:auto}
+.result-chart-columns{position:relative;display:flex;gap:0;width:100%}
+.result-chart-grid{position:absolute;inset:35px 0 auto;height:180px;display:flex;flex-direction:column;justify-content:space-between;pointer-events:none}
+.result-chart-grid i{border-top:1px dashed #dce4df;width:100%}
+.result-chart-column{position:relative;display:flex;flex-direction:column;align-items:center;gap:5px;flex:1 0 108px;min-width:108px;max-width:180px;padding:0 5px 8px;border:1px solid transparent;border-radius:7px;background:transparent;color:#344e42;cursor:pointer;text-align:center}
+.result-chart-column:hover{background:#edf5f0}
+.result-chart-column[aria-pressed=true]{border-color:#377769;background:#eef7f2}
+.result-chart-column:focus-visible,.result-chart-scroll:focus-visible,.experiment-trial-link:focus-visible{outline:2px solid #2e7564;outline-offset:1px}
+.result-chart-plot{position:relative;display:block;height:214px;width:100%;flex:none}
+.result-chart-bar{position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:58px;max-width:80%;border-radius:5px 5px 0 0;background:#508a82}
+.result-chart-bar.baseline{background:#b8c8c6}.result-chart-bar.ablation{background:#c79c70}
+.result-chart-value{position:absolute;left:0;right:0;color:#385e4c;font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.result-chart-column>strong{font-size:13px;font-weight:600}.result-chart-column>span:not(.result-chart-plot){font-size:11px;white-space:nowrap}.result-chart-column>small{font-size:11px;color:#6d7c74}
+.result-chart-historical .result-chart-bar{opacity:.6;border:1px dashed #3f5d50}
+.result-chart-missing{position:absolute;bottom:0;left:0;right:0;color:#8b7864}
+.experiment-version-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.experiment-version-tabs button{padding:7px 12px;border:1px solid #dce4df;border-radius:6px;background:white;color:#4f665b;font-size:13px}
+.experiment-version-tabs button[aria-pressed=true]{background:#edf5f0;border-color:#508a82;color:#294e45}
+.experiment-version-tabs button:disabled{opacity:.5}
+.experiment-trial-link{display:block;border:0;background:transparent;color:#2b7162;text-align:left;padding:0;text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.experiment-trial-row{cursor:pointer}.experiment-trial-row:hover td,.experiment-trial-row[aria-selected=true] td{background:#f0f6f1}
+.experiment-trial-detail{min-width:0;border:1px solid #bcd4c7;border-radius:9px;padding:18px;margin:18px 0;background:#fbfdfb;scroll-margin-top:12px}
+.experiment-trial-detail>header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.experiment-trial-detail h4{margin:0;font-size:16px;color:#294e45;overflow-wrap:anywhere}.experiment-trial-detail>header p{margin:5px 0!important;font-size:12px;overflow-wrap:anywhere}.experiment-trial-detail pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto}.experiment-trial-detail .training-console{margin-top:16px}.experiment-trial-detail>header button{flex-shrink:0}
+.console-parameters{margin:12px 16px;padding:12px;border:1px solid #d8e5dd;border-radius:6px;background:#f7faf7;color:#294e45}.console-parameters summary{cursor:pointer}.console-parameters pre{max-height:300px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+@media(max-width:600px){.result-chart-toolbar{align-items:flex-start}.result-chart-layout{grid-template-columns:42px minmax(0,1fr)}.experiment-trial-detail{padding:10px}.experiment-trial-detail>header{flex-wrap:wrap}.experiment-result-chart .chart-legend{flex-wrap:wrap}.result-chart-axis{font-size:10px}}

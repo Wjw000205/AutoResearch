@@ -1,0 +1,42 @@
+.inline-info.architecture-delivery-status {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  padding: 14px 16px;
+  border: 1px solid;
+  border-radius: 8px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+.inline-info.architecture-delivery-warning {
+  background: #fff7e8;
+  border-color: #e2cda5;
+  color: #815318;
+}
+.inline-info.architecture-delivery-info {
+  background: #edf5f8;
+  border-color: #c9dce5;
+  color: #34556a;
+}
+.inline-info.architecture-delivery-status > strong {
+  display: block;
+  color: inherit;
+}
+.inline-info.architecture-delivery-status > p,
+.inline-info.architecture-delivery-status > details {
+  margin: 8px 0 0;
+  color: inherit;
+}
+.inline-info.architecture-delivery-status summary {
+  cursor: pointer;
+  color: inherit;
+}
+.inline-info.architecture-delivery-status pre {
+  max-width: 100%;
+  max-height: 320px;
+  margin: 8px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: inherit;
+}

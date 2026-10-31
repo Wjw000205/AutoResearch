@@ -1,0 +1,17 @@
+.consensus-status { margin: 18px 0; padding: 22px 24px; border-left: 3px solid var(--accent, #86a867); }
+.consensus-status-heading, .consensus-status-heading > div { display: flex; align-items: center; gap: 12px; }
+.consensus-status-heading { justify-content: space-between; flex-wrap: wrap; }
+.consensus-status-heading h3 { margin: 3px 0 8px; font-size: 18px; }
+.consensus-status-heading small { color: #667767; }
+.consensus-status-metrics, .consensus-role-states { display: flex; gap: 14px 24px; flex-wrap: wrap; margin: 16px 0; }
+.consensus-status-metrics > span, .consensus-role-states > span { font-size: 13px; color: #667767; }
+.consensus-status-metrics strong, .consensus-role-states strong { color: #324638; margin-left: 8px; }
+.consensus-role-states > span { border: 1px solid #dce5d5; padding: 7px 10px; border-radius: 5px; }
+.consensus-request { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.consensus-request small { color: #6c7a6c; }
+.consensus-blockers { background: #faf7ef; padding: 12px; border-radius: 6px; }
+.consensus-blockers summary { cursor: pointer; font-size: 13px; color: #8b632f; }
+.consensus-blockers li { font-size: 13px; margin: 8px 0; overflow-wrap: anywhere; }
+.consensus-next { font-size: 13px; border-top: 1px solid #e2e8dc; margin-top: 16px; padding-top: 14px; }
+.consensus-ready { border-left-color: #5f9641; }
+@media (max-width: 600px) { .consensus-status { padding: 16px; } .consensus-status-heading .btn { width: 100%; justify-content: center; } }
