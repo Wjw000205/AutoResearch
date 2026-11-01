@@ -1,0 +1,21 @@
+.session-token-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin: 12px 0;
+}
+.session-token-grid dt { color: #6c7972; font-size: 13px; line-height: 1.5; }
+.session-token-grid dd { margin: 3px 0 0; color: #243e34; font-size: 16px; font-variant-numeric: tabular-nums; }
+.artifact-row:has(.session-token-grid) { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; align-items: center; }
+.artifact-row:has(.session-token-grid) > button { justify-self: end; }
+.reasoning-usage-label { margin: 12px 0 0; color: #6c7972; font-size: 13px; }
+.reasoning-request-detail { min-width: 0; padding: 16px; border: 1px solid #dbe5d7; border-radius: 6px; background: #f8faf5; }
+.reasoning-request-detail h4 { margin: 0 0 12px; }
+.reasoning-request-detail details { margin-top: 16px; }
+.reasoning-request-detail summary { cursor: pointer; }
+.reasoning-request-detail pre { max-height: 420px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #fff; border: 1px solid #e2e8dc; border-radius: 4px; }
+@media (max-width: 1000px) {
+  .session-token-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .artifact-row:has(.session-token-grid) { grid-template-columns: minmax(0, 1fr); }
+  .artifact-row:has(.session-token-grid) > button { justify-self: end; }
+}

@@ -1,0 +1,5 @@
+.reference-upload-status { min-height: 1.5em; margin: 6px 0; color: #718562; font-size: .8667rem; overflow-wrap: anywhere; }
+.reference-upload-status:empty { display: none; }
+.reference-chips > span { flex-wrap: wrap; }
+.reference-chips .reference-rag-status { padding: 2px 5px; background: #f7f9f3; border-radius: 3px; color: #667a57; font-size: .8rem; }
+.reference-chips button:disabled { opacity: .45; cursor: default; }

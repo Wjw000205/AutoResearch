@@ -1,0 +1,25 @@
+.innovation-view { padding: 26px; }
+.innovation-view > header { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 22px; }
+.innovation-view h3, .innovation-view h4 { margin: 0 0 10px; }
+.innovation-view p { line-height: 1.75; margin: 8px 0; }
+.innovation-progress { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; background: #edf2e7; padding: 12px 16px; border-radius: 7px; margin-bottom: 20px; }
+.innovation-candidates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.innovation-candidates article { padding: 18px; border: 1px solid #dde2d8; border-radius: 9px; min-width: 0; }
+.innovation-candidates article.selected { border-color: #64815a; background: #f6f8f2; }
+.innovation-card-heading { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 18px; }
+.innovation-card-heading span, .innovation-comparisons h4 { display: flex; align-items: center; gap: 5px; }
+.innovation-view dl { margin: 0; }
+.innovation-view dl > div { margin: 12px 0; }
+.innovation-view dt { font-size: 12px; color: #68775f; margin-bottom: 5px; }
+.innovation-view dd { margin: 0; line-height: 1.7; overflow-wrap: anywhere; white-space: pre-wrap; }
+.innovation-view details { margin-top: 12px; }
+.innovation-view summary { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.innovation-view pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 480px; overflow-y: auto; }
+.innovation-comparisons { margin-top: 26px; }
+.innovation-comparisons article { padding: 16px 0; border-bottom: 1px solid #e3e7df; }
+.innovation-ranking { font-size: 12px; color: #68775f; }
+.innovation-selection { margin-top: 24px; padding: 20px; border-left: 3px solid #64815a; background: #f2f5ed; }
+.recovery-original { margin-top: 10px; font-size: 12px; }
+.recovery-original pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 1050px) { .innovation-candidates { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .innovation-view { padding: 16px; } }

@@ -1,0 +1,51 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies and build products
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+
+# Local research state and execution artifacts
+.autoresearch/
+data/
+experiments/
+output/
+outputs/
+logs/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+tmp/
+temp/
+%SystemDrive%/
+
+# Tests and validation artifacts omitted from this source publication
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+playwright-report/
+test-results/
+.t-*/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

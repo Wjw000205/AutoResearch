@@ -1,0 +1,2 @@
+.tool-event-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0; font-size: 12px; color: var(--text-secondary, #6b7280); }
+.tool-event-summary code { color: var(--text-primary, #27364b); overflow-wrap: anywhere; padding: 3px 6px; border-radius: 4px; background: var(--surface-muted, #f1f5f9); }
