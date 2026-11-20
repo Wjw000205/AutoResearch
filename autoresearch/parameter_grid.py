@@ -88,6 +88,11 @@ def _params_at(evidence, grid, value):
 
 
 def same_seed_score(comparison, seed):
+    if comparison.get('own_control_eligible'):
+        rows = [r for r in comparison['own_observations'] if r['seed'] == seed]
+        if len(rows) == 1 and math.isfinite(rows[0]['proposed']):
+            return {'proposed_score':rows[0]['proposed'], 'baseline_score':None, 'relative_improvement':None}
+        return None
     pairs = [p for p in comparison.get('pairs', []) if p['seed'] == seed]
     if not comparison.get('comparable') or len(pairs) != 1:
         return None
@@ -202,6 +207,10 @@ def reviewed_lineage(evidence, selected_id, reference_id):
 
 def stability_scores(evidence, selected_id, reference_id):
     """Never rank a new single-seed candidate against an old multi-seed mean."""
+    from .combination_validation import stability_scores as combination_scores
+    combined = combination_scores(evidence, selected_id, reference_id)
+    if combined is not None:
+        return combined
     grids = reviewed_lineage(evidence, selected_id, reference_id)
     if not grids:
         if any(u.get('parameter_grid') for u in evidence['units']):
@@ -234,6 +243,12 @@ def certified_selection(engine, run_id):
         return None
     decision = engine.store.get('experiment_decisions', saved['body']['decision_id'])
     evidence = engine.store.get('experiment_evidence', decision['evidence']['id'])['summary']
+    combined = evidence.get('combination_validation') or {}
+    if combined.get('status') == 'complete' and combined.get('final_pair'):
+        pair = combined['final_pair']
+        return {'certificate_id': saved['id'], 'unit_id': pair['unit_id'], 'task_id': combined['task_id'],
+                'validation_seed': combined['validation_seed'], 'validation_seeds': [combined['validation_seed']],
+                'trial_ids': pair['trial_ids'], 'records': [r for r in evidence['records'] if r['id'] in pair['trial_ids']]}
     if not any(u.get('parameter_grid') for u in evidence['units']):
         return None  # Do not reinterpret historical selections.
     assessment = saved['body']['assessment']
@@ -316,9 +331,15 @@ def view(store, run_id, trials, *, truncated=False, plan=None):
                 or decision['proposal_sha256'] != body['proposal_sha256']):
             return {**result, 'status': 'unavailable', 'reason': '参数网格批准记录待复核，暂不展示选参结论。'}
         groups.setdefault(grid['id'], []).append(body)
+    return _saved_grid_rows(result, groups, trials, truncated)
+
+
+def _saved_grid_rows(result, groups, trials, truncated):
+    from .research_cycle import validation_summary
     for bodies in groups.values():
         grid, source = bodies[0]['unit']['parameter_grid'], bodies[0]['unit']['jobs']
         binding = grid['binding']
+        cycle = binding['cycle']
         evidence = {'units': [], 'job_parameters': {}, 'comparisons': {}, 'ledger': {'jobs': []}}
         from .tuning_scope import value_key, get
         from .tuning_candidates import changed
@@ -343,7 +364,10 @@ def view(store, run_id, trials, *, truncated=False, plan=None):
                         target = target[part]
                     target[parts[-1]] = value
                 found = [r for r in trials if not r.get('superseded')
-                         and r.get('research_cycle', 1) == cycle and sha(r.get('params', {})) == sha(params)]
+                         and (r.get('research_cycle') or 1) == cycle and r.get('code_revision') == binding['revision']
+                         and r.get('code_sha256') == binding['code_sha256']
+                         and r.get('experiment_plan_sha256') == binding['plan_sha256']
+                         and sha(r.get('params', {})) == sha(params)]
                 if not found and value_key(value) not in approved_values:
                     continue
                 name = (found[0]['id'] if len(found) == 1 else
@@ -357,6 +381,7 @@ def view(store, run_id, trials, *, truncated=False, plan=None):
                             or row.get('code_sha256') != binding['code_sha256']
                             or row.get('experiment_plan_sha256') != binding['plan_sha256']
                             or row.get('bundle_sha256') != binding.get('bundle_sha256')
+                            or not row.get('evaluation_errors_complete', True) or not row.get('metrics_complete', True)
                             or row.get('evaluation_errors') or row.get('params_complete') is False):
                         state = 'invalid'
                     if state == 'completed':

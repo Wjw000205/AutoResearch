@@ -23,6 +23,15 @@ GUIDANCE = ('本轮按用户要求将既有方法迁移至指定真实数据集�
     '整体主指标改善即可，辅助指标作为取舍分析；执行、公平性、数据泄漏和资源检查仍须通过。'
     '旧数据专属诊断只在新数据上有明确可计算定义时保留。'
     '完整历史和代码按证据引用读取，不复制运行输出或全部历史上下文。')
+PAPER_GUIDANCE = ('本轮显式重开模型输入输出适配，复用历史研究方法。外部基线专用论文原始成绩；'
+    '只编排 proposed 和本方法的自有消融，baseline_params 只描述对照任务维度。'
+    '按引用表的输入候选、输出任务、评估划分、尺度与汇总规则重新设计并独立审核。'
+    '仅用自有验证集选参。未报告的条件记未知，待核实前不计算可比提升，也不能将论文成绩写为本地试验。')
+
+
+from .experiment_configuration import TUNING_GUIDANCE as YAML_CONFIGURATION_GUIDANCE
+GUIDANCE += '\n' + YAML_CONFIGURATION_GUIDANCE
+PAPER_GUIDANCE += '\n' + YAML_CONFIGURATION_GUIDANCE
 
 
 def _get_field(store, collection, key, field):
@@ -121,7 +130,7 @@ def review_scope(store, run_id):
         'datasets': [target['dataset'] for target in record['request']['targets']],
         'operator_instruction': receipt['body']['instruction'],
         'scope': 'experiment_configuration' if receipt['body']['entry'] == 'experiments' else 'existing_method_new_data_protocol',
-        'guidance': GUIDANCE + ' 原方案的数据集和试点参数由本轮指定数据及其来源协议替换；'
+        'guidance': (PAPER_GUIDANCE if record['request'].get('paper_reference') else GUIDANCE) + ' 原方案的数据集和试点参数由本轮指定数据及其来源协议替换；'
             '原方法共识继续有效。评议本次数据适配的增量及受影响部分，复用未变更的模块定义与代码。'}}
 
 
@@ -135,7 +144,9 @@ def adapt(engine, run_id, *, transition_id, instruction):
             or run_id in getattr(engine, 'tasks', {}) and not engine.tasks[run_id].done()):
         raise ValueError('需要已停止的数据切换与明确的适配指令。')
     prior = route(engine.store, run_id)
-    if prior and prior['body']['entry'] == 'experiments':
+    reference = record['request'].get('paper_reference')
+    entry = 'design' if reference else 'experiments'
+    if prior and prior['body']['entry'] == entry:
         return prior
     if engine.store.active_reasoning(run_id, {'running', 'queued', 'starting',
             'turn_start_dispatched', 'thread_start_dispatched', 'thread_resume_dispatched'}):
@@ -159,7 +170,7 @@ def adapt(engine, run_id, *, transition_id, instruction):
         if fingerprint:
             retained.append(record_archive.save(engine.store, run_id, fingerprint))
     body = {'transition_id': record['id'], 'transition_sha256': record['sha256'],
-        'cycle': record['cycle'], 'entry': 'experiments', 'protocol': 2, 'instruction': instruction,
+        'cycle': record['cycle'], 'entry': entry, 'protocol': 2, 'instruction': instruction,
         'source_consensus_sha256': sha(consensus), 'source_cycle': record['request']['source_cycle'],
         'method_cycle': consensus.get('cycle', 1),
         'previous_route_records': retained}
@@ -170,14 +181,14 @@ def adapt(engine, run_id, *, transition_id, instruction):
     # existing method only; fresh data/protocol/code approvals remain mandatory.
     engine.store.batch([
         (ROUTES, identity, receipt), ('consensus', run_id, consensus),
-        ('programs', run_id, _archived(record, 'programs')),
-        ('runs', run_id, {**run, 'stage': 'experiments', 'status': 'paused', 'error': None,
+        *([('programs', run_id, _archived(record, 'programs'))] if not reference else []),
+        ('runs', run_id, {**run, 'stage': entry, 'status': 'paused', 'error': None,
             'state': {**run['state'], 'dataset_adaptation': identity, 'dataset_configuration_protocol': 1}, 'updated_at': now()}),
         ('graph_status', run_id, {'id': run_id, 'run_id': run_id, 'cycle': record['cycle'],
-            'node': 'experiments', 'status': 'waiting', 'waiting_for': 'dataset_configuration', 'updated_at': now()}),
+            'node': entry, 'status': 'waiting', 'waiting_for': 'model_adaptation_review' if reference else 'dataset_configuration', 'updated_at': now()}),
     ], [(collection, key) for collection, key in obsolete if collection != 'consensus'])
     engine.store.event(run_id, 'research.dataset_adaptation',
-        '复用原方法与模型实现，在实验阶段配置数据集并检查数据接口；尚无新数据测量。',
+        '已按论文结果表重开模型适配设计，原实现与实验已归档。' if reference else '复用原方法与模型实现，在实验阶段配置数据集并检查数据接口；尚无新数据测量。',
         {'adaptation_id': identity, 'source_cycle': body['source_cycle'], 'cycle': record['cycle']})
     return receipt
 
@@ -243,7 +254,7 @@ def preview(engine, run_id, targets):
         'scientific_approval': False, 'execution_authorized': False}
 
 
-def prepare(engine, run_id, *, snapshot_id, targets, instruction):
+def prepare(engine, run_id, *, snapshot_id, targets, instruction, paper_reference=None):
     """Called under the lifecycle lock; archive before changing active pointers."""
     from . import record_archive
     if not isinstance(instruction, str) or not 1 <= len(instruction.strip()) <= 4000:
@@ -251,7 +262,8 @@ def prepare(engine, run_id, *, snapshot_id, targets, instruction):
     identity = f'{run_id}:dataset-transition:{snapshot_id}'
     existing = engine.store.get(COLLECTION, identity)
     if existing:
-        if existing['request']['targets'] != targets or existing['request']['operator_instruction'] != instruction:
+        if (existing['request']['targets'] != targets or existing['request']['operator_instruction'] != instruction
+                or existing['request'].get('paper_reference') != paper_reference):
             raise ValueError('同一切换快照不能对应不同请求。')
         if not route(engine.store, run_id):
             adapt(engine, run_id, transition_id=identity, instruction=instruction)
@@ -263,6 +275,13 @@ def prepare(engine, run_id, *, snapshot_id, targets, instruction):
     if snapshot(engine, run_id, targets) != value:
         raise ValueError('归档期间任务状态发生变化，保留原入口。')
     request = {**value, 'operator_instruction': instruction}
+    if paper_reference:
+        from .paper_baselines import read, MODE, datasets
+        cited = read(engine.store, run_id, paper_reference)
+        if sorted(t['dataset'] for t in targets) != datasets(cited):
+            raise ValueError('Paper reference does not cover the requested dataset')
+        request['paper_reference'] = paper_reference
+        request['target_config'] = {**value['target_config'], 'baseline_mode': MODE, 'combination_validation_protocol':3}
     record = {'id': identity, 'run_id': run_id, 'cycle': value['next_cycle'],
         'request': request, 'sha256': sha(request), 'archives': archives, 'created_at': now(),
         'graph_thread_id': identity, 'scientific_approval': False, 'execution_authorized': False}
@@ -284,8 +303,11 @@ def prepare(engine, run_id, *, snapshot_id, targets, instruction):
         _put(engine.store, db, COLLECTION, identity, record)
         for source in value['sources']:
             db.execute('DELETE FROM records WHERE collection=? AND key=?', (source['collection'], source['key']))
-        run.update(status='paused', stage='experiments', error=None, config=value['target_config'],
-            state={'research_cycle': value['next_cycle'], 'dataset_transition': identity}, updated_at=now())
+        task_policies = {k:run['state'][k] for k in ('experiment_attempt_policy','host_review_token_policy',
+            'full_acceptance_check_budget','parallel_host_code_review','dataset_optimization_protocol',
+            'agent_bayesian_batch_from_cycle') if paper_reference and k in run.get('state', {})}
+        run.update(status='paused', stage='design' if paper_reference else 'experiments', error=None, config=request['target_config'],
+            state={**task_policies, 'research_cycle': value['next_cycle'], 'dataset_transition': identity}, updated_at=now())
         _put(engine.store, db, 'runs', run_id, run)
         _put(engine.store, db, 'graph_status', run_id, {'id': run_id, 'run_id': run_id,
             'cycle': value['next_cycle'], 'node': 'experiments', 'status': 'waiting',
@@ -337,6 +359,13 @@ async def context(engine, run_id, stage, *, targets=None):
         packet['existing_implementation'] = {key: program[key] for key in
             ('code_sha256', 'artifact_id', 'spec_hash', 'delivery_hash', 'delivery_id',
              'codex_workspace', 'implementation_document_id', 'implementation_document_sha256') if key in program}
+        if program.get('dataset_runtime_id'):
+            packet['prior_dataset_setup_id'] = program['dataset_runtime_id']
+    if request.get('paper_reference'):
+        from .paper_baselines import read
+        packet.update(guidance=PAPER_GUIDANCE, scope='paper_protocol_model_adaptation',
+                      paper_reference=request['paper_reference'],
+                      paper_benchmark=read(engine.store, run_id, request['paper_reference']))
     return {'dataset_transition': packet, 'dataset_transition_context_protocol': 1,
             **review_scope(engine.store, run_id)}
 
@@ -346,6 +375,17 @@ def validate_design(engine, run_id, design, packet):
         return
     expected = {row['target']['dataset']: row['dataset_assets'] for row in packet['datasets']}
     tasks = design.get('benchmark_tasks') or [design]
+    if packet.get('paper_reference'):
+        paper = packet['paper_benchmark'].get('protocol', {})
+        if design.get('paper_reference') != packet['paper_reference'] or design.get('baseline_mode') != 'paper_reported':
+            raise ValueError('New design must retain the reviewed external reference and prohibit external baseline jobs')
+        if 'input_lengths' in paper and 'output_lengths' in paper:
+            from .benchmark_matrix import dimensions
+            required = {(l, h) for l in paper['input_lengths'] for h in paper['output_lengths']}
+            actual = {(dimensions(t).get('input_length'), dimensions(t).get('output_length')) for t in tasks}
+            if required != actual:
+                raise ValueError(f'论文窗口矩阵需要 {len(required)} 项，已提交 {len(tasks) if design.get("benchmark_tasks") else 0} 项；'
+                                 f'缺少 {sorted(required-actual, key=str)}；额外 {sorted(actual-required,key=str)}。')
     if {task.get('dataset') for task in tasks} != set(expected):
         raise ValueError('数据集切换设计必须覆盖全部指定数据集。')
     for task in tasks:

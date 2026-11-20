@@ -20,19 +20,22 @@ TASK_COLLECTIONS = frozenset({
     'experiment_sources', 'experiment_analyses', 'experiment_cleanups', 'performance_policies', 'performance_policy_archives', 'saved_runtime_audits',
     'rapid_experiment_revisions', 'experiment_memories', 'rapid_continuations', 'rapid_continuation_archives',
     'experiment_protocols', 'experiment_original_receipts', 'optimization_loops',
-    'training_adjustments',
+    'training_adjustments', 'scientific_report_reviews',
     'training_review_recoveries', 'tuning_progress_recoveries', 'yaml_review_successors',
     'dataset_assets', 'dataset_downloads', 'dataset_transitions', 'dataset_transition_routes',
+    'dataset_configuration_retry_authorizations',
     'comparison_protocol_repairs',
-    'code_layout_relocations', 'codex_acceptance_replays', 'code_repair_packets',
+    'code_layout_relocations', 'codex_acceptance_replays', 'code_repair_packets', 'code_repair_read_followups',
+    'code_review_batches', 'code_review_redispatches',
     'implementation_source_supplements',
     'implementation_acceptance_budgets', 'implementation_review_clock_adjustments',
+    'implementation_evidence_tasks', 'harness_local_activity', 'source_identity_receipts',
     'steps', 'cycle_steps', 'research_cycles', 'revision_plans', 'consensus',
     'proposal_reviews', 'debate_inputs', 'innovation_sessions', 'innovation_attempts',
     'innovation_readings', 'innovation_material_archives', 'handoffs', 'handoff_inputs',
-    'handoff_progress', 'decisions', 'operator_resumes', 'run_control_requests', 'programs', 'selections',
+    'handoff_progress', 'decisions', 'operator_resumes', 'run_control_requests', 'task_restarts', 'execution_intents', 'programs', 'selections',
     'tuning_plans', 'experiment_plans', 'protocol_reviews', 'implementation_routing_recoveries', 'experiment_restarts', 'experiments',
-    'codex_workflows', 'implementation_document_drafts', 'architecture_diagrams', 'codex_checks', 'codex_check_attempts', 'experiment_attempts', 'artifacts', 'stage_contexts', 'literature_inputs', 'literature_notes',
+    'codex_workflows', 'implementation_whole_review_migrations', 'independent_full_review_notes', 'implementation_document_drafts', 'architecture_diagrams', 'codex_checks', 'codex_check_attempts', 'experiment_attempts', 'artifacts', 'stage_contexts', 'literature_inputs', 'literature_notes',
     'run_evidence', 'paper_rag_reuses', 'paper_source_bindings', 'pdf_citations', 'graph_status', 'contexts', 'context_snapshots', 'transcripts',
     'memory', 'memory_documents', 'response_cache', 'request_audits', 'moderation_reviews', 'codex_reasoning', 'context_evidence', 'paper_dossiers',
     'semantic_vectors', 'paper_ocr', 'paper_visual', 'research_states', 'research_state_sources',
@@ -79,13 +82,17 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(v) for v in value]
     if isinstance(value, str):
-        return re.sub(r'sk-[A-Za-z0-9_-]{12,}', '[redacted]', value)
+        # Match a credential token, not the suffix of scientific words such as
+        # "task-reconstruction". Credential fields and configured secret values
+        # are independently redacted by their owning serializers.
+        return re.sub(r'(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{12,}', '[redacted]', value)
     return value
 
 
 _MANIFEST_HANDOFF = "coalesce(json_extract(data,'$.handoff_id'),json_extract(data,'$.operation_id'))"
 _DELIVERY_HANDOFF = ("CASE WHEN json_type(data,'$.handoff_id') IS NULL "
                      "THEN json_extract(data,'$.operation_id') ELSE json_extract(data,'$.handoff_id') END")
+_DELIVERY_IDENTITIES = ('document_id', 'source_id', 'artifact_id')
 
 
 def _migrate_delivery_lookup(db):
@@ -96,7 +103,7 @@ def _migrate_delivery_lookup(db):
     """
     if not db.in_transaction:
         db.execute('BEGIN IMMEDIATE')
-    for identity in ('document_id', 'source_id'):
+    for identity in _DELIVERY_IDENTITIES:
         db.execute('CREATE INDEX IF NOT EXISTS evidence_delivery_' + identity + '_v1 ON records('
             "json_extract(data,'$.run_id'),json_extract(data,'$.role'),"
             "json_extract(data,'$." + identity + "'),(" + _DELIVERY_HANDOFF + '),updated_at,key) '
@@ -127,6 +134,23 @@ def _migrate_manifest_lookup(db):
         'evidence-manifest-lookup-v1', now(),
         'Additive context manifest run/handoff, run/request and run/role indexes; '
         'original manifests and delivery policies retained'))
+
+
+def _migrate_memory_version_lookup(db):
+    # Version filtering probes the same source for every candidate chunk. The
+    # generic run index scans unrelated source manifests for each probe.
+    db.execute("CREATE INDEX IF NOT EXISTS memory_document_version_lookup ON records("
+        "json_extract(data,'$.run_id'),json_extract(data,'$.source_id'),"
+        "json_extract(data,'$.document_version_order')) WHERE collection='memory_documents'")
+
+
+def _migrate_transcript_input_lookup(db):
+    db.execute("CREATE INDEX IF NOT EXISTS transcript_input_operation ON records("
+        "json_extract(data,'$.run_id'),json_extract(data,'$.role'),json_extract(data,'$.operation_id'),"
+        "updated_at DESC,key DESC) WHERE collection='transcripts' AND json_extract(data,'$.kind')='input'")
+    db.execute("CREATE INDEX IF NOT EXISTS transcript_input_task ON records("
+        "json_extract(data,'$.run_id'),json_extract(data,'$.role'),json_extract(data,'$.task'),"
+        "updated_at DESC,key DESC) WHERE collection='transcripts' AND json_extract(data,'$.kind')='input'")
 
 
 class Store:
@@ -160,6 +184,8 @@ class Store:
                     run_id TEXT NOT NULL, kind TEXT NOT NULL,
                     message TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS events_run ON events(run_id,id);
+                CREATE INDEX IF NOT EXISTS events_continuation_diagnostic
+                    ON events(run_id,id DESC) WHERE kind='run.continuation_invalid';
                 CREATE INDEX IF NOT EXISTS events_handoff_tool
                     ON events(run_id,json_extract(data,'$.handoff_id'),id DESC)
                     WHERE kind IN ('tool.started','tool.completed','tool.failed');
@@ -187,6 +213,8 @@ class Store:
             migrate(db)
             _migrate_manifest_lookup(db)
             _migrate_delivery_lookup(db)
+            _migrate_memory_version_lookup(db)
+            _migrate_transcript_input_lookup(db)
 
     @contextmanager
     def _db(self):
@@ -287,7 +315,7 @@ class Store:
                 # the bound generic collection filter alone cannot prove it.
                 where += " AND collection='context_manifests'"
         if collection == 'evidence_deliveries' and run_id is not None and "json_extract(data,'$.role')" in predicate:
-            for identity in ('document_id', 'source_id'):
+            for identity in _DELIVERY_IDENTITIES:
                 if "json_extract(data,'$." + identity + "')" in predicate:
                     index = ' INDEXED BY evidence_delivery_' + identity + '_v1'
                     where += " AND collection='evidence_deliveries'"
@@ -341,7 +369,7 @@ class Store:
 
     def matching_input_transcripts(self, run_id: str, role: str, task: str):
         """Newest exact input candidates, without decoding unrelated transcripts."""
-        where, parameters = self._record_filter('transcripts', run_id)
+        where, parameters = "collection='transcripts' AND json_extract(data,'$.run_id')=?", [run_id]
         where += " AND json_extract(data,'$.kind')='input' AND json_extract(data,'$.role')=? AND json_extract(data,'$.task')=?"
         with self._read_db() as db:
             rows = db.execute('SELECT data FROM records WHERE ' + where +
@@ -533,12 +561,25 @@ class Store:
             row = db.execute(query, parameters).fetchone()
         return {**dict(row), 'method': 'sqlite-inverted-index+lexical+signed-feature-hash-512'}
 
-    def batch(self, puts=(), deletes=(), *, supersede_validation=None):
+    def batch(self, puts=(), deletes=(), *, supersede_validation=None, expected=(), before_commit=None,
+              delete_events=()):
         """Atomically commit a workflow transition and all its archived evidence."""
         with self._db() as db:
             db.execute('BEGIN IMMEDIATE')
+            for collection, key, before in expected:
+                row = db.execute('SELECT data FROM records WHERE collection=? AND key=?', (collection, key)).fetchone()
+                encoded_before = json.dumps(before, ensure_ascii=False, allow_nan=False) if before is not None else None
+                if (row['data'] if row else None) != encoded_before:
+                    raise ValueError('Workflow record changed before batch commit: ' + collection)
             for collection, key in deletes:
                 db.execute('DELETE FROM records WHERE collection=? AND key=?', (collection, key))
+            for event in delete_events:
+                self._guard_run(db, event['run_id'])
+                deleted = db.execute('DELETE FROM events WHERE id=? AND run_id=? AND kind=? '
+                    'AND message=? AND data=? AND created_at=?',
+                    tuple(event[k] for k in ('id', 'run_id', 'kind', 'message', 'data', 'created_at')))
+                if deleted.rowcount != 1:
+                    raise ValueError('Workflow event changed before batch commit')
             for collection, key, value in puts:
                 self._guard_write(db, collection, key, value)
                 db.execute('INSERT INTO records VALUES (?,?,?,?) ON CONFLICT(collection,key) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at',
@@ -564,6 +605,9 @@ class Store:
                     "AND coalesce(json_extract(data,'$.research_cycle'),1)=? "
                     "AND coalesce(json_extract(data,'$.superseded'),0)=0",
                     (reason, now(), run_id, cycle))
+
+            if before_commit is not None:
+                before_commit()  # An exception rolls back all writes in this transaction.
 
     def mutate(self, collection: str, key: str, fn: Callable, default=None):
         with self._db() as db:
@@ -642,46 +686,51 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             if not db.execute("SELECT 1 FROM records WHERE collection='run_deletions' AND key=?", (run_id,)).fetchone():
                 raise ValueError('A deletion marker is required before purging research')
-            rows = db.execute('SELECT collection,key,data FROM records').fetchall()
-            records = [(row['collection'], row['key'], json.loads(row['data'])) for row in rows]
+            # Select ownership and legacy links in SQLite. Paid request archives
+            # can be many gigabytes; deletion must not deserialize all tasks.
+            shared = ','.join('?' for _ in SHARED_COLLECTIONS)
+            legacy = ','.join('?' for _ in (TASK_COLLECTIONS | {'budgets'}))
+            prefix = "CASE WHEN instr(key,':')>0 THEN substr(key,1,instr(key,':')-1) ELSE key END"
+            db.execute('CREATE TEMP TABLE purge_owned(collection TEXT,key TEXT,PRIMARY KEY(collection,key))')
+            db.execute(f"""INSERT INTO purge_owned SELECT collection,key FROM records
+                WHERE (collection='runs' AND key=?) OR
+                  (collection NOT IN ({shared}) AND collection!='runs' AND
+                    (json_extract(data,'$.run_id')=? OR
+                     (coalesce(json_extract(data,'$.run_id'),'') IN ('',0)
+                      AND collection IN ({legacy}) AND {prefix}=?)))""",
+                (run_id, *SHARED_COLLECTIONS, run_id, *(TASK_COLLECTIONS | {'budgets'}), run_id))
             # Preserve only the safe usage projection of legacy native Codex
             # workflows before their task-owned prompts and artifacts are purged.
             from .codex_accounting import usage_record
-            for collection, key, value in records:
-                if collection != 'codex_workflows' or value.get('run_id') != run_id:
-                    continue
+            for row in db.execute("SELECT data FROM records WHERE collection='codex_workflows' AND json_extract(data,'$.run_id')=?", (run_id,)):
+                value = json.loads(row['data'])
                 for attempt in value.get('attempts', []):
                     usage = usage_record(run_id, attempt.get('checkpoint'))
                     if usage:
                         db.execute('INSERT INTO records VALUES(?,?,?,?) ON CONFLICT(collection,key) DO NOTHING',
                                    ('codex_usage', usage['id'], json.dumps(usage, ensure_ascii=False, allow_nan=False), now()))
-            request_ids, transcript_ids = set(), set()
-            for collection, key, value in records:
-                if isinstance(value, dict) and _run_owner(collection, key, value) == run_id:
-                    if collection in {'usage', 'transcripts'}:
-                        request_ids.update(str(value[field]) for field in ('request_id',) if value.get(field))
-                        if collection == 'usage':
-                            request_ids.add(key)
-                        else:
-                            transcript_ids.add(key)
-                    elif collection == 'budgets':
-                        request_ids.update(str(item.get('id')) for item in value.get('records', []) if item.get('id'))
-            for collection, key, value in records:
-                if collection in SHARED_COLLECTIONS or collection in {'budgets', 'usage', 'codex_usage'}:
-                    continue
-                owned = _run_owner(collection, key, value) == run_id
-                if collection == 'response_cache' and isinstance(value, dict) and not value.get('run_id'):
-                    result = value.get('result') or {}
-                    owned = owned or (isinstance(result, dict) and (
-                        result.get('request_id') in request_ids or result.get('transcript_id') in transcript_ids))
-                if not owned:
-                    continue
-                if collection == 'memory' and isinstance(value, dict) and value.get('metadata', {}).get('shared') is True:
-                    value = {**value, 'run_id': None}
-                    db.execute('UPDATE records SET data=?,updated_at=? WHERE collection=? AND key=?',
-                               (json.dumps(value, ensure_ascii=False, allow_nan=False), now(), collection, key))
-                else:
-                    db.execute('DELETE FROM records WHERE collection=? AND key=?', (collection, key))
+            db.execute('CREATE TEMP TABLE purge_links(kind TEXT,value TEXT,PRIMARY KEY(kind,value))')
+            db.execute("""INSERT OR IGNORE INTO purge_links
+                SELECT 'request',r.key FROM records r JOIN purge_owned o USING(collection,key) WHERE r.collection='usage'
+                UNION SELECT 'transcript',r.key FROM records r JOIN purge_owned o USING(collection,key) WHERE r.collection='transcripts'
+                UNION SELECT 'request',CAST(json_extract(r.data,'$.request_id') AS TEXT)
+                  FROM records r JOIN purge_owned o USING(collection,key)
+                  WHERE r.collection IN ('usage','transcripts') AND coalesce(json_extract(r.data,'$.request_id'),'') NOT IN ('',0)
+                UNION SELECT 'request',CAST(json_extract(item.value,'$.id') AS TEXT)
+                  FROM records r JOIN purge_owned o USING(collection,key),json_each(r.data,'$.records') item
+                  WHERE r.collection='budgets' AND coalesce(json_extract(item.value,'$.id'),'') NOT IN ('',0)""")
+            db.execute("""INSERT OR IGNORE INTO purge_owned SELECT collection,key FROM records
+                WHERE collection='response_cache' AND coalesce(json_extract(data,'$.run_id'),'') IN ('',0)
+                  AND ((SELECT value FROM purge_links WHERE kind='request' AND value=json_extract(data,'$.result.request_id')) IS NOT NULL
+                    OR (SELECT value FROM purge_links WHERE kind='transcript' AND value=json_extract(data,'$.result.transcript_id')) IS NOT NULL)""")
+            db.execute("""UPDATE records SET data=json_set(data,'$.run_id',NULL),updated_at=?
+                WHERE collection='memory' AND json_type(data,'$.metadata.shared')='true'
+                  AND EXISTS(SELECT 1 FROM purge_owned o WHERE o.collection=records.collection AND o.key=records.key)""", (now(),))
+            db.execute("""DELETE FROM records WHERE collection NOT IN ('budgets','usage','codex_usage')
+                AND NOT(collection='memory' AND json_type(data,'$.metadata.shared') IS 'true')
+                AND EXISTS(SELECT 1 FROM purge_owned o WHERE o.collection=records.collection AND o.key=records.key)""")
+            db.execute('DROP TABLE purge_links')
+            db.execute('DROP TABLE purge_owned')
             db.execute('DELETE FROM events WHERE run_id=?', (run_id,))
             db.execute("UPDATE records SET data=?,updated_at=? WHERE collection='run_deletions' AND key=?",
                        (json.dumps(tombstone, ensure_ascii=False, allow_nan=False), now(), run_id))

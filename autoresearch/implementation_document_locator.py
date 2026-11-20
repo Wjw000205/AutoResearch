@@ -113,11 +113,11 @@ def revision_patch(spec, revisions):
     return operations
 
 
-def _replace_text(original, replacements):
+def _replace_text(original, replacements, *, limit=32):
     """Resolve every unique span against the same base, never against earlier edits."""
     from .implementation_authoring_preservation import SaveConflict
-    if not isinstance(original, str) or not isinstance(replacements, list) or not 1 <= len(replacements) <= 32:
-        raise SaveConflict('invalid_text_replacement', '仅文本单元可使用 1 至 32 项 text_replacements。')
+    if not isinstance(original, str) or not isinstance(replacements, list) or not 1 <= len(replacements) <= limit:
+        raise SaveConflict('invalid_text_replacement', f'仅文本单元可使用 1 至 {limit} 项 text_replacements。')
     spans = []
     for replacement in replacements:
         if (not isinstance(replacement, dict) or set(replacement) != {'before', 'after'}

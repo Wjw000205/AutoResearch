@@ -1,0 +1,4 @@
+.harness-local-progress { margin: 12px 0; padding: 14px 16px; border: 1px solid #dce5da; border-radius: 10px; background: #f7f9f5; color: #293c30; line-height: 1.65; overflow-wrap: anywhere; }
+.harness-local-progress > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+.harness-local-progress p { margin: 7px 0; }
+.harness-local-progress small { color: #63745f; }

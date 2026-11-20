@@ -157,12 +157,12 @@ def resume_target(progress, *, engine=None, intelligence=None, run_id=None, key=
     if (count != MAX_CONTINUATIONS or target is None or engine is None or intelligence is None
             or not _valid_chain(engine, intelligence, run_id, key, progress)):
         return None
-    source = _source(engine.store, intelligence, run_id, chain[0][-1])
+    source = _source(engine.store, intelligence, run_id, chain[0][-1], handoff_id=key)
     health = _health_source(engine.store, run_id, source) if source else None
     return {**target, 'health_probe': health} if health else None
 
 
-def _source(store, intelligence, run_id, final, *, normal=False, require_readback=True):
+def _source(store, intelligence, run_id, final, *, normal=False, require_readback=True, handoff_id=None):
     from .engine import digest
     prepared = final.get('prepared', {})
     if (not isinstance(prepared, dict) or not isinstance(prepared.get('context'), dict)
@@ -174,6 +174,20 @@ def _source(store, intelligence, run_id, final, *, normal=False, require_readbac
     checkpoint = saved.get('checkpoint', {})
     reservation = saved.get('reservation', {})
     control = prepared['context'].get('_harness_control', {})
+    # Original response-only implementation requests omitted the operation
+    # marker. Their native submission and controller slot still bind the owner.
+    markerless = not normal and handoff_id and '_harness_control' not in prepared['context']
+    if markerless:
+        capture = saved.get('memory_capture_binding') or {}
+        work = prepared['context'].get('implementation_work') or {}
+        frozen = store.get('handoff_inputs',handoff_id,{})
+        progress = store.get('handoff_progress',handoff_id,{})
+        if (work.get('version')==1 and frozen.get('context',{}).get('implementation_work')==work
+                and capture.get('run_id')==run_id and capture.get('role')==prepared['role']
+                and capture.get('handoff_id')==handoff_id and capture.get('operation_id')==operation
+                and progress.get('mode')=='final_only' and final in
+                [progress.get('finalization'),*progress.get('finalization_history',[])]):
+            control = {'mode':'final_only','operation_id':final['operation_id']}
     if (saved.get('result') is not None or saved.get('run_id') != run_id
             or saved.get('role') != prepared['role'] or saved.get('operation_id') != operation
             or saved.get('schema') != prepared['schema']
@@ -196,7 +210,7 @@ def _source(store, intelligence, run_id, final, *, normal=False, require_readbac
             or type(saved.get('output_limit')) is not int
             or reservation.get('request_output_token_limit') != saved['output_limit']):
         return None
-    if checkpoint['status'] == 'failed' and (
+    if (markerless or checkpoint['status'] == 'failed') and (
             saved.get('id') != native_key or checkpoint.get('version') != 1
             or checkpoint.get('model_provider') != 'openai'
             or not isinstance(saved.get('instruction'), str)
@@ -241,7 +255,7 @@ def _valid_chain(engine, intelligence, run_id, key, progress):
         return False
     for number, (previous, final, audit) in enumerate(zip(finals, finals[1:], audits), 1):
         target = _target(previous)
-        source = _source(engine.store, intelligence, run_id, previous)
+        source = _source(engine.store, intelligence, run_id, previous, handoff_id=key)
         limit = MAX_CONTINUATIONS
         health = audit.get('health_probe')
         if number > MAX_CONTINUATIONS:
@@ -269,7 +283,7 @@ def _valid_chain(engine, intelligence, run_id, key, progress):
                 or not _fresh_failure_resume(generation, engine.store.get('codex_reasoning', source['native_key']))):
             return False
         expected = copy.deepcopy(previous['prepared'])
-        expected['context']['_harness_control']['operation_id'] = final['operation_id']
+        expected['context'].setdefault('_harness_control',{'mode':'final_only','completed_tool_signatures':[]})['operation_id'] = final['operation_id']
         if final.get('prepared') != expected or digest(expected) != audit.get('prepared_sha256'):
             return False
     return _profile_matches(engine.store, intelligence, run_id, finals[-1], audits[-1]['source'])
@@ -290,16 +304,18 @@ def advance(engine, intelligence, run_id, key, progress):
     if progress.get('finalization_history') and not _valid_chain(engine, intelligence, run_id, key, progress):
         return False
     final = progress['finalization']
-    source = _source(engine.store, intelligence, run_id, final)
+    source = _source(engine.store, intelligence, run_id, final, handoff_id=key)
     if source is None or not _profile_matches(engine.store, intelligence, run_id, final, source):
         return False
+    from .execution_continuation import after_native_readback
+    generation = after_native_readback(engine, run_id, key, target, source, field='native_final_targets')
     if source['status'] == 'failed' and not _fresh_failure_resume(
             generation, engine.store.get('codex_reasoning', source['native_key'])):
         return False
     engine.check_active(run_id)
     prepared = copy.deepcopy(final['prepared'])
     operation = uid()
-    prepared['context']['_harness_control']['operation_id'] = operation
+    prepared['context'].setdefault('_harness_control',{'mode':'final_only','completed_tool_signatures':[]})['operation_id'] = operation
     preview = intelligence.preflight_batch(run_id, [prepared])
     if (preview['request_count'] != 1
             or preview['requests'][0]['max_output_tokens'] != source['effective_output_limit']):

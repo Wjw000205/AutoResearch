@@ -8,7 +8,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 
 from . import document_index
-from .architecture_validation import operation
+from .architecture_validation import operation, once
 
 PROTOCOL = 'implementation_alignment_protocol'
 from .implementation_reading import READ_PENDING
@@ -24,6 +24,7 @@ def _workflow_design(engine, run_id, hid, context):
     """Resolve the host workflow; model-supplied design bodies grant no scope."""
     from .engine import digest
     bindings = [context.get('implementation_document_authoring') or {},
+        context.get('whole_code_review') or {},
         context.get('definition_code_followup') or {},
         context.get('code_repair_clarification') or {},
         (context.get('implementation_indexed_review_contract') or {}).get('binding') or {},
@@ -34,7 +35,7 @@ def _workflow_design(engine, run_id, hid, context):
     if not identities:
         purpose = engine.store.get('handoffs', hid, {}).get('purpose', '')
         parts = purpose.split(':') if isinstance(purpose, str) else []
-        if len(parts) == 3 and parts[0] == 'code_review':
+        if parts and parts[0] == 'code_review' and (len(parts) == 3 or len(parts) == 5 and parts[3] == 'redispatch'):
             identities = {key for key in engine.store.record_keys('codex_workflows', run_id)
                           if digest(key) == parts[1]}
             if len(identities) > 1:
@@ -62,6 +63,9 @@ def _delivery(engine, run_id, role, hid, result):
     assignment = engine.store.get('handoffs', hid, {})
     frozen = engine.store.get('handoff_inputs', hid, {})
     decision = engine.store.get('decisions', hid, {})
+    if decision.get('code_review_inheritance'):
+        from .review_inheritance import verify_decision
+        verify_decision(engine, run_id, role, hid, frozen.get('context', {}), decision)
     payload = {key: frozen.get(key) for key in ('instruction', 'context', 'schema')}
     candidate = _candidate.get()
     source = frozen.get('context') or {}
@@ -79,8 +83,11 @@ def _delivery(engine, run_id, role, hid, result):
             or decision.get('role') != role or decision.get('purpose') != assignment.get('purpose')
             or decision.get('result') != delivered):
         _fail('对齐审查的角色、冻结输入或原始交付记录不一致。')
-    progress = engine.store.get('handoff_progress', hid, {})
-    if progress and (progress.get('id') != hid or progress.get('run_id') != run_id):
+    # A genuinely empty checkpoint has no reads to authenticate yet. A
+    # nonempty ledger must still carry its exact owner before any credit.
+    from .implementation_reading import ledger_identity
+    owner, owner_run = ledger_identity(engine.store, hid)
+    if owner is not None and (owner != hid or owner_run != run_id):
         _fail('对齐审查的真实读取记录不属于当前交接。')
     for key in ('proposal_hash', 'spec_hash', 'document_sha256', 'code_sha256', 'delivery_hash'):
         if key in source and (key in result or key != 'document_sha256') and result.get(key) != source[key]:
@@ -93,18 +100,43 @@ def _delivery(engine, run_id, role, hid, result):
     return source
 
 
+@once
 def _handoffs(engine, run_id, role, hid, result, context):
     from .engine import digest
     frozen = _delivery(engine, run_id, role, hid, result)
     if digest(frozen) != digest(context):
         _fail('对齐审查上下文与原始冻结输入不一致。')
-    return [hid]
+    from . import independent_full_review as full
+    if full.KEY in context:
+        return _full_handoffs(engine, run_id, role, hid, context)
+    from .review_inheritance import owners
+    return [hid, *owners(engine, run_id, role, hid, context)]
+
+
+def _full_handoffs(engine, run_id, role, hid, context):
+    from . import independent_full_review as full
+    decision = engine.store.get('decisions', hid, {})
+    if decision.get('result') is not None:
+        return full.reading_handoffs(engine.store, run_id,
+            full.stamp_vote(role, decision['result'], hid, context[full.KEY]))
+    # The ordinary candidate validator owns the current unsealed request.
+    # Only a completed, authenticated same-source parent can extend its reads.
+    parent = context.get(full.READING, {}).get('parent_handoff_id')
+    if not parent:
+        return [hid]
+    before = engine.store.get('handoff_inputs', parent, {}).get('context', {})
+    raw = engine.store.get('decisions', parent, {}).get('result')
+    if (before.get(full.KEY) != context[full.KEY] or full.material_text(before) != full.material_text(context)
+            or full.sha(raw) != context[full.READING].get('parent_result_sha256')):
+        _fail('Full-review source continuation changed its original parent material')
+    return [hid, *full.reading_handoffs(engine.store, run_id, full.stamp_vote(role, raw, parent, context[full.KEY]))]
 
 
 def _required_ranges(engine, run_id, refs, sources):
     if not isinstance(refs, list) or not refs:
         _fail(READ_PENDING + '；需要可读取的原文位置。')
     required = {}
+    documents = {}
     for ref in refs:
         if not isinstance(ref, dict):
             _fail('对齐依据引用必须包含精确文档、版本及字符范围。')
@@ -112,10 +144,14 @@ def _required_ranges(engine, run_id, refs, sources):
         if did not in sources or sources[did] != sha:
             _fail('对齐依据引用了未绑定的文档或旧版本。')
         try:
-            manifest, _ = document_index.load(engine, run_id, did, sha)
+            # One authenticated load per exact identity in this synchronous
+            # validation. Never retain file-integrity credit across calls.
+            if (did, sha) not in documents:
+                manifest, _ = document_index.load(engine, run_id, did, sha)
+                documents[did, sha] = {s['id']: s for s in manifest['sections']}
         except (ValueError, OSError) as exc:
             _fail('对齐依据原文的版本或完整性校验失败：' + str(exc))
-        section = next((s for s in manifest['sections'] if s['id'] == ref.get('section_id')), None)
+        section = documents[did, sha].get(ref.get('section_id'))
         offset, limit = ref.get('offset'), ref.get('limit')
         if (section is None or type(offset) is not int or type(limit) is not int
                 or offset < 0 or not 1 <= limit <= 6000
@@ -144,6 +180,8 @@ def validate_review_evidence(engine, run_id, role, handoff_id, result, context):
     handoffs = _handoffs(engine, run_id, role, handoff_id, result, context)
     required = {}
     count = 0
+    legacy_code_changes = ('delivery_artifacts' in context and 'repair_findings' not in result
+                           and bool(result.get('fixes')))
     for finding in findings:
         if not isinstance(finding, dict):
             _fail('对齐审查的逐项核对结果格式不完整。')
@@ -154,7 +192,7 @@ def validate_review_evidence(engine, run_id, role, handoff_id, result, context):
             from .implementation_alignment import _validate_refs
             _validate_refs(refs, source_documents)
         ranges = _required_ranges(engine, run_id, refs, sources) if refs else {}
-        if finding.get('status') == 'aligned':
+        if finding.get('status') == 'aligned' or legacy_code_changes and finding.get('status') == 'pending':
             count += len(refs)
             for did, pages in ranges.items():
                 required.setdefault(did, []).extend(pages)
@@ -168,7 +206,7 @@ def validate_review_evidence(engine, run_id, role, handoff_id, result, context):
             'same_version': True, 'scientific_approval': False}
 
 
-def _code_text(engine, run_id, artifact_id, delivery):
+def _code_text(engine, run_id, artifact_id, delivery, *, allow_binary=False):
     import hashlib
     from pathlib import Path
     from .deletion import _plain_path
@@ -186,12 +224,17 @@ def _code_text(engine, run_id, artifact_id, delivery):
                 or hashlib.sha256(raw).hexdigest() != delivery.get('sha256')
                 or type(delivery.get('bytes')) is not int or len(raw) != delivery['bytes']):
             _fail('代码对齐依据的实际字节、版本或大小与冻结交付不一致。')
-        return raw.decode('utf-8')
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            if allow_binary:
+                return None
+            raise
     except (KeyError, ValueError, OSError) as exc:
         _fail('代码对齐依据无法核验实际交付原文：' + str(exc))
 
 
-def _code_spans(engine, handoff_id, artifact_id, sha, text):
+def _own_code_spans(engine, handoff_id, artifact_id, sha, text):
     from .architecture_validation import source_read
     import json
 
@@ -205,13 +248,19 @@ def _code_spans(engine, handoff_id, artifact_id, sha, text):
         if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
             _fail('代码对齐的实际读取回执格式损坏。')
         return [item for item in receipts if isinstance(item.get('call'), dict)
-                and item['call'].get('name') in {'artifacts.read', 'code.read'}]
+                and item['call'].get('name') in {'artifacts.read', 'code.read', 'materials.request_read'}]
 
     spans = []
     receipts = source_read(engine.store, ('code_read_receipts', handoff_id), read_receipts, borrowed=True)
     for receipt in receipts:
         if not isinstance(receipt, dict):
             _fail('代码对齐的实际读取回执格式损坏。')
+        if receipt.get('call', {}).get('name') == 'materials.request_read':
+            if receipt.get('result', {}).get('error'):
+                continue
+            from .supplemental_reads import normal_read
+            owner = engine.store.get('handoffs', handoff_id, {})
+            receipt = normal_read(engine, owner['run_id'], handoff_id, receipt)
         call, page = receipt.get('call'), receipt.get('result')
         if not isinstance(call, dict) or call.get('name') not in {'artifacts.read', 'code.read'}:
             continue
@@ -222,7 +271,11 @@ def _code_spans(engine, handoff_id, artifact_id, sha, text):
             continue
         if isinstance(page, dict) and page.get('error'):
             continue
-        offset, limit = args.get('offset', 0), args.get('limit', 16000)
+        from .code_review_reread import withheld
+        if withheld(page):
+            continue  # Typed nonexecution is never an actual code-read receipt.
+        default_limit = 4000 if call['name'] == 'code.read' else 16000
+        offset, limit = args.get('offset', 0), args.get('limit', default_limit)
         if (not isinstance(page, dict) or type(offset) is not int or offset < 0
                 or offset > len(text) or type(limit) is not int or not 1 <= limit <= 16000):
             _fail('代码对齐的实际读取范围不合法。')
@@ -238,13 +291,74 @@ def _code_spans(engine, handoff_id, artifact_id, sha, text):
     return sorted(spans)
 
 
+def _code_spans(engine, handoff_id, artifact_id, sha, text):
+    spans = _own_code_spans(engine, handoff_id, artifact_id, sha, text)
+    from . import independent_full_review as full
+    from .architecture_validation import source_read
+    def full_context():
+        import json
+        with engine.store._read_db() as db:
+            row = db.execute("SELECT CASE WHEN json_type(data,'$.context.independent_full_review') IS NOT NULL "
+                "THEN json_extract(data,'$.context') END FROM records "
+                "WHERE collection='handoff_inputs' AND key=?", (handoff_id,)).fetchone()
+        return json.loads(row[0]) if row and row[0] is not None else {}
+    context = source_read(engine.store, ('full_code_read_context', handoff_id), full_context, borrowed=True)
+    if full.KEY in context:
+        owner = engine.store.get('handoffs', handoff_id, {})
+        for parent in _full_handoffs(engine, owner['run_id'], owner['to_role'], handoff_id, context)[1:]:
+            spans.extend(_own_code_spans(engine, parent, artifact_id, sha, text))
+        return sorted(spans)
+    from .review_inheritance import raw_plan
+    if raw_plan(engine, handoff_id) is None:
+        return spans
+    hand = engine.store.get('handoffs', handoff_id, {})
+    context = engine.store.get('handoff_inputs', handoff_id, {}).get('context', {})
+    from .review_inheritance import owners, consumed_receipts
+    from .evidence_delivery import tracking_required
+    from .working_context import sha as receipt_sha
+    for owner in owners(engine, hand.get('run_id'), hand.get('to_role'), handoff_id, context):
+        old = _own_code_spans(engine, owner, artifact_id, sha, text)
+        if not tracking_required(engine.store, hand['run_id'], owner):
+            spans.extend(old)  # Preserve the exact legacy reading contract.
+            continue
+        def read_progress():
+            import json
+            with engine.store._read_db() as db:
+                row=db.execute("SELECT json_extract(data,'$.tool_results') FROM records "
+                    "WHERE collection='handoff_progress' AND key=?",(owner,)).fetchone()
+            return {'tool_results':json.loads(row[0]) if row and row[0] is not None else []}
+        from .architecture_validation import source_read
+        progress = source_read(engine.store,('inherited_code_tool_results',owner),read_progress,borrowed=True)
+        consumed = consumed_receipts(engine, hand['run_id'], hand['to_role'], owner)
+        # A sealed original opinion retains its original reading contract.
+        # Its exact cited ranges were already admitted with the actual ledger;
+        # later prompt-window eviction cannot revoke that completed evidence.
+        verdict = engine.store.get('decisions', owner, {}).get('result', {})
+        for citation in verdict.get('code_evidence', []):
+            if citation.get('artifact_id') == artifact_id and citation.get('sha256') == sha:
+                begin, end = citation['offset'], citation['offset'] + citation['limit']
+                cursor = begin
+                for a, b in old:
+                    if a <= cursor:
+                        cursor = max(cursor, b)
+                if cursor >= end:
+                    spans.append((begin, end))
+        for row in progress.get('tool_results', []):
+            call, page = row.get('call', {}), row.get('result', {})
+            if (call.get('name') in {'code.read', 'artifacts.read'} and call.get('arguments', {}).get('id') == artifact_id
+                    and receipt_sha(row) in consumed and isinstance(page.get('text'), str) and not page.get('error')):
+                start = page['offset']
+                spans.append((start, start + len(page['text'])))
+    return sorted(spans)
+
+
 @operation
 def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
     """Check actual same-role code reads; a verification description is no run proof."""
     if context.get(PROTOCOL) != 1 or 'delivery_artifacts' not in context:
         return None
     from pathlib import PurePosixPath
-    from .engine import digest
+    from .engine import ResearchBlocked, digest
     from .implementation_alignment import acceptance_ids, required_review_ids
     frozen = _delivery(engine, run_id, role, handoff_id, result)
     if digest(frozen) != digest(context):
@@ -263,11 +377,20 @@ def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
         _fail('代码对齐审查缺少实际代码依据。')
     accepted = acceptance_ids(context)
     required = required_review_ids(context,role)
-    if result.get('approve') is True and (not accepted or not items):
+    from . import code_review_partition as partitions
+    partitioned = partitions.FIELD in context
+    if result.get('approve') is True and (not accepted or not items) and (not partitioned or required):
         _fail(READ_PENDING + '；代码批准需要逐项核对验收 ID 对应的实际实现。')
     import json
     manifest_files = [row for row in deliveries if row.get('path') == 'implementation.json']
     manifest_rows = context.get('implementation_alignment_manifest_requirements')
+    if partitioned:
+        try:
+            batch = partitions.authenticate(engine, run_id, role, handoff_id, context)
+            partitions.validate_ballot(context, role, result)
+        except ValueError as exc:
+            _fail(str(exc))
+        manifest_rows = batch['requirements']
     if len(manifest_files) != 1 or not isinstance(manifest_rows, list):
         _fail('代码对齐缺少本次实际交付清单中的验收映射。')
     manifest_file = manifest_files[0]
@@ -295,16 +418,21 @@ def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
                        for doc in context.get('indexed_documents', []))):
         _fail('代码对齐缺少当前批准实现文档的固定版本。')
     implementation_sources = {implementation['document_id']: implementation['sha256']}
-    for item in items:
+    supplement = context.get('scope_revision_document') if partitioned else None
+    if supplement:
+        if supplement not in context.get('indexed_documents', []) or not context.get('approved_source_scope'):
+            _fail('代码对齐缺少固定的分工修订版本。')
+        implementation_sources[supplement['document_id']] = supplement['sha256']
+    for index, item in enumerate(items):
         if not isinstance(item, dict):
             _fail('代码对齐依据格式不完整。')
         requirement = item.get('requirement_id')
-        if not isinstance(requirement, str) or not requirement.strip() or accepted and requirement not in accepted:
+        if (not isinstance(requirement, str) or not requirement.strip()
+                or accepted and requirement not in accepted or partitioned and requirement not in required):
             _fail('代码对齐依据引用了当前规范之外的验收 ID。')
         artifact_id, sha = item.get('artifact_id'), item.get('sha256')
         delivery = by_id.get(artifact_id)
         if not delivery or delivery.get('sha256') != sha:
-            from .engine import ResearchBlocked
             from . import code_evidence_reference_correction as references
             error = ResearchBlocked(references.ERROR)
             error.code_reference_problems = references.problems(engine, run_id, handoff_id, result, context)
@@ -312,20 +440,24 @@ def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
         # A missing manifest entry is itself reviewable. Only the explicit
         # same-delivery clarification may cite such a file; hashes, ownership,
         # actual same-role reads and approved-document references still apply.
-        clarification = context.get('code_repair_clarification', {}).get('version') == 1
-        if delivery.get('path') not in locations.get(requirement, set()) and not clarification:
-            _fail('代码对齐依据文件与本次交付清单中的对应验收位置不一致。')
+        # Manifest locations guide navigation; actual dependencies and config
+        # consumers elsewhere in the same frozen delivery are valid evidence.
         name = PurePosixPath(str(delivery.get('path', '')).replace('\\', '/'))
-        if name.suffix.lower() not in {'.py', '.pyi'} and not (
-                clarification and delivery.get('path') == 'implementation.json'):
-            _fail('代码对齐依据必须定位实际 Python 实现或测试，清单与完成声明不能代替代码。')
+        from .review_response_policy import TEXT_SUFFIXES
+        if name.suffix.lower() not in TEXT_SUFFIXES:
+            from . import code_evidence_reference_correction as references
+            error = ResearchBlocked(references.NON_CODE_ERROR)
+            error.code_reference_problems = references.problems(engine, run_id, handoff_id, result, context)
+            raise error
         offset, limit = item.get('offset'), item.get('limit')
         if (type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 16000
                 or not isinstance(item.get('verification'), str) or not item['verification'].strip()):
             _fail('代码对齐依据缺少有效原文范围或具体核对说明。')
         if artifact_id not in loaded:
             loaded[artifact_id] = _code_text(engine, run_id, artifact_id, delivery)
-            spans[artifact_id] = _code_spans(engine, handoff_id, artifact_id, sha, loaded[artifact_id])
+            spans[artifact_id] = ([(start, end) for start, end, _ in partitions.delivered_spans(
+                engine, run_id, role, handoff_id, context, delivery, loaded[artifact_id])] if partitioned
+                else _code_spans(engine, handoff_id, artifact_id, sha, loaded[artifact_id]))
         if offset + limit > len(loaded[artifact_id]):
             _fail('代码对齐依据范围超出当前实际交付。')
         cursor = offset
@@ -334,7 +466,36 @@ def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
                 cursor = max(cursor, end)
         if cursor < offset + limit:
             _fail(READ_PENDING + '；请读取 source 对应的实际代码或测试文件范围，再交付代码核对结论。')
-        ranges = _required_ranges(engine, run_id, item.get('implementation_refs'), implementation_sources)
+        refs = item.get('implementation_refs')
+        if supplement and result.get('approve') and not any(
+                ref.get('document_id') == implementation['document_id'] and
+                ref.get('document_sha256') == implementation['sha256'] for ref in refs or []):
+            _fail(READ_PENDING + '；代码批准必须引用实际读取的原实现规范。')
+        if supplement and result.get('approve') and not any(
+                ref.get('document_id') == supplement['document_id'] and
+                ref.get('document_sha256') == supplement['sha256'] for ref in refs or []):
+            _fail(READ_PENDING + '；代码批准必须引用实际读取的分工修订文档。')
+        try:
+            ranges = _required_ranges(engine, run_id, refs, implementation_sources)
+        except ResearchBlocked as exc:
+            from .review_document_ids import ERRORS
+            if str(exc) not in ERRORS:
+                raise
+            # The source may be intact while the reviewer cited a foreign
+            # document or an invalid span. Only a candidate-owned locator is
+            # eligible for feedback; source-load/integrity failures propagate.
+            problems = []
+            for ref_index, ref in enumerate(refs):
+                try:
+                    _required_ranges(engine, run_id, [ref], implementation_sources)
+                except ResearchBlocked as problem:
+                    if str(problem) not in ERRORS:
+                        raise
+                    problems.append({'reference_field':'implementation_refs', 'evidence_index':index,
+                        'requirement_id':requirement, 'reference_index':ref_index,
+                        'reference':ref, 'reason':str(problem)})
+            exc.alignment_reference_problems = problems
+            raise
         for did, pages in ranges.items():
             implementation_ranges.setdefault(did, []).extend(pages)
         # Manifest evidence can explain a tracking defect but cannot replace
@@ -343,15 +504,65 @@ def validate_code_evidence(engine, run_id, role, handoff_id, result, context):
             seen.add(requirement)
     if result.get('approve') is True and not set(required)<=seen:
         _fail('代码对齐批准尚未覆盖全部验收 ID 的实际实现。')
+    if partitioned and result.get('approve') is True:
+        from .review_response_policy import TEXT_SUFFIXES
+        endpoints = {row['id']: row for row in context[partitions.FIELD]['interfaces']}
+        by_path = {row['path']: row for row in deliveries}
+        for finding in result['interface_findings']:
+            edge = endpoints[finding['id']]
+            if edge.get('provider_unresolved'):
+                _fail('静态接口缺少可定位的提供端，需要在分工中明确端点：' + edge['provider'])
+            path = edge['consumer'] if edge['consumer_role'] == role else edge['provider']
+            delivery = by_path[path]
+            artifact_id = delivery['artifact_id']
+            if artifact_id not in loaded:
+                loaded[artifact_id] = _code_text(engine, run_id, artifact_id, delivery)
+                spans[artifact_id] = [(start, end) for start, end, _ in partitions.delivered_spans(
+                    engine, run_id, role, handoff_id, context, delivery, loaded[artifact_id])]
+            cursor = finding['offset']
+            stop = cursor + finding['limit']
+            for begin, end in spans[artifact_id]:
+                if begin <= cursor:
+                    cursor = max(cursor, end)
+            side = 'consumer' if edge['consumer_role'] == role else 'provider'
+            endpoints_for_side = edge.get(f'{side}_ranges', [])
+            intersects = any(finding['offset'] < end and begin < stop for begin, end in endpoints_for_side)
+            if finding['limit'] <= 0 or cursor < stop or (endpoints_for_side and not intersects):
+                _fail(READ_PENDING + '；跨组端点尚未引用本角色收到的源码：' + path)
+            if supplement:
+                required_documents = {implementation['document_id'], supplement['document_id']}
+                ranges = _required_ranges(engine, run_id, finding.get('implementation_refs'), implementation_sources)
+                if set(ranges) != required_documents:
+                    _fail(READ_PENDING + '；跨组端点需核对原规范及分工修订。')
+                for did, pages in ranges.items():
+                    implementation_ranges.setdefault(did, []).extend(pages)
+        inspected = set()
+        for delivery in deliveries:
+            if delivery['path'] == 'implementation.json' or PurePosixPath(delivery['path']).suffix.lower() not in TEXT_SUFFIXES:
+                continue
+            identity = delivery['sha256']
+            if identity in inspected:
+                continue
+            inspected.add(identity)
+            artifact_id = delivery['artifact_id']
+            text = loaded[artifact_id] if artifact_id in loaded else _code_text(engine, run_id, artifact_id, delivery)
+            ranges = spans[artifact_id] if artifact_id in spans else partitions.delivered_spans(
+                engine, run_id, role, handoff_id, context, delivery, text)
+            from .document_read_window import _uncovered
+            scope = context[partitions.FIELD]
+            gaps = _uncovered(0, len(text), [(item[0], item[1], '') for item in ranges])
+            if text and (not ranges or scope.get('complete_source_reads') and gaps):
+                _fail(READ_PENDING + '；本角色尚有未核对的源码：' + delivery['path'])
     from .implementation_reading import coverage
     for did, ranges in implementation_ranges.items():
         if not coverage(engine, run_id, {'document_id': did, 'sha256': implementation_sources[did]},
-                        ranges, [handoff_id])['complete']:
+                        ranges, _handoffs(engine, run_id, role, handoff_id, result, context))['complete']:
             _fail(READ_PENDING + '；请实际读取 implementation_refs 绑定的当前实现文档，再核对代码。')
     return {'verified_code_refs': len(items), 'requirement_ids': sorted(seen),
             'reading_handoff_ids': [handoff_id], 'scientific_approval': False}
 
 
+@operation
 def validate_vote(engine, run_id, role, handoff_id, result, context, *, delivery=False):
     """Validate the alignment contract, its source reading, and actual delivery."""
     if context.get(PROTOCOL) != 1:

@@ -133,6 +133,8 @@ COMMON = (
     '不属于你职责的事项明确交给负责角色或后续执行门禁，不得重复要求总监自行调查。'
     'evidence_ids 只写工具已返回的本任务来源、论文或笔记ID，不把设计建议当科学证据。'
     '历史检查点、文献交接目录及记忆摘要仅用于追溯；不能作为论文原文、已读状态或科学结论。'
+    'evidence.catalog返回的目录ID仅作导航记录引用；涉及检索日期、命中名单或方法内容时，'
+    '须用evidence.read读取对应/coverage或笔记字段，方法断言仍需绑定原文。'
     '实验尚未获批，禁止执行训练、声称完成基准测量或编造代码提交/数据哈希。'
     '协议必须可执行，但实现代码、运行计时和最终数据校验在设计/实现阶段完成，不应要求它们先于立项共识存在。'
     '当前 execution_constraints 和 hardware.execution_preferences 是执行上限；旧提案的120秒等更小估计不是用户限制，'
@@ -267,6 +269,8 @@ async def deliver(engine, harness, run_id, round_number, context):
             budget_only = not platform and resource_only_work(vote)
             child = {k: copy.deepcopy(v) for k, v in context.items()
                 if not budget_only and (k.endswith('_protocol') or k.endswith('_index'))}
+            if context.get('discussion_generation'):
+                child['discussion_generation'] = context['discussion_generation']
             child.update(objective=store.get('runs', run_id)['objective'], proposal=context['proposal'],
                 proposal_hash=context['proposal_hash'], original_objections=owned,
                 evidence=compact_evidence(engine.evidence_snapshot(run_id)),

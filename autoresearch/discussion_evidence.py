@@ -10,6 +10,8 @@ import copy
 import hashlib
 from pathlib import Path
 
+from .task_record_references import catalog_reference as _catalog_reference
+
 
 GATE = 'Discussion delivery cited evidence outside the saved task index'
 
@@ -95,47 +97,23 @@ def _record_reference(engine, run_id, identifier, tools):
 
 
 def _frozen_request(engine, run_id, handoff_id, progress):
+    from .engine import digest
     handoff = engine.store.get('handoffs', handoff_id, {})
     slot = 'finalization' if progress.get('mode') == 'final_only' else 'normal_request'
-    prepared = progress.get(slot, {}).get('prepared', {})
+    packet = progress.get(slot, {})
+    prepared = packet.get('prepared', {})
     if (handoff.get('id') != handoff_id or handoff.get('run_id') != run_id
             or not handoff_id.startswith(run_id + ':')
             or set(('role', 'task', 'context', 'schema')) - prepared.keys()
             or handoff.get('to_role') != prepared['role']):
         return None
+    if (packet.get('prepared_sha256') is not None or prepared['context'].get('_tool_contract_version') == 1):
+        if packet.get('prepared_sha256') != digest(prepared):
+            return None
     receipts = prepared['context'].get('tool_results', [])
     if not receipts or any(row not in progress.get('tool_results', []) for row in receipts):
         return None
     return prepared
-
-
-def _catalog_reference(engine, run_id, identifier, prepared):
-    """A bounded catalog selection is navigation, even when fully delivered."""
-    from .context_catalog import read
-    artifact = engine.store.get('artifacts', identifier, {})
-    if (artifact.get('id') != identifier or artifact.get('run_id') != run_id
-            or artifact.get('kind') != 'literature_index'):
-        return None
-    for index, tool in enumerate(prepared['context']['tool_results']):
-        call, result = tool.get('call', {}), tool.get('result')
-        args = call.get('arguments', {})
-        if (call.get('name') != 'evidence.read' or not isinstance(result, dict)
-                or result.get('error') or args.get('artifact_id') != identifier
-                or args.get('expected_sha256') != artifact.get('sha256')):
-            continue
-        try:
-            expected = read(engine, run_id, args)
-        except (ValueError, TypeError, KeyError, OSError):
-            continue
-        if expected != result:
-            continue
-        return {'id': identifier, 'kind': 'task_catalog_selection',
-            'sha256': expected['source_sha256'], 'selection_sha256': expected['selection_sha256'],
-            'page_sha256': hashlib.sha256(expected['text'].encode()).hexdigest(),
-            'json_pointer': expected['json_pointer'], 'offset': expected['offset'],
-            'end': expected['offset'] + len(expected['text']), 'total_chars': expected['total_chars'],
-            'primary_source_reading': False, 'tool_result_index': index}
-    return None
 
 
 def _supplied_context(engine, run_id, prepared):
@@ -154,6 +132,10 @@ def _supplied_context(engine, run_id, prepared):
             continue
         active = snapshot['active_context']
         def expand(value):
+            from .context_records import text_slice
+            sliced = text_slice(value, active)
+            if sliced is not None:
+                return sliced
             if isinstance(value, dict) and set(value) == {'$text'}:
                 return active['shared_context_text'][value['$text']]
             if isinstance(value, dict) and set(value) == {'$catalog_record'}:

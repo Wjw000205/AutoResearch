@@ -11,7 +11,7 @@ import json
 import math
 
 from .training_adjustment import obj
-from .training_convergence import finite, monitor_values, _series, segment_identity, failure_observation
+from .training_convergence import finite, monitor_values, _series, segment_identity, failure_observation, paired_fit_events
 
 VERSION = 2
 RESPONSE_CONTRACT_VERSION = 2
@@ -185,7 +185,9 @@ def _association(rows, field):
             'scope': 'Same-step observations in the last 200 batches; descriptive association, not a verified cause.'}
 
 
-def observe(log, metric, direction):
+
+
+def observe(log, metric, direction, *, paired_stages=False):
     """Summaries of the latest contiguous fit only; never read held-out values."""
     events = log.get('events', []) if isinstance(log, dict) else log if isinstance(log, list) else []
     rows, identity, last = [], None, None
@@ -200,6 +202,12 @@ def observe(log, metric, direction):
             rows = []
         identity, last = current, step
         rows.append(row)
+    monitor_rows = rows
+    if paired_stages:
+        training, validation = paired_fit_events(events)
+        if training and validation:
+            rows, monitor_rows = training, validation
+            identity = segment_identity(rows[-1])
     epochs = {}
     for row in rows:
         epoch = row.get('epoch')
@@ -260,8 +268,8 @@ def observe(log, metric, direction):
         for field in ('grad_norm', 'activation_norm', 'update_norm', 'zero_gradient_fraction', 'nonfinite_count')}
         for name in module_names[:16]}
     observed_metric = metric if isinstance(metric, str) and not metric.startswith(('test_', 'held_out')) else None
-    validation = monitor_values(rows, observed_metric, direction)
-    trend, aligned = alignment(rows, aggregated, validation, direction)
+    validation = monitor_values(monitor_rows, observed_metric, direction)
+    trend, aligned = alignment(monitor_rows, aggregated, validation, direction)
     return {'segment_identity': identity, 'stage_identity_complete': bool(identity) and 'unspecified' not in identity[:3],
         'batch_observations': len(rows), 'batch_trend': _series(rows, observed_metric, direction),
         'epoch_count': len(aggregated), 'epoch_trend': _series(aggregated, None, None),
@@ -269,7 +277,7 @@ def observe(log, metric, direction):
         'runtime': runtime, 'failure_event': failure_observation(log, identity),
         'epoch_descriptive_trend': trend, 'validation_alignment': aligned,
         'validation_trajectory': {'metric': observed_metric, 'direction': direction,
-            'points': validation_points(rows, validation),
+            'points': validation_points(monitor_rows, validation),
             'scope': 'Recorded finite validation observations in the latest contiguous fit only; no interpolation or causal conclusion.'},
         'epoch_trajectory': aggregated,
         'tail_associations': {k: _association(rows, k) for k in ('input_norm', 'target_norm', 'grad_norm', 'update_norm')},
@@ -295,7 +303,7 @@ def read(engine, run_id, trial, diagnostic, metric, direction):
         if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != source.get('sha256'):
             return {**result, 'reason': 'Telemetry bytes do not match the frozen diagnosis.'}
         log = json.loads(raw, parse_constant=lambda _: None)
-        observed = observe(log, metric, direction)
+        observed = observe(log, metric, direction, paired_stages=trial.get('fit_monitor_protocol') == 1)
         best = (observed['validation_alignment'].get('best') or {}).get('value')
         final = trial.get('metrics', {}).get(metric) if metric and not metric.startswith(('test_', 'held_out')) else None
         observed['checkpoint_alignment'] = {'metric': metric, 'reported_final': final if finite(final) else None,
@@ -312,6 +320,30 @@ def read(engine, run_id, trial, diagnostic, metric, direction):
         return {**result, 'available': True, **observed}
     except (OSError, ValueError, TypeError, OverflowError):
         return {**result, 'reason': 'Telemetry absent or unreadable; no normal-training inference.'}
+
+
+def fit_histories(engine, run_id, evidence, trial_ids=None):
+    """Re-read the frozen log bytes for a new assessment without replacing a historical observation."""
+    histories = {}
+    for row in evidence['records']:
+        if (row.get('status') != 'completed' or row.get('superseded') or row['params'].get('phase') != 'validation'
+                or trial_ids is not None and row['id'] not in trial_ids):
+            continue
+        diagnostic = evidence.get('diagnostics', {}).get(row['id'], {})
+        monitor = diagnostic.get('monitor') or {}
+        if not diagnostic.get('source', {}).get('sha256') or not monitor.get('metric'):
+            continue
+        derived = read(engine, run_id, {**row, 'fit_monitor_protocol': 1}, diagnostic,
+                       monitor['metric'], monitor['direction'])
+        summary = {key: derived[key] for key in ('source', 'available', 'reason', 'checkpoint_alignment') if key in derived}
+        alignment = derived.get('validation_alignment', {})
+        identity = derived.get('segment_identity')
+        if identity and identity[1] != 'unspecified':
+            summary['fit_id'] = identity[1]
+        if alignment:
+            summary.update({key: alignment[key] for key in ('count', 'best', 'last')})
+        histories[row['id']] = summary
+    return histories
 
 
 def collect(engine, run_id, rows, diagnostics, program, metric, direction):
@@ -428,7 +460,7 @@ def compact(value):
     return result
 
 
-def validate_response(proposal, evidence, pointer, *, parameter_controls=None):
+def validate_response(proposal, evidence, pointer, *, parameter_controls=None, architecture_batch_run=None):
     active = evidence.get('training_investigation') or {}
     if not active.get('required'):
         return
@@ -452,6 +484,8 @@ def validate_response(proposal, evidence, pointer, *, parameter_controls=None):
     if not files or any(not isinstance(p, str) or not p for p in response['module_paths']):
         raise ValueError('Training response requires affected module paths')
     action, disposition, unit_id = proposal['action'], response['disposition'], proposal['unit_id']
+    if architecture_batch_run and action == 'diagnose' and unit_id is not None and disposition != 'coverage_validation':
+        raise ValueError('A frozen architecture comparison with training alerts requires coverage_validation')
     followup = active.get('followup') or {}
     if followup.get('requires_reassessment') and response['followup_outcome'] == 'not_applicable':
         raise ValueError('New verification results must reassess the previous training intervention')
@@ -471,6 +505,8 @@ def validate_response(proposal, evidence, pointer, *, parameter_controls=None):
         if action not in {'diagnose', 'revise_architecture'} or unit_id is not None or not proposal['changes']:
             raise ValueError('Instrumentation/code repair must dispatch concrete scoped code changes')
     elif disposition in {'adjust_parameters', 'controlled_diagnostic'}:
+        if action == 'diagnose' and unit_id is None and proposal['changes']:
+            raise ValueError('A new diagnostic code check requires instrument or repair_code; controlled_diagnostic schedules an existing batch')
         needed = {'learning_rate': ['learning_rate', 'grad_norm'], 'gradient': ['grad_norm'],
             'loss_scale': ['loss_scale', 'grad_norm'], 'data_pipeline': ['input_norm'],
             'batch_noise': [], 'implementation': [], 'telemetry': [],
@@ -509,8 +545,12 @@ def validate_response(proposal, evidence, pointer, *, parameter_controls=None):
         if disposition == 'adjust_parameters' and unit['kind'] not in {'pilot', 'grid'}:
             raise ValueError('Parameter adjustment requires paired baseline/candidate training')
     elif disposition == 'coverage_validation':
-        from .experiment_progression import validate_coverage
-        validate_coverage(proposal, evidence)
+        if architecture_batch_run:
+            from .architecture_validation_batch import validate
+            validate(proposal, evidence, architecture_batch_run)
+        else:
+            from .experiment_progression import validate_coverage
+            validate_coverage(proposal, evidence)
     elif disposition == 'continue':
         observations = active.get('observations', {})
         if response['cause_status'] != 'supported' or response['cause'] not in {'batch_noise', 'telemetry'}:
@@ -535,14 +575,14 @@ def validate_response(proposal, evidence, pointer, *, parameter_controls=None):
         raise ValueError('Unresolved training stop cannot authorize another experiment')
 
 
-def validate_reads(reads, proposal, evidence):
+def validate_reads(reads, proposal, evidence, *, supporting_source_paths=()):
     active = evidence.get('training_investigation') or {}
     if not active.get('required'):
         return
     required = set(active['focus_trial_ids'] or (active.get('followup') or {}).get('new_trial_ids', []))
     modules = set(proposal['training_response']['module_paths'])
     if not all(required.issubset(r.get('training_trials_read', [])) and r.get('source_paths') for r in reads) or \
-            not modules.issubset({p for r in reads for p in r.get('source_paths', [])}):
+            not modules.issubset(set(supporting_source_paths).union(*(r.get('source_paths', []) for r in reads))):
         raise ValueError('All three agents must read the affected training evidence and relevant module source before this intervention')
 
 
@@ -622,3 +662,41 @@ async def analysis_reads(engine, harness, run_id, analyses, context, instruction
         results.append(updated)
         reads.append(receipt)
     return results, reads
+
+
+async def independent_analyses(engine, harness, run_id, purpose, instruction, context, schema):
+    """New full-group analyses finish their own evidence reads before adoption."""
+    from . import independent_full_review as full
+    from .experiment_decisions import analysis_receipts
+    from .engine import ResearchBlocked
+    scope=context.get('experiment_decision',{}).get('training_investigation') or {}
+    required=set(scope.get('focus_trial_ids',[]))
+    if scope.get('requires_reassessment') and not required:
+        ref=context['validation_evidence']
+        source=engine.store.get('experiment_evidence',ref['id'])['summary']
+        required=set(source['training_investigation']['followup']['new_trial_ids'])
+    def validate_vote(vote):
+        try:
+            read=analysis_receipts(engine,run_id,vote,context,purpose=purpose,instruction=instruction)
+            if scope.get('required') and (not required.issubset(read.get('training_trials_read',[])) or not read.get('source_paths')):
+                from .training_read_dispatch import _pending, _targets
+                error = ResearchBlocked('Read all frozen affected trials and relevant source before completing the independent analysis')
+                targets = _pending(_targets(engine, run_id, context, {}, read, required))
+                if not read.get('source_paths'):
+                    ref = context['validation_evidence']
+                    base = {'evidence_id': ref['id'], 'expected_sha256': ref['sha256'], 'snapshot': 'current', 'limit': 6000}
+                    previous = (context['experiment_decision'].get('recent_revision') or {}).get('resource_revision_request', {})
+                    paths = previous.get('body', {}).get('original_proposal', {}).get('training_response', {}).get('module_paths', [])
+                    targets.append({'requirement': '从本版已执行源码中独立读取与本分析有关的模块正文，并引用本角色本次或父交接的实际回执。',
+                        'prior_module_paths': paths, 'index_call': {'name': 'experiments.inspect_module', 'arguments': base},
+                        'source_view': '在 index_call.arguments 中添加精确 path 和 view=source 读取正文。'})
+                error.next_read_targets = targets
+                raise error
+        except ResearchBlocked as exc:
+            error=ValueError(str(exc))
+            error.covered_chars=full.read_progress(engine.store,run_id,vote,
+                {'experiments.analyze','experiments.inspect_module','experiments.compare','experiments.read'})
+            error.missing_read_targets=getattr(exc.__cause__,'pages',[])
+            error.next_read_targets = getattr(exc, 'next_read_targets', None)
+            raise error from exc
+    return await full.group(harness,run_id,purpose,instruction,context,schema,validator=validate_vote)

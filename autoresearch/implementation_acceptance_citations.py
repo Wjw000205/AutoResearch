@@ -62,7 +62,8 @@ def correction_context(engine, run_id, source):
     refs = list({digest(ref):ref for ref in refs}.values())
     # Authenticate actual original-role delivery as well as local source bytes.
     # No source text is supplied merely because it exists in the document index.
-    flow.validate_refs(engine, run_id, source['handoff_id'], context, refs, field='citation_correction.source_evidence')
+    flow.validate_refs(engine, run_id, source['handoff_id'], context, refs,
+                       field='citation_correction.source_evidence', report_evidence=True)
     if not any(r['document_id'] in approved for r in refs):
         policy.fail('原交接没有实际读取并投递的批准来源，不能只补引用。')
     evidence, cache = [], {}
@@ -143,15 +144,3 @@ def validate_packet(engine, run_id, packet):
     return source['context']
 
 
-async def correct(engine, h, run_id, state, row, source, diagnostic):
-    from . import implementation_acceptance_flow as flow
-    if diagnostic != {'version':1,'kind':'missing_approved_source_references','criteria':_targets(source)}:
-        policy.fail('批准来源引用修正诊断与原报告不一致。')
-    context = await engine._read_consensus_check(run_id, correction_context, engine, run_id, source)
-    amendment = await flow.ask(engine, h, run_id, state, _purpose(engine, source), source['role'],
-                               INSTRUCTION, context, schema(context))
-    result = apply(source, amendment['result'], context)
-    packet = {**copy.deepcopy(source), 'result':result, 'citation_correction':{
-        'version':1, 'original_report':copy.deepcopy(source['result']), 'amendment':amendment}}
-    await engine._read_consensus_check(run_id, flow.validate_report, engine, run_id, row, packet)
-    return packet

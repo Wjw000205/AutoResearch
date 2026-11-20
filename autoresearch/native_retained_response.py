@@ -11,6 +11,24 @@ import hashlib
 import json
 
 
+def captured_delivery(store, saved, frozen):
+    """Read the exact input delivered for this operation and frozen assignment."""
+    from .codex_reasoning import ENVELOPE_INSTRUCTION
+    from .memory_capture import read_captured_input, sha_text
+    binding = saved.get('memory_capture_binding') or {}
+    if (binding.get('handoff_id') != frozen['id'] or binding.get('operation_id') != saved['operation_id']
+            or saved['run_id'] != frozen['run_id'] or not binding.get('context_snapshot_id')):
+        return None
+    snapshot = store.get('context_snapshots', binding['context_snapshot_id'], {})
+    wire = read_captured_input(snapshot, saved['run_id'], saved['role'])
+    if not wire or any(binding.get(k) != v for k, v in wire['binding'].items()):
+        return None
+    instruction = wire['system'] + '\n\n' + wire['user'] + ('' if saved.get('native_task_schema') else ENVELOPE_INSTRUCTION)
+    if instruction != saved.get('instruction') or sha_text(instruction) != saved['checkpoint'].get('instruction_sha256'):
+        return None
+    return wire
+
+
 def recover(intelligence, saved, *, schema_repair=None, strict_source=False):
     from .codex_reasoning import TRANSPORT_SCHEMA
     from .intelligence import ProviderError, parse_provider_json

@@ -18,6 +18,25 @@ from .fair_comparison import assert_same_task
 
 
 ROLES = ("director", "engineer", "scout")
+
+
+def review_request_schema(prepared, purpose, context):
+    """Bind new protocol and validation ballots to the revision actually under review."""
+    kind = purpose.split(':', 1)[0]
+    titles = {'protocol_review': 'Premeasurement protocol review', 'cycle_review': 'Measured validation review'}
+    if kind not in titles:
+        return prepared
+    schema = copy.deepcopy(prepared['schema'])
+    for branch in schema.get('anyOf', [schema]):
+        fields = branch.get('properties', {})
+        if 'approve' in fields:
+            branch['title'] = titles[kind]
+            for field in ('proposal_hash', 'revision_hash'):
+                if field in fields and isinstance(context.get(field), str):
+                    fields[field] = {**fields[field], 'const':context[field]}
+    return {**prepared, 'schema': schema}
+
+
 STOP_WARNING_CODES = {"small_sample", "unverified_tuning_budget"}
 ASSUMPTIONS = [
     "Candidate selection uses completed, non-superseded validation records only; held-out test scores are never selection evidence.",
@@ -324,6 +343,9 @@ def decide_cycle(summary, reviews, cycle, max_cycles, min_relative_improvement=0
             or not isinstance(iteration_policy.get("rationale"), str) or not iteration_policy["rationale"].strip()):
         raise ValueError("iteration_policy must declare stop or revise and a nonempty rationale")
     reasons = []
+    if summary.get('metric_contract'):
+        from .metric_contract import decide as decide_bound
+        return decide_bound(summary, reviews, cycle, max_cycles, min_relative_improvement, iteration_policy)
     enough = summary.get("phase") == "validation" and isinstance(summary.get("metric"), str) and summary["metric"].startswith("val_") \
         and summary.get("comparable") is True and type(summary.get("n_pairs")) is int and summary["n_pairs"] > 0 \
         and _finite(summary.get("improvement")) and summary["improvement"] > 0 \
@@ -345,8 +367,8 @@ def decide_cycle(summary, reviews, cycle, max_cycles, min_relative_improvement=0
         reasons.append('The selected validation pair failed or lacks evidence for at least one predeclared primary/secondary numeric criterion.')
     targets = (summary.get("proposal_hash"), summary.get("revision_hash"))
     bound = all(isinstance(value, str) and value.strip() for value in targets)
-    exact_roles = len(reviews) == len(ROLES) and all(isinstance(review, dict) for review in reviews) \
-        and sorted(str(review.get("role")) for review in reviews) == sorted(ROLES)
+    from .independent_full_review import members
+    exact_roles = members(reviews)
     unanimous = bound and exact_roles and all(review.get("approve") is True
         and review.get("proposal_hash") == targets[0] and review.get("revision_hash") == targets[1]
         and review.get("required_changes", []) == [] for review in reviews)
@@ -358,7 +380,7 @@ def decide_cycle(summary, reviews, cycle, max_cycles, min_relative_improvement=0
         decision = "blocked"
     elif enough and unanimous and not reported_negative_stop_hold(summary, iteration_policy):
         decision = "finalize"
-        reasons.append("The validation improvement meets the threshold and all three roles accept this exact candidate; freeze it before held-out evaluation.")
+        reasons.append("The validation improvement meets the threshold and each independent reviewer accepts this exact candidate; freeze it before held-out evaluation.")
     elif bound and failure and iteration_policy and iteration_policy["on_validation_failure"] == "stop":
         decision = "stop"
         reasons.append("The predeclared stop policy ends this study with a descriptive negative validation result. "

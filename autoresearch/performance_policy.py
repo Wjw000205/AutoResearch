@@ -350,12 +350,8 @@ async def adopt(engine, run_id, snapshot_id, metric, direction, instruction):
             if frozen['snapshot_id'] != snapshot_id:
                 raise ValueError('规则或证据已变化，请重新预览。')
             return frozen, [save(engine.store, run_id, ref) for ref in frozen['policy']['source_refs']]
-        task = asyncio.create_task(asyncio.to_thread(prepare))
-        try:
-            frozen, archived = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+        from .async_ownership import to_thread
+        frozen, archived = await to_thread(prepare)
         if engine.store.get('runs', run_id) != run:
             raise ValueError('任务状态已变化，未提交规则。')
         body = {**frozen['policy'], 'operator_instruction': instruction.strip()}

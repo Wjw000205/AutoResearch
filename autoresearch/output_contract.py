@@ -1,5 +1,10 @@
 """Shared response contracts and a concise pre-submission checklist."""
 
+FINAL_SCHEMA_PREFIX = (
+    '\nFINAL OUTPUT CONTRACT (authoritative): return exactly this schema at the top level, '
+    'without a proposal/result/stage wrapper and without extra fields. Keep each prose field concise. '
+)
+
 READING_PLAN_SCHEMA = {
     'type': 'object',
     'properties': {

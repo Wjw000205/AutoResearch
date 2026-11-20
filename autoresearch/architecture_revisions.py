@@ -246,7 +246,7 @@ async def inputs(engine, h, run_id, record, original):
     """Freeze directories, current host receipts and already validated RAG notes."""
     from .engine import digest
     from . import architecture_documents as architecture
-    from .execution_contract import constraints, host_budget_snapshot
+    from .execution_contract import current_constraints, host_budget_snapshot
     from .lab import assess_resources
     from .literature_notes import notes_view
     if record.get('inputs'):
@@ -256,7 +256,7 @@ async def inputs(engine, h, run_id, record, original):
     proposal = engine.store.get('consensus', run_id)['proposal']
     hardware = await engine.execution_hardware(run_id)
     authority = {'version': 1, 'checked_at': now(), 'run_id': run_id,
-        'proposal_hash': digest(proposal), 'execution_constraints': constraints(run['config']),
+        'proposal_hash': digest(proposal), 'execution_constraints': current_constraints(engine.store, run_id),
         'current_call_budget': host_budget_snapshot(engine.store, run_id, proposal, digest(proposal), engine.cycle(run_id)),
         'operator_authorization': record.get('operator_authorization'),
         'resource_admission': {'source': 'host current hardware/preferences and original resource_plan',
@@ -292,7 +292,7 @@ async def inputs(engine, h, run_id, record, original):
                           text, 'validated_literature_note'))
     docs.extend(_benchmark_sources(engine, run_id, latest, proposal, original, docs))
     record.update(inputs=docs, authority_document=authority_doc,
-                  proposal_hash=saved['proposal_hash'], execution_constraints=constraints(run['config']))
+                  proposal_hash=saved['proposal_hash'], execution_constraints=authority['execution_constraints'])
     engine.store.put('architecture_revisions', record['id'], record)
     return docs
 
@@ -342,6 +342,10 @@ def review_context(engine, run_id, design, *, read_window_protocol=None):
         context['document_read_window_protocol'] = 1
     from .dataset_transition import review_scope
     context.update(review_scope(engine.store, run_id))
+    from .dataset_contract import from_design
+    request_catalog = from_design(design)
+    if request_catalog:
+        context.update(dataset_catalog=copy.deepcopy(request_catalog), dataset_request_protocol=2)
     return context
 
 
@@ -350,15 +354,25 @@ def _save_protocol_context(engine, h, run_id, design, plan, acceptance, policy,
     """Save on the caller after its definition ancestry has been checked."""
     from .engine import digest
     from . import architecture_documents as architecture
+    saved = architecture.save(engine, h, run_id, design)
+    if saved.get('io_template_review') == 1:
+        from .io_matrix import protocol_plan
+        plan = protocol_plan(plan)
     payload = {'experiment_plan': plan, 'acceptance': acceptance, 'iteration_policy': policy,
                'task_primary_threshold': engine.store.get('runs', run_id)['config'].get('min_relative_improvement', .01)}
     text = '# 新架构的预定执行计划\n\n本版本无测量结果；不得改写原冻结计划。\n\n'
+    if (policy != design['iteration_policy'] or any(
+            acceptance.get(k) != design['acceptance'].get(k) for k in ('complete', 'limitations'))):
+        text += ('本版为架构模板 ' + saved['document']['sha256'] + ' 的协议修订附件。'
+                 '下列 acceptance 与 iteration_policy 为待三方评审的完整替换条款。\n\n')
     for field, value in payload.items():
         text += '## ' + field + '\n\n```json\n' + architecture._json(value) + '\n```\n\n'
     doc = _save(engine, h, run_id,
         f'cycle-{engine.cycle(run_id)}/architecture/{digest(design)}/protocol/{revision_hash}.md', text, 'revised_experiment_protocol')
-    saved = architecture.save(engine, h, run_id, design)
     ctx = copy.deepcopy(checked_context)
+    if plan.get('matrix_acceptance'):
+        from .execution_contract import current_constraints
+        ctx['execution_constraints'] = current_constraints(engine.store, run_id)
     ctx.update(proposal_hash=proposal_hash, revision_hash=revision_hash, design_hash=digest(design),
                protocol_document=doc, task_primary_threshold=payload['task_primary_threshold'],
                indexed_documents=[doc, saved['document'], *[
@@ -389,26 +403,44 @@ def validate_plan(engine, run_id, record, design):
     run = engine.store.get('runs', run_id)
     from .experiment_plan import build_for_engine
     expected = build_for_engine(engine, run_id, design, run['config']['max_trials'])
+    if record.get('metric_contract'):
+        from .metric_contract_recovery import checked
+        checked(engine, run_id, record, design)
+        expected.update(metric_contract=record['metric_contract'],
+                        metric_contract_work_order=record['metric_contract_work_order'])
     acceptance, policy = design['acceptance'], design['iteration_policy']
+    if record.get('metric_contract', {}).get('acceptance_source') is not None:
+        from .metric_protocol_revisions import checked as checked_revision
+        acceptance, policy = checked_revision(engine, run_id, record, design)
     from .performance_policy import MODE, classify
     if record.get('acceptance', {}).get('policy') == MODE:
-        acceptance = classify(acceptance, design['primary_metric'])
+        acceptance = classify(acceptance, expected.get('matrix_acceptance', {}).get('metric', design['primary_metric']))
     ph = digest(engine.store.get('consensus', run_id)['proposal'])
+    from .protocol_amendments import replay_threshold
+    threshold = replay_threshold(engine, run_id, record, run['config'].get('min_relative_improvement', .01))
+    if record.get('protocol_amendments'):
+        from .protocol_amendments import replay
+        acceptance, policy = replay(engine, run_id, record, expected, acceptance, policy,
+            threshold, digest(design), ph)
     rh = digest({'plan': expected, 'acceptance': acceptance, 'iteration_policy': policy,
-                 'task_primary_threshold': run['config'].get('min_relative_improvement', .01)})
+                 'task_primary_threshold': threshold})
     if (record['id'] != plan_key(engine, run_id) or record.get('acceptance') != acceptance
             or record.get('iteration_policy') != policy or record.get('protocol_revision_hash') != rh
             or any(record.get(k) != v for k, v in expected.items())):
         raise ResearchBlocked('修订架构冻结计划与具体设计或已评议版本不一致。')
     votes = record.get('protocol_votes', [])
-    if len(votes) != 3 or {v.get('role') for v in votes} != {'director', 'engineer', 'scout'}:
+    from . import independent_full_review as full_review
+    if not full_review.members(votes):
         raise ResearchBlocked('修订架构计划缺少完整三方评议。')
     for vote in votes:
+        if full_review.KEY in vote:
+            full_review.authenticate(engine.store, run_id, vote)
+            full_review.validate_delivery(engine.store, run_id, vote, engine=engine)
         decision = engine.store.get('decisions', record.get('protocol_handoffs', {}).get(vote['role'], ''), {})
         if (vote.get('approve') is not True or vote.get('required_changes')
                 or vote.get('proposal_hash') != ph or vote.get('revision_hash') != rh
                 or decision.get('role') != vote['role'] or decision.get('run_id') != run_id
-                or decision.get('result') != {k: v for k, v in vote.items() if k != 'role'}):
+                or decision.get('result') != full_review.answer(vote)):
             raise ResearchBlocked('修订架构计划缺少同一版本真实评议交付。')
     from .protocol_review_recovery import COLLECTION, key as protocol_key
     segmented = engine.store.get(COLLECTION, protocol_key(run_id, rh))
@@ -421,13 +453,15 @@ def validate_plan(engine, run_id, record, design):
 
 def _objections(review):
     from .engine import digest
-    if review.get('review_recovery_protocol') == 1:
+    from .architecture_full_review import FIELD as FULL
+    if review.get('review_recovery_protocol') == 1 and FULL not in review:
         from .architecture_review_recovery import effective_source
         review = effective_source(review)
     # Final summaries may omit a section blocker. Preserve all actual dissent;
     # duplicate text from the same role shares the final issue's historical ID.
     objections = {}
-    for final, vote in [(True, v) for v in review.get('reviews', [])] + [(False, v) for v in review.get('unit_reviews', [])]:
+    units=[] if FULL in review else review.get('unit_reviews',[])
+    for final, vote in [(True, v) for v in review.get('reviews', [])] + [(False, v) for v in units]:
         updates = vote.get('progress', {}).get('issue_updates') if final else None
         stable_ids = {index: u['issue_id'] for u in updates or []
                       if u.get('disposition') in {'carried_forward', 'reopened'}
@@ -628,14 +662,16 @@ async def run(engine, h, run_id, original):
     docs = await inputs(engine, h, run_id, record, original)
     if not record.get('pending'):
         objections = _objections(review)
+        from .dataset_configuration_queue import trial_limit as effective_trial_limit
+        from .execution_contract import current_constraints
         context = review_context(engine, run_id, design)
         docs = context['indexed_documents']
-        context = {**context, 'source_tool_protocol': 1,
+        context = {**context, 'source_tool_protocol': 1, 'execution_constraints': current_constraints(engine.store, run_id),
             'research_cycle': engine.cycle(run_id), 'proposal_hash': record['proposal_hash'],
             'parent_design_hash': digest(design), 'architecture_document': review['document'],
             'indexed_documents': [review['document'], *[d for d in docs if d['document_id'] != review['document']['document_id']]],
             'review_fixes': objections, 'revision_number': len(record['revisions']) + 1,
-            'trial_budget': engine.store.get('runs', run_id)['config']['max_trials'],
+            'trial_budget': effective_trial_limit(engine.store,run_id,engine.store.get('runs', run_id)['config']['max_trials']),
             'per_trial_seconds': engine.store.get('runs', run_id)['config']['experiment_timeout']}
         if convergence.enabled(engine, run_id):
             context.update(convergence.context(engine, run_id, 'architecture', design))
@@ -654,6 +690,12 @@ async def run(engine, h, run_id, original):
             '否则 resolved_issue_ids须逐一覆盖本次意见，change_summary描述实质修改。不要写代码或运行实验。')
         from .design_review_policy import AUTHOR
         instruction += AUTHOR
+        from .dataset_contract import bind_request, from_design
+        request_catalog = from_design(design)
+        if request_catalog:
+            context['dataset_catalog'] = copy.deepcopy(request_catalog)
+            instruction, context, dataset_schema = bind_request(instruction, context, schema['properties']['design'])
+            schema['properties']['design'] = dataset_schema
         if context.get('architecture_progress_protocol') == convergence.VERSION:
             instruction += convergence.AUTHOR
         purpose = f'design_revision:{engine.cycle(run_id)}:{digest(design)}:{len(record["revisions"])+1}'
@@ -668,6 +710,9 @@ async def run(engine, h, run_id, original):
         engine.store.event(run_id, 'architecture.revision_started', '正在按独立修改意见编写新架构版本。',
             {'parent_design_hash': digest(design), 'revision': len(record['revisions']) + 1})
     pending = record['pending']
+    if pending['context'].get('resource_revision_correction'):
+        from .architecture_resource_correction import seed_template
+        seed_template(engine, h, run_id, pending)
     from .intelligence import ProviderError
     try:
         local_revalidation = (record.get('delivery_validation') or {}).get('local_revalidation')
@@ -703,7 +748,12 @@ async def run(engine, h, run_id, original):
             delivery_recovery.activate(engine, h, run_id, record)
             return design
     else:
-        new_design = {**design, **result['design']}
+        from .io_matrix import materialize as materialize_design
+        try:
+            revised = materialize_design(result['design'], dataset_catalog=pending['context'].get('dataset_catalog'))
+        except ValueError as exc:
+            raise ResearchBlocked('架构修订数据集绑定校验未通过：' + str(exc)) from exc
+        new_design = {**design, **revised}
     dh = digest(new_design)
     prior_designs = [original, *[row['design'] for row in record['revisions']]]
     if (dh in [digest(d) for d in prior_designs]
@@ -728,9 +778,12 @@ async def run(engine, h, run_id, original):
         audit, _ = delivery_recovery.checked_local_revalidation(engine, run_id, local_revalidation['audit_id'], pending=pending)
         if audit['payload']['candidate_hash'] != dh or audit['payload']['plan_hash'] != digest(checked_plan):
             raise ResearchBlocked('本地复验后的候选或冻结实验矩阵发生变化；未登记新版本。')
-    assessment = assess_resources(new_design['resource_plan'], await engine.execution_hardware(run_id))
+    hardware = await engine.execution_hardware(run_id)
+    assessment = assess_resources(new_design['resource_plan'], hardware)
     if not assessment['approved']:
-        raise ResearchBlocked('修订架构未通过当前资源准入。')
+        from .architecture_resource_correction import handle_denial
+        handle_denial(engine, h, run_id, record, review, design, result, assessment, hardware)
+        return design
     row = {'number': len(record['revisions']) + 1, 'parent_design_hash': digest(design),
            'design': new_design, 'design_hash': dh, 'response': result,
            'handoff_id': pending['handoff_id'], 'created_at': now()}

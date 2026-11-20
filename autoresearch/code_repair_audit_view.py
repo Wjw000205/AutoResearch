@@ -43,6 +43,11 @@ def complete_view(packet):
         ('version', 'source_sha256', 'spec_hash', 'delivery_hash', 'review_scope')}
     result['view_version'] = 2
     result['source_packet_sha256'] = repair.sha(packet)
+    host = packet.get('clarification', {}).get('host_constraint_reconciliation')
+    if host:
+        result['host_constraint_reconciliation'] = copy.deepcopy(host)
+    if packet.get('clarification',{}).get('evidence_work_item'):
+        result['evidence_work_item']=copy.deepcopy(packet['clarification']['evidence_work_item'])
     if packet.get('audit_revision'):
         result['previous_audit'] = copy.deepcopy(packet['audit_revision'])
     result['documents'] = [{**{k: copy.deepcopy(v) for k, v in doc.items() if k != 'segments'},
@@ -90,6 +95,10 @@ def view(packet, target_ids=None):
         'source_sha256', 'spec_hash', 'delivery_hash')}
     if 'previous_audit' in full:
         result['previous_audit'] = full['previous_audit']
+    if 'host_constraint_reconciliation' in full:
+        result['host_constraint_reconciliation'] = copy.deepcopy(full['host_constraint_reconciliation'])
+    if 'evidence_work_item' in full:
+        result['evidence_work_item']=copy.deepcopy(full['evidence_work_item'])
     result['items'] = [i for i in full['items'] if i['issue_id'] in ids]
     result['deferred_items'] = [{k: i[k] for k in ('issue_id', 'role', 'issue', 'requirement_id', 'fixes')}
         for i in full['deferred_items']]

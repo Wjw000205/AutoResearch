@@ -368,6 +368,8 @@ def capture(h, run_id, role, key, prepared, result, progress, response_id=None):
 
 
 def prepare(h,run_id,role,key,progress,prepared):
+    from .document_read_convergence import guard as read_convergence_guard
+    read_convergence_guard(h, run_id, role, key, progress, prepared['context'])
     closeout = _closeout(prepared['context'], run_id, role, key, progress)
     retained = (prepared['context'].get('document_read_window_protocol') == 3
                 and prepared['context'].get('implementation_acceptance_protocol') == 1)

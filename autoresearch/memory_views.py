@@ -514,6 +514,10 @@ def _resolve(value, active):
               '$shared_text': active.get('shared_text', {})}
     seen = set()
     for _ in range(40):
+        from .context_records import text_slice
+        sliced = text_slice(value, active)
+        if sliced is not None:
+            return sliced
         if not isinstance(value, dict) or len(value) != 1:
             return value
         kind = next(iter(value))

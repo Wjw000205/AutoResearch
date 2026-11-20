@@ -18,6 +18,8 @@ tuning_scope.acceptance 是宿主对当前绑定重新核验后的范围批准�
 def project(engine, run_id, record, plan):
     """Caller has just verified the plan, owners, reads and all effective votes."""
     final = record['rounds'][-1]
+    from .independent_full_review import KEY, REVIEWERS, LEGACY_REVIEWERS
+    roles = REVIEWERS if final.get(KEY) else LEGACY_REVIEWERS
     votes = {}
     for role, original in final['votes'].items():
         request = active_vote(original)
@@ -25,13 +27,14 @@ def project(engine, run_id, record, plan):
         votes[role] = {'purpose': request['purpose'], 'answer_sha256': sha(answer),
             **{k: copy.deepcopy(answer[k]) for k in ('approve', 'rationale', 'issues')}}
     if (record['status'] != 'accepted' or record['plan_sha256'] != sha(plan)
-            or set(votes) != {'director', 'engineer', 'scout'}
+            or set(votes) != set(roles)
             or any(not v['approve'] or v['issues'] for v in votes.values())):
         raise ValueError('Scope acceptance requires the verified effective independent votes')
     from .tuning_scope_context import historical_check
     archive = engine.store.get('experiment_evidence', record['evidence']['id'])
     historical = historical_check(engine, run_id, archive['summary'])
     body = {'version': 1, 'scope_id': record['id'], 'plan_sha256': record['plan_sha256'],
+        **({KEY: copy.deepcopy(final[KEY])} if final.get(KEY) else {}),
         'binding': copy.deepcopy(record['binding']), 'source_evidence': copy.deepcopy(record['evidence']),
         'accepted_at': record['updated_at'], 'effective_votes': votes,
         'verification': 'Current source identity, author, same-role read coverage and effective votes verified by host',

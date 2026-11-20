@@ -88,7 +88,8 @@ _PUBLIC_HARDWARE = {
 _PUBLIC_EVIDENCE = {'novelty_search_scope': {
     'exhaustive': None, 'policy': None,
     'queries': [{**dict.fromkeys(('receipt_id', 'plan_id', 'as_of_date', 'query', 'base_query',
-        'facet', 'sort', 'year_from', 'year_to', 'scout_requested', 'successful')),
+        'facet', 'sort', 'year_from', 'year_to', 'scout_requested', 'successful',
+        'result_sha256', 'completed_stage_id')),
         'paper_ids': [None], 'errors': [dict.fromkeys(('source', 'error', 'status_code', 'checked_at'))]}]}}
 
 

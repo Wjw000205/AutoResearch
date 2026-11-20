@@ -87,9 +87,13 @@ def pending_continuation(h, run_id, role, purpose, key, progress):
     for entry in history:
         if entry.get('confirmation_scope_problems'):
             _verify_confirmation_source(h.engine, run_id, role, purpose, key, context, progress, entry)
-    if last.get('code_reference_problems'):
-        from .code_evidence_reference_correction import verify_archive
-        verify_archive(h.engine, run_id, role, purpose, key, context, last)
+    for entry in history:
+        if entry.get('code_reference_problems'):
+            from .code_evidence_reference_correction import verify_archive
+            verify_archive(h.engine, run_id, role, purpose, key, context, entry)
+        if entry.get('code_reference_delivery_problems'):
+            from .code_reference_delivery_recovery import verify_archive as verify_delivery
+            verify_delivery(h.engine, run_id, role, purpose, key, context, progress, entry)
     if last.get('code_repair_response_problems'):
         from .code_repair_response_correction import verify_archive
         verify_archive(h.engine, run_id, role, purpose, key, context, last)
@@ -224,9 +228,21 @@ def _diagnostic(result, error, attempt, context, reference_problems, indexed_mis
                     '不能自动替换哈希、仅为通过校验选无关来源、删除尚无支持的义务或把未读写成 aligned；'
                     '若批准正文缺少决定性规定，应保留 pending/mismatch 并给出具体补充与验证方法。'})
         # Invalid pointers are correction targets, never suggested read credit.
-        rejected = {digest(row['reference']) for row in reference_problems}
-        diagnostic['alignment_read_correction']['source_refs'] = [
-            ref for ref in diagnostic['alignment_read_correction']['source_refs'] if digest(ref) not in rejected]
+        for field in ('source_refs','implementation_refs'):
+            rejected = {digest(row['reference']) for row in reference_problems
+                        if row.get('reference_field','source_refs') == field}
+            plan = diagnostic['alignment_read_correction']
+            plan[field] = [ref for ref in plan[field] if digest(ref) not in rejected]
+        if any(row.get('reference_field') == 'implementation_refs' for row in reference_problems):
+            doc = context['implementation_document']
+            target = diagnostic['alignment_reference_correction']
+            target['allowed_implementation_document'] = {
+                'document_id':doc['document_id'], 'document_sha256':doc['sha256'],
+                'sections':[{'id':s['id'],'chars':s['end']-s['start']} for s in doc['sections']]}
+            target['instruction'] = ('按 invalid_references 中的 evidence_index 和 reference_index 核对原答复。'
+                'code_evidence 的 implementation_refs 只能指向 allowed_implementation_document。'
+                '通过 documents.read 核对当前版本与条款，按章节内字符位置修订引用。'
+                '保留原判断和所有尚未解决的意见，再提交完整答复。')
     return diagnostic
 
 
@@ -242,6 +258,8 @@ async def before_commit(h, run_id, role, purpose, key, result):
         return False
     if engine.store.get('handoffs', key, {}).get('purpose') != purpose:
         raise ResearchBlocked('对齐补读目的与原始冻结交接不一致。')
+    if not isinstance(engine.store.get('handoff_progress', key, {}), dict):
+        raise ResearchBlocked('对齐审查检查点格式无效，原记录保留。')
     engine.check_active(run_id)
     from .implementation_author_read_recovery import validate_scope as validate_author_read_scope
     await engine._read_consensus_check(run_id, validate_author_read_scope,
@@ -258,22 +276,43 @@ async def before_commit(h, run_id, role, purpose, key, result):
     progress = engine.store.get('handoff_progress', key, {})
     history = progress.get(HISTORY, [])
     from . import code_evidence_reference_correction as code_references
-    if isinstance(history, list) and history and isinstance(history[-1], dict) and history[-1].get(code_references.FIELD):
+    from . import code_reference_delivery_recovery as reference_deliveries
+    if isinstance(history, list):
+        for archived_delivery in history:
+            if isinstance(archived_delivery, dict) and archived_delivery.get(reference_deliveries.FIELD):
+                await engine._read_consensus_check(run_id, reference_deliveries.verify_archive,
+                    engine, run_id, role, purpose, key, context, progress, archived_delivery)
+    reference_source = next((item for item in reversed(history) if isinstance(item, dict)
+                             and item.get(code_references.FIELD)), None) if isinstance(history, list) else None
+    if reference_source:
         await engine._read_consensus_check(run_id, code_references.verify_archive,
-            engine, run_id, role, purpose, key, context, history[-1])
-        code_references.validate_correction(result, history[-1])
+            engine, run_id, role, purpose, key, context, reference_source)
+        try:
+            code_references.validate_correction(result, reference_source)
+        except reference_deliveries.DeliveryRejected:
+            return await reference_deliveries.schedule(h, run_id, role, purpose, key, result, reference_source)
     from . import code_repair_response_correction as repair_responses
     if isinstance(history, list) and history and isinstance(history[-1], dict) and history[-1].get(repair_responses.FIELD):
         repair_responses.verify_archive(engine, run_id, role, purpose, key, context, history[-1])
-        repair_responses.validate_correction(result, history[-1])
+        try:
+            repair_responses.validate_correction(result, history[-1])
+        except ResearchBlocked:
+            from .review_evidence_supplement import retry_full_rewrite
+            if retry_full_rewrite(h,run_id,key,result,engine.store.get('handoff_progress',key)):
+                return True
+            raise
     from .implementation_alignment import FINDINGS_DUPLICATE
     format_source = next((item for item in reversed(history) if isinstance(item, dict)
                           and (item.get('findings_format_problems') or item.get('diagnostic') == FINDINGS_DUPLICATE)),
                          None) if isinstance(history, list) else None
     if format_source:
         _verify_format_source(format_source, role, purpose)
-        _preserve_format_candidate(result, format_source['candidate'], context,
-                                   format_source['findings_format_problems'])
+        if stage == 'code_review':
+            from .review_response_policy import validate_binding
+            validate_binding(result, format_source['candidate'])
+        else:
+            _preserve_format_candidate(result, format_source['candidate'], context,
+                                       format_source['findings_format_problems'])
     from . import implementation_review_routing_correction as coordinates
     coordinate_source = next((item for item in reversed(history) if isinstance(item, dict)
                               and (item.get('routing_coordinate_problems')
@@ -284,7 +323,11 @@ async def before_commit(h, run_id, role, purpose, key, result):
         # An unchanged invalid answer stays in the same correction history.
         # It cannot become a decision or an approval.
         if digest(result) != coordinate_source['candidate_sha256']:
-            coordinates.validate_correction(result, coordinate_source['candidate'], context, role)
+            if stage == 'code_review':
+                from .review_response_policy import validate_binding
+                validate_binding(result, coordinate_source['candidate'])
+            else:
+                coordinates.validate_correction(result, coordinate_source['candidate'], context, role)
     from . import implementation_confirmation_scope_correction as confirmations
     confirmation_source = next((item for item in reversed(history) if isinstance(item, dict)
                                 and item.get('confirmation_scope_problems')), None) if isinstance(history, list) else None
@@ -313,6 +356,8 @@ async def before_commit(h, run_id, role, purpose, key, result):
         else:
             await engine._read_consensus_check(run_id, validate_candidate,
                 engine, run_id, role, key, result, context, delivery=stage == 'code_review')
+            if stage == 'code_review':
+                repair_responses.validate_delivery(result, context, role)
     except ResearchBlocked as exc:
         if getattr(exc, 'author_revision_problems', None):
             revision_problems = exc.author_revision_problems
@@ -372,25 +417,32 @@ async def before_commit(h, run_id, role, purpose, key, result):
     except ValueError as exc:
         raise ResearchBlocked(str(exc)) from exc
     engine.check_active(run_id)
-    if repair_response_problems and (coordinate_problems or reference_problems or format_problems
+    if stage != 'code_review' and repair_response_problems and (coordinate_problems or reference_problems or format_problems
             or confirmation_problems or convergence_violation or revision_problems or code_reference_problems):
         raise ResearchBlocked('代码意见补正同时出现其他来源或身份错误，原答复保留。')
-    if code_reference_problems and (coordinate_problems or reference_problems or format_problems
+    if stage != 'code_review' and code_reference_problems and (coordinate_problems or reference_problems or format_problems
                                     or confirmation_problems or convergence_violation or revision_problems):
         raise ResearchBlocked('代码引用补正同时出现其他格式或范围错误，原回复保留，未重新提交。')
-    if convergence_violation and (indexed_missing_ranges or reference_problems or format_problems
+    if stage != 'code_review' and convergence_violation and (indexed_missing_ranges or reference_problems or format_problems
                                   or confirmation_problems or coordinate_problems):
         raise ResearchBlocked('实现评议同时含复核范围和其他不支持的格式或来源错误，未登记批准；原候选保留。')
     if coordinate_problems:
-        if format_problems or reference_problems or confirmation_problems:
+        if stage != 'code_review' and (format_problems or reference_problems or confirmation_problems):
             raise ResearchBlocked('实现评议同时含多种不支持的格式或来源错误，未登记批准；原候选保留。')
-        error = coordinates.BOUNDARY_ERROR
-    if error is None and stage == 'code_review' and any(
+        error = error or coordinates.BOUNDARY_ERROR
+    missing_evidence = []
+    # Whole-delivery review has its own post-delivery classification gate.
+    # A pending dependency is not a request for executable code fixes or
+    # repeated reading. Source references still pass validate_candidate above;
+    # whole.validate_vote checks actual complete reading and every code defect.
+    if error is None and stage == 'code_review' and not context.get('whole_code_review') and any(
             finding.get('status') == 'pending' for finding in result.get('alignment_findings', [])):
-        from .code_review_outcome import complete_rejection
+        from .code_review_outcome import complete_rejection, missing_evidence_ids
         if not await engine._read_consensus_check(run_id, complete_rejection,
                 engine, run_id, key, result, context):
-            error = READ_PENDING + '；本次代码核对仍有 pending 项，请在同一交付上补读复核。'
+            missing_evidence = missing_evidence_ids(result, context, role)
+            error = (READ_PENDING + '；以下待核条款缺少对应的 code_evidence：' + '、'.join(missing_evidence)
+                     if missing_evidence else READ_PENDING + '；本次代码核对仍有 pending 项，请在同一交付上补读复核。')
     if error is None:
         return False
     if engine.store.get('decisions', key):
@@ -436,6 +488,7 @@ async def before_commit(h, run_id, role, purpose, key, result):
             'code_reference_requests_sha256': digest(sources),
             'code_reference_context_sha256': digest(context)} if code_reference_problems else {}),
         **({repair_responses.FIELD: copy.deepcopy(repair_response_problems),
+            'review_response_policy_version': 2,
             'code_repair_requests_sha256': digest(sources),
             'code_repair_context_sha256': digest(context)} if repair_response_problems else {}),
         **({'confirmation_scope_problems': copy.deepcopy(confirmation_problems),
@@ -464,7 +517,7 @@ async def before_commit(h, run_id, role, purpose, key, result):
     if repair_response_problems:
         diagnostic = repair_responses.diagnostic(result, error, attempt, repair_response_problems)
     elif code_reference_problems:
-        diagnostic = code_references.diagnostic(result, attempt, code_reference_problems)
+        diagnostic = code_references.diagnostic(result, attempt, code_reference_problems, error=error)
     elif revision_problems:
         from .implementation_author_revision import diagnostic as revision_diagnostic
         diagnostic = revision_diagnostic(result, context, error, attempt, continuation_cap, revision_problems)
@@ -477,11 +530,24 @@ async def before_commit(h, run_id, role, purpose, key, result):
                       _format_diagnostic(result, error, attempt, format_problems) if format_problems else
                       _diagnostic(result, error, attempt, context, reference_problems, indexed_missing_ranges))
     from .code_review_context import enabled as code_context_enabled, missing_read_plan_async
+    if missing_evidence:
+        diagnostic['alignment_read_correction']['missing_code_evidence_ids'] = missing_evidence
     projection_baseline = None
     if (code_context_enabled(context, purpose)
             and diagnostic.get('host_diagnostic') == 'implementation_alignment_read_required'):
         diagnostic, projection_baseline = await missing_read_plan_async(
             h, run_id, key, context, diagnostic, checkpoint)
+    preloaded = []
+    if projection_baseline is not None:
+        from .code_review_prefetch import retrieve
+        preloaded = await engine._read_consensus_check(run_id, retrieve,
+            engine, run_id, role, key, context, diagnostic, progress)
+        progress.setdefault('tool_results', []).extend(preloaded)
+        if preloaded:
+            diagnostic['alignment_read_correction']['host_retrieval'] = {
+                'pages': len(preloaded), 'text_chars': sum(len(r['result'].get('text', '')) for r in preloaded),
+                'reading_credit_granted': False, 'scientific_approval': False,
+                'scope': 'Actual same-role missing pages retrieved; independent review and input delivery remain required.'}
     progress.setdefault('tool_results', []).append(diagnostic)
     progress.update(turn=next_turn, pending_tool_calls=[], tool_cursor=0, tool_counted=False)
     for name in ('normal_request', 'finalization'):
@@ -502,4 +568,15 @@ async def before_commit(h, run_id, role, purpose, key, result):
         progress.update(engine.store.mutate('handoff_progress', key, save))
     else:
         h._save_progress(run_id, key, progress)
+    if repair_response_problems:
+        engine.store.event(run_id, 'handoff.returned_for_correction',
+            '评审交付未完整对应原问题，已交回原角色补正；其他角色的结果和原始意见保留。',
+            {'handoff_id': key, 'role': role, 'category': 'review_delivery',
+             'action': 'return_to_author', 'problem_kinds': sorted({r['kind'] for r in repair_response_problems}),
+             'code_edit_authorized': False, 'approval_granted': False})
+    if preloaded:
+        engine.store.event(run_id, 'implementation.code_review_reads_preloaded',
+            '已按当前缺口批量取回本角色原文，减少模型定位往返；尚未代表阅读完成或审查通过。',
+            {'handoff_id': key, 'pages': len(preloaded),
+             'text_chars': sum(len(r['result'].get('text', '')) for r in preloaded)})
     return True

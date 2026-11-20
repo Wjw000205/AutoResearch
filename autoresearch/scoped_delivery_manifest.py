@@ -25,7 +25,7 @@ def entries(raw, count):
     return rows
 
 
-async def repair(engine, harness, run_id, record, files):
+async def repair(engine, harness, run_id, record, files, *, archived_inputs=()):
     """One additive mapping correction, bound to the completed native delivery."""
     from .rapid_experiment_revision import COLLECTION, _write_files, _base_unchanged
     from .scoped_codex_recovery import run, current
@@ -43,7 +43,7 @@ async def repair(engine, harness, run_id, record, files):
     job = record.get('delivery_manifest_repair')
     if not job:
         workspace = engine.run_dir(run_id).resolve() / 'delivery-map-repairs' / binding
-        _write_files(workspace, files)
+        _write_files(workspace, files, archived_inputs=archived_inputs)
         instruction = ('只补正 _delivery/changes.json 的缺失修改项映射，不修改任何其他文件。'
             '先读取 work_order.json、现有 changes.json 和已交付材料。原条目原样保留；'
             '只允许添加已存在的 _delivery/ 辅助文件路径及缺失的 change_index。'
@@ -52,6 +52,8 @@ async def repair(engine, harness, run_id, record, files):
             '不得改源码、配置、检查脚本、批准单、manifest.json、断言范围或执行训练/CPU检查。'
             '宿主会在独立副本更新 changes.json 的派生摘要；原交付及回执保留。完成后仍须独立代码审查。'
             '\n缺失的 changes 索引：' + json.dumps(missing))
+        from .request_hash_policy import instruction as hash_checked_instruction
+        instruction = hash_checked_instruction(instruction)
         job = {'operation_id': uid(), 'workspace': str(workspace), 'instruction': instruction,
                'source_sha256': binding, 'missing_indices': missing, 'created_at': now()}
         record['delivery_manifest_repair'] = job
@@ -66,7 +68,7 @@ async def repair(engine, harness, run_id, record, files):
     def verify():
         _base_unchanged(engine, run_id, record)
         for name, raw in files.items():
-            if name != '_delivery/changes.json' and read_file(workspace, name) != raw:
+            if name != '_delivery/changes.json' and read_file(workspace, name, archived_input=name in archived_inputs) != raw:
                 raise ResearchBlocked('交付映射补正修改了受保护文件：' + name)
     def save():
         engine.store.put(COLLECTION, record['id'], record)

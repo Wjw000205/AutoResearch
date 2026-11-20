@@ -333,6 +333,10 @@ def assert_input(context, instruction, *, prepared=None):
             '$catalog_record': active.get('shared_context_catalog_records', {}),
             '$record': active.get('shared_context_records', {})}
         def expand(value, seen=frozenset()):
+            from .context_records import text_slice
+            sliced = text_slice(value, active)
+            if sliced is not None:
+                return sliced
             if isinstance(value, dict) and len(value) == 1 and next(iter(value)) in tables:
                 kind, reference = next(iter(value.items()))
                 table = tables[kind]

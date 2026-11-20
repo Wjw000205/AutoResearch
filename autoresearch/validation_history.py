@@ -57,22 +57,43 @@ def current_binding(store, run_id, context):
                 or summary['proposal_hash'] != context['proposal_hash']):
             return None
         votes = program['reviews']
-        if len(votes) != 3 or {v['role'] for v in votes} != ROLES:
+        from . import independent_full_review as full
+        compact = program.get('implementation_review_strategy') == 'document_code'
+        if compact:
+            if len(votes)!=2 or {v['role'] for v in votes}!=set(full.REVIEWERS):
+                return None
+        elif not full.members(votes):
             return None
         receipts = []
         for vote in votes:
-            hid = vote['handoff_id']
+            modern = full.KEY in vote
+            if modern:
+                full.authenticate(store, run_id, vote)
+            hid = vote[full.KEY]['handoff_id'] if modern else vote['handoff_id']
             handoff = store.get('handoffs', hid) or {}
             decision = store.get('decisions', hid) or {}
             frozen = store.get('handoff_inputs', hid) or {}
             result = decision.get('result')
             assignment = frozen.get('context', {})
+            if compact:
+                work = assignment.get('implementation_work', {})
+                target = work.get('materials',{}).get('identity',{})
+                if (work.get('action') != 'implementation_code_review' or work.get('workflow_id') != program['delivery_id']
+                        or work.get('cycle') != context['research_cycle'] or _binding(target) != binding
+                        or target.get('proposal_hash') != context['proposal_hash'] or handoff.get('status') != 'completed'
+                        or handoff.get('run_id')!=run_id or frozen.get('run_id')!=run_id or decision.get('run_id')!=run_id
+                        or handoff.get('to_role')!=vote['role'] or decision.get('role')!=vote['role']
+                        or result != vote['result'] or handoff.get('output_hash')!=_digest(result)
+                        or result.get('approve') is not True or result.get('findings')!=[]):
+                    return None
+                receipts.append(hid)
+                continue
             if (handoff.get('run_id') != run_id or handoff.get('status') != 'completed'
                     or handoff.get('to_role') != vote['role']
                     or decision.get('run_id') != run_id or decision.get('role') != vote['role']
                     or frozen.get('run_id') != run_id
                     or not str(handoff.get('purpose', '')).startswith('code_review:')
-                    or result != {k: v for k, v in vote.items() if k not in ('role', 'handoff_id')}
+                    or result != (full.answer(vote) if modern else {k: v for k, v in vote.items() if k not in ('role', 'handoff_id')})
                     or handoff.get('output_hash') != _digest(result)
                     or vote.get('approve') is not True or vote.get('issues') != [] or vote.get('fixes') != []
                     or _binding(vote) != binding or _binding(assignment) != binding

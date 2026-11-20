@@ -40,7 +40,7 @@ def revision(store, hid, workflow_id, directories):
     """
     with store._read_db() as db:
         heads = []
-        for collection, key in (('handoff_inputs', hid), ('handoff_progress', hid),
+        for collection, key in (('handoffs', hid), ('handoff_inputs', hid), ('handoff_progress', hid),
                                 ('implementation_document_drafts', hid), ('codex_workflows', workflow_id)):
             row = db.execute('SELECT updated_at FROM records WHERE collection=? AND key=?',
                              (collection, key)).fetchone()

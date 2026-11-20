@@ -1,7 +1,7 @@
 """Conservative domain anchors; a venue match is never a relevance match."""
 import re
 
-VERSION = 3
+VERSION = 4
 
 
 def text(paper):
@@ -11,15 +11,30 @@ def text(paper):
 def domain_match(query, paper):
     # Quoted subject phrases come from task intake; synonyms are alternatives.
     anchors = re.findall(r'"([^"\n]{1,100})"', str(query))
+    if not anchors:
+        subject = subject_query(str(query))
+        if subject != str(query):
+            anchors = [subject]
     normalize = lambda value: re.sub(r'[\s_-]+', ' ', value.casefold()).strip()
     content = normalize(text(paper))
-    return not anchors or any(normalize(anchor) in content for anchor in anchors)
+    def scripts(value):
+        return {name for name, pattern in [('latin', r'[a-zA-Z]'), ('han', r'[\u3400-\u9fff]')]
+                if re.search(pattern, value)}
+    # A missing translation is uncertainty, not evidence of domain mismatch.
+    # Semantic relevance remains the Scout's screening responsibility.
+    comparable = [anchor for anchor in anchors if scripts(anchor) & scripts(content)]
+    return not comparable or any(normalize(anchor) in content for anchor in comparable)
 
 
 def subject_query(query):
     """A recall query drops facet conjunctions, never the research domain."""
     phrases = re.findall(r'"([^"\n]{1,100})"', query)
-    return phrases[0] if phrases else query
+    if phrases:
+        return phrases[0]
+    cleaned = re.sub(r'^\s*(?:(?:19|20)\d{2}\s+)+', '', query)
+    subject = re.split(r'\b(?:AND|OR|NOT|foundation|models?|methods?|architecture|calibration|CCF)\b',
+                       cleaned, maxsplit=1, flags=re.I)[0].strip(' ()')
+    return subject or query
 
 
 def task_query(engine, run_id):
@@ -31,8 +46,15 @@ def task_query(engine, run_id):
     terms = intake.get('domain_terms')
     if not isinstance(terms, list):
         terms = [intake['domain']] if intake.get('domain') else []
-    return ' '.join('"' + term.replace('"', '') + '"' for term in terms[:12]
-                    if isinstance(term, str) and 0 < len(term.strip()) <= 100)
+    terms = [term.strip() for term in terms if isinstance(term, str) and 0 < len(term.strip()) <= 100]
+    # Use the task's own search-language subjects, never a host translation or
+    # generic mechanism words such as "model" as substitutes for its domain.
+    for query in intake.get('search_queries', []):
+        if isinstance(query, str):
+            phrases = re.findall(r'"([^"\n]{1,100})"', query)
+            if phrases:
+                terms.append(phrases[0])
+    return ' '.join('"' + term.replace('"', '') + '"' for term in dict.fromkeys(terms))
 
 
 def filter_task(engine, run_id, papers):

@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath
 
 from .delivery_files import copy_verified, identity, io_path
@@ -34,6 +35,8 @@ def validate_directory_layout(directory, manifest=None):
     """Check the directory contract of new dispatches; retain legacy snapshots."""
     if manifest is None:
         manifest = json.loads(io_path(Path(directory) / 'implementation.json').read_text(encoding='utf-8'))
+    from .delivery_manifest_contract import validate as validate_manifest
+    validate_manifest(manifest)
     if (not isinstance(manifest, dict) or manifest.get('code_layout') != 'modular'
             or type(manifest.get('directory_layout_version')) is not int
             or manifest['directory_layout_version'] not in (1, 2)):
@@ -106,13 +109,20 @@ def source_issues(source):
     return issues
 
 
-def relative_file(value):
+def archived_params_path(value):
+    return isinstance(value, str) and re.fullmatch(r'(?:_delivery_snapshot/)?_validation_inputs/(?:0|[1-9][0-9]*)/params\.json', value) is not None
+
+
+def relative_file(value, *, archived_input=False):
     if not isinstance(value, str) or not value or '\\' in value or ':' in value or '\x00' in value:
         raise ValueError('运行文件必须是规范的项目内相对路径')
     path = PurePosixPath(value)
-    if value in {'hyperparameters.yaml','hyperparameters.receipt.json'}:
+    if value.rstrip(' .').casefold() in {'hyperparameters.yaml','hyperparameters.receipt.json'}:
         raise ValueError('运行文件不能覆盖宿主绑定的 YAML 输入或回执')
-    if path.is_absolute() or path.as_posix() != value or '..' in path.parts or any(part in RESERVED for part in path.parts):
+    if archived_input and archived_params_path(value):
+        return path
+    if (path.is_absolute() or path.as_posix() != value or '..' in path.parts
+            or any(part.rstrip(' .').casefold() in RESERVED for part in path.parts)):
         raise ValueError('运行文件路径越界或与宿主控制文件冲突')
     return path
 
@@ -164,8 +174,13 @@ def validate(bundle, code):
     entry = next((row for row in files if row['path'] == 'experiment.py'), None)
     if not entry or entry['sha256'] != hashlib.sha256(code.encode()).hexdigest():
         raise ValueError('运行入口与已批准代码不一致')
+    archived = {}
     for row in files:
-        relative_file(row['path'])
+        name = row['path']
+        if archived_params_path(name):
+            prefix = '_delivery_snapshot/' if name.startswith('_delivery_snapshot/') else ''
+            archived.setdefault(prefix, {})[name[len(prefix):]] = row
+        relative_file(name, archived_input=True)
         path = root / row['path']
         for part in (path, *path.parents):
             if part.is_symlink() or getattr(part, 'is_junction', lambda: False)():
@@ -174,6 +189,20 @@ def validate(bundle, code):
                 break
         if identity(path) != {key: row[key] for key in ('sha256', 'bytes')}:
             raise ValueError('冻结运行模块发生变化：' + row['path'])
+    if archived:
+        from .saved_validation_configuration import input_files
+        by_name = {r['path']: r for r in files}
+        for prefix, rows in archived.items():
+            order = prefix + 'work_order.json'
+            if order not in by_name:
+                raise ValueError('Archived validation inputs require the matching host work order')
+            raw = io_path(root / order).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != by_name[order]['sha256']:
+                raise ValueError('Archived validation work order changed')
+            expected = {n: hashlib.sha256(b).hexdigest() for n, b in input_files(json.loads(raw)).items()
+                        if archived_params_path(n)}
+            if expected != {n: row['sha256'] for n, row in rows.items()}:
+                raise ValueError('Archived validation params differ from their host work order')
     return sum(row['bytes'] for row in files)
 
 

@@ -24,6 +24,7 @@ import psutil
 
 ROOT = Path(__file__).resolve().parent.parent
 HOST, PORT = '127.0.0.1', 8000
+STOP_TIMEOUT = 30
 
 
 def runtime_dir(root: Path) -> Path:
@@ -34,7 +35,14 @@ def write_record(path: Path, value: dict) -> None:
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        temporary.replace(path)
+        for attempt in range(8):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(.025 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -153,7 +161,7 @@ def start(root: Path, *, timeout: float = 45) -> dict:
     raise RuntimeError('启动检查尚未完成，请运行 start.cmd status；日志：' + str(directory / 'server.log'))
 
 
-def stop(root: Path, *, timeout: float = 30) -> dict:
+def stop(root: Path, *, timeout: float = STOP_TIMEOUT) -> dict:
     current = status(root)
     if current['status'] == 'stopped':
         return current
@@ -187,13 +195,19 @@ async def run_server(root: Path, record: dict) -> None:
         'available', 'version', 'executable', 'discovery_source', 'error_code', 'error') if k in readiness}
     write_record(directory / 'runtime.json', record)
     request = directory / f'stop-{record["instance"]}.json'
-    server = uvicorn.Server(uvicorn.Config('autoresearch.api:app', host=HOST, port=PORT))
+    # An already-reset Windows transport can leave wait_closed pending after the listener is gone.
+    # Bound HTTP draining; Uvicorn still awaits application lifespan and research checkpoint cleanup.
+    server = uvicorn.Server(uvicorn.Config('autoresearch.api:app', host=HOST, port=PORT,
+                                           timeout_graceful_shutdown=STOP_TIMEOUT))
 
     async def observe():
         while True:
             if server.started and record['status'] == 'starting':
-                record['status'] = 'running'
-                write_record(directory / 'runtime.json', record)
+                try:
+                    write_record(directory / 'runtime.json', {**record, 'status':'running'})
+                    record['status'] = 'running'
+                except OSError:
+                    pass  # Retry on the next tick and still observe instance-bound stop requests.
             if request.exists():
                 try:
                     value = json.loads(request.read_text(encoding='utf-8'))
@@ -201,8 +215,8 @@ async def run_server(root: Path, record: dict) -> None:
                     value = {}
                 if value.get('instance') == record['instance']:
                     record['status'] = 'stopping'
-                    write_record(directory / 'runtime.json', record)
                     server.should_exit = True
+                    write_record(directory / 'runtime.json', record)
                     return
             await asyncio.sleep(.25)
 

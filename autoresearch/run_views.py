@@ -66,7 +66,8 @@ def revision(store, run_id):
             'innovation_sessions', 'experiments', 'artifacts', 'budgets', 'usage', 'moderation_reviews',
             'literature_inputs', 'contexts', 'context_snapshots', 'codex_workflows', 'protocol_reviews',
             'implementation_document_drafts', 'architecture_diagrams', 'handoff_progress',
-            'dataset_experiment_setups', 'dataset_codex_jobs', 'dataset_agent_plans')
+            'dataset_experiment_setups', 'dataset_codex_jobs', 'dataset_agent_plans', 'execution_intents',
+            'implementation_evidence_tasks','harness_local_activity')
         rows = [(collection, *db.execute("""SELECT count(*),max(updated_at) FROM records
             WHERE collection=? AND json_extract(data,'$.run_id')=?""", (collection, run_id)).fetchone())
             for collection in collections]
@@ -164,7 +165,7 @@ def _definition(store, run, saved):
 def architecture_summary(store, run):
     from .engine import digest
     cycle = run.get('state', {}).get('research_cycle', 1)
-    reviews = _rows(store, 'architecture_reviews', ['id', 'status', 'cycle', 'created_at', 'document', 'review_delivery_validation'],
+    reviews = _rows(store, 'architecture_reviews', ['id', 'status', 'cycle', 'created_at', 'document', 'io_template_review', 'combination_count', 'review_delivery_validation'],
                    run_id=run['id'], where="json_extract(data,'$.cycle')=?", args=(cycle,))
     current = max(reviews, key=lambda row: row.get('created_at') or '') if reviews else None
     fields = {name: _field(name) for name in ('id', 'version', 'status', 'cycle', 'reason', 'original_design_hash',
@@ -324,8 +325,14 @@ def _build_assignment_scope(store, run):
             clauses.append("coalesce(json_extract(data,'$.purpose'),'') NOT LIKE 'dataset_configure:%'")
     if stage == 'implementation':
         from .implementation_progress import _latest, _current_spec
+        def attempt_field(name):
+            return (f"(SELECT json_extract(a.value,'$.{name}') FROM json_each(records.data,'$.attempts') a "
+                    "WHERE json_extract(a.value,'$.index')=json_extract(records.data,'$.current_revision'))")
         workflow = _latest(store, 'codex_workflows', run['id'], cycle or 1, {
             'id': 'key', 'status': _field('status'), 'revision': _field('current_revision'),
+            'spec_hash': _field('spec_hash'), 'attempt_status': attempt_field('status'),
+            'delivery_hash': attempt_field('delivery_hash'),
+            'revision_packet': attempt_field('code_revision_review.packet_sha256'),
             'document_id': _current_spec("json_extract(s.value,'$.document.document_id')")},
             generation=run.get('state', {}).get('implementation_generation'))
         if workflow:
@@ -351,8 +358,12 @@ def agent_assignment_summary(store, run, role, *, activity=None):
     """
     from .implementation_activity import predicate, receipt_metadata
     from .assignment_activity import generation_condition, view as assignment_activity
+    from .metric_contract_recovery import RETIRED_REVIEW_PREFIXES
     activity = receipt_metadata(store, run['id']) if activity is None else activity
     visible, visible_args = predicate(activity, 'handoffs')
+    for prefix in RETIRED_REVIEW_PREFIXES:
+        visible += " AND substr(coalesce(json_extract(records.data,'$.purpose'),''),1,?) != ?"
+        visible_args = (*visible_args, len(prefix), prefix)
     # Preserve rejected dispatches in history, but do not let an audited,
     # never-dispatched replacement hide the actual author and its final report.
     visible += """ AND NOT (json_extract(records.data,'$.status')='cancelled' AND EXISTS(
@@ -367,16 +378,45 @@ def agent_assignment_summary(store, run, role, *, activity=None):
     if generation is not None:
         visible += ' AND ' + generation_condition()
         visible_args = (*visible_args, generation)
+    if run.get('state', {}).get('code_review_redispatch'):
+        visible += """ AND NOT EXISTS(SELECT 1 FROM records reset,
+            json_each(reset.data,'$.body.previous_handoffs') retired
+            WHERE reset.collection='code_review_redispatches' AND json_extract(reset.data,'$.run_id')=?
+                AND json_extract(reset.data,'$.body.version') IN (2,3)
+                AND json_extract(retired.value,'$.id')=records.key)"""
+        visible_args = (*visible_args, run['id'])
     scope, scope_args, workflow = _assignment_scope(store, run)
     scoped_visible = visible + (' AND ' + scope if scope else '')
     scoped_args = (*visible_args, *scope_args)
     fields = ['id', 'purpose', 'status', 'error', 'activity', 'created_at', 'updated_at']
-    current = _one(store, 'handoffs', fields, run_id=run['id'],
-        where="json_extract(data,'$.to_role')=? AND " + scoped_visible, args=(role, *scoped_args),
-        order_by="(json_extract(data,'$.status')='running') DESC,"
-                 "coalesce(json_extract(data,'$.created_at'),updated_at) DESC,key DESC") or {}
-    historical = None
+    order = "(json_extract(data,'$.status')='running') DESC,coalesce(json_extract(data,'$.created_at'),updated_at) DESC,key DESC"
+    current = None
+    if (role in {'director', 'scout'} and workflow and workflow.get('status') == 'code_review'
+            and workflow.get('attempt_status') not in {'approved', 'rejected', 'superseded', 'blocked'}):
+        # The code-review card follows the current Codex delivery and attempt.
+        revision_packet = workflow.get('revision_packet')
+        marker = 'code_revision_review' if revision_packet else 'whole_code_review'
+        delivery_scope = f"""json_extract(data,'$.purpose') LIKE 'code_review:%' AND EXISTS(
+            SELECT 1 FROM records input WHERE input.collection='handoff_inputs' AND input.key=records.key
+                AND json_extract(input.data,'$.run_id')=json_extract(records.data,'$.run_id')
+                AND json_extract(input.data,'$.context.{marker}.workflow_id')=?
+                AND json_extract(input.data,'$.context.{marker}.attempt')=?
+                AND json_extract(input.data,'$.context.code_revision_review.packet_sha256') IS ?
+                AND json_extract(input.data,'$.context.spec_hash')=?
+                AND json_extract(input.data,'$.context.delivery_hash')=?)"""
+        delivery_args = (*scoped_args, workflow['id'], workflow['revision'], revision_packet, workflow['spec_hash'], workflow['delivery_hash'])
+        current = _one(store, 'handoffs', fields, run_id=run['id'],
+            where="json_extract(data,'$.to_role')=? AND " + scoped_visible + ' AND ' + delivery_scope,
+            args=(role, *delivery_args), order_by=order)
+        if current or revision_packet:
+            scoped_visible += ' AND ' + delivery_scope
+            scoped_args = delivery_args
     if not current:
+        current = _one(store, 'handoffs', fields, run_id=run['id'],
+            where="json_extract(data,'$.to_role')=? AND " + scoped_visible,
+            args=(role, *scoped_args), order_by=order) or {}
+    historical = None
+    if not current and not (role in {'director','scout'} and workflow and workflow.get('status') == 'code_review' and workflow.get('revision_packet')):
         historical = _one(store, 'handoffs', fields, run_id=run['id'],
             where="json_extract(data,'$.to_role')=? AND " + visible, args=(role, *visible_args),
             order_by="coalesce(json_extract(data,'$.created_at'),updated_at) DESC,key DESC")
@@ -396,9 +436,29 @@ def agent_assignment_summary(store, run, role, *, activity=None):
             (run['id'], role, *scoped_args)).fetchone()[0]
     last = current or historical or {}
     task = PURPOSES.get((last.get('purpose') or '').split(':')[0], last.get('purpose')) or '等待分派'
+    if current and (current.get('purpose') or '').startswith('code_review:') and ':changes-v1:' in current['purpose']:
+        task = '审查上一轮意见与本次代码修改'
     assignment, output = None, None
     if current:
+        # Project the actual assignment operands without loading prompts or evidence bodies.
+        dispatch_fields = {}
+        if (current.get('purpose') or '').startswith(('experiment_', 'rapid_')):
+            decision = 'context.experiment_decision.'
+            search = 'context.decision_proposal.parameter_search.'
+            combination = decision + 'combination_validation.next_step.'
+            dispatch_fields = {
+                'dataset': f"coalesce({_field(decision + 'configuration_queue.active_dataset')},{_field('context.benchmark_task.dataset')})",
+                'trial': _field('context.trial.name'),
+                'variant': f"coalesce({_field(search + 'variant')},{_field(combination + 'variant')},{_field('context.trial.params.variant')})",
+                'seed': f"coalesce({_field(search + 'validation_seed')},{_field(combination + 'validation_seed')},{_field('context.trial.params.seed')})",
+                'factor': f"coalesce({_field(search + 'factor_path')},{_field(combination + 'factor_path')})",
+                'proposed_value': _field(search + 'value'),
+                'combination_control': f"CASE WHEN {_field(search + 'factor_path')} IS NULL THEN {_field(combination + 'control_value')} END",
+                'combination_candidates': f"CASE WHEN {_field(search + 'factor_path')} IS NULL THEN {_field(combination + 'pending_values')} END",
+                'review_batch': _field('context.tuning_point_reads.latest_unit'),
+            }
         context = _one(store, 'handoff_inputs', {
+            **dispatch_fields,
             'document_title': "substr(coalesce(json_extract(data,'$.context.implementation_document.title'),"
                 "json_extract(data,'$.context.architecture_document.title')),1,500)",
             'authoring_revision': "CASE WHEN json_type(data,'$.context.implementation_document_authoring.revision')='integer' "
@@ -427,6 +487,9 @@ def agent_assignment_summary(store, run, role, *, activity=None):
             version = re.search(r'(?:specification|architecture)-v(\d+)\.md$', context.get('document_title') or '')
             version_number = int(version.group(1)) if version else None
         labels = [task]
+        reading_round = re.search(r':full-reading:(\d+)$', current.get('purpose') or '')
+        if reading_round:
+            labels.append(f'补读材料（第 {reading_round[1]} 轮）')
         if version_number is not None:
             labels.append(f'第 {version_number} 版')
         if isinstance(context.get('unit_number'), int) and context['unit_number'] > 0:
@@ -436,6 +499,17 @@ def agent_assignment_summary(store, run, role, *, activity=None):
             labels.append(f"补充评议 {context['followup']}")
         assignment = {name: current.get(name) for name in ('id', 'purpose', 'created_at', 'updated_at')}
         assignment.update(status=status, label=' · '.join(labels))
+        from .assignment_task_brief import view as task_brief
+        brief = task_brief(store, run['id'], role, current['id'])
+        if brief is not None:
+            assignment['task_brief'] = brief
+            if brief['source']=='current_frozen_evidence_task':
+                assignment['label']=brief['title']
+        subject = {field: context[field] for field in dispatch_fields if context.get(field) is not None}
+        if context.get('document_title'):
+            subject['document_title'] = context['document_title']
+        if subject:
+            assignment['subject'] = subject
         if status == 'completed':
             fields = {name: _field(name) for name in ('id', 'created_at')}
             for name in ('rationale', 'summary', 'explanation', 'hypothesis', 'architecture',
@@ -481,6 +555,8 @@ def agent_assignment_summary(store, run, role, *, activity=None):
                     'purpose': current['purpose'], 'status': 'completed', 'kind': 'output',
                     'text': summary, 'truncated': True, 'consensus': consensus}
     current_activity = assignment_activity(store, run, current, status, role, defer_reading=True)
+    if current_activity and current_activity.get('state') == 'validating':
+        status = 'running'  # The host is busy with this returned vote; the model remains completed.
     original_status = status
     if current_activity and current_activity.get('state') == 'recovering':
         status = 'recovering'
@@ -498,6 +574,16 @@ def agent_assignment_summary(store, run, role, *, activity=None):
             current_activity['detail'] if current_activity else
             current.get('error') or (run.get('error') if current.get('status') == 'running' else None) or
             '等待执行记录'})
+
+
+def latest_dispatch_event(store, run_id):
+    """Only the newest event can describe the last observed activity."""
+    with store._read_db() as db:
+        row = db.execute("""SELECT kind, created_at,
+            coalesce(json_extract(data,'$.role'),json_extract(data,'$.to_role')),
+            CASE WHEN kind IN ('tool.started','tool.completed') THEN substr(message,1,100) END
+            FROM events WHERE run_id=? ORDER BY id DESC LIMIT 1""", (run_id,)).fetchone()
+    return dict(zip(('kind', 'at', 'role', 'tool'), row)) if row else None
 
 
 def command_summary(store, run, steps, architecture=None, *, activity=None):
@@ -538,11 +624,13 @@ def command_summary(store, run, steps, architecture=None, *, activity=None):
         mainline.append({'id': stage, 'label': labels[stage], 'status': status, 'cycle': cycle,
                          'is_current': current, 'activity_status': run['status'] if current else None,
                          'reason': hold['reason'] if hold and stage == 'validation_review' else run.get('error') if current else None})
-    from .optimization_loop import view as optimization_view
-    return {'projection': 'summary', 'details_loaded': False, 'optimization_loop':optimization_view(store,run), 'current_stage': run['stage'],
+    from .optimization_loop import stage_status
+    from .harness_activity import view as harness_activity
+    return {'projection': 'summary', 'details_loaded': False, 'optimization_loop':stage_status(store,run), 'current_stage': run['stage'],
         'current_stage_label': '验证结果与停止规则待核对' if run.get('validation_hold') else labels.get(run['stage'], run['stage']), 'current_cycle': cycle,
         'run_status': run['status'], 'run_error': run.get('error'), 'progress': run.get('progress', 0),
-        'current_execution': execution_view(store, run),
+        'current_execution': execution_view(store, run), 'dispatch_event': latest_dispatch_event(store, run['id']),
+        'harness_activity': harness_activity(store,run),
         'progress_scope': '当前流程阶段进度，非研究达标概率', 'next_action': (run.get('validation_hold') or {}).get('reason') or run.get('error') or
             ('恢复后继续：' if run['status'] == 'paused' else '当前阶段：') + labels.get(run['stage'], run['stage']),
         'agents': agents, 'mainline': mainline, 'branches': [], 'branches_loaded': False,
@@ -648,7 +736,7 @@ def _native_service_failure_hint(store, run, operation_id):
         'readback_required': True}
 
 
-def summary(engine, run_id):
+def summary(engine, run_id, *, include_billing=True):
     from .billing_projection import summary as billing_summary
     from .implementation_progress import view as implementation_progress
     with engine.store.read_snapshot() as store:
@@ -658,11 +746,21 @@ def summary(engine, run_id):
                      "'experiment_attempt_policy',json_extract(data,'$.state.experiment_attempt_policy'),"
                      "'dataset_adaptation',json_extract(data,'$.state.dataset_adaptation'),"
                      "'dataset_configuration_protocol',json_extract(data,'$.state.dataset_configuration_protocol'),"
+                     "'dataset_optimization_protocol',json_extract(data,'$.state.dataset_optimization_protocol'),"
                      "'implementation_generation',json_extract(data,'$.state.implementation_generation'),"
+                     "'code_review_redispatch',json_extract(data,'$.state.code_review_redispatch'),"
+                     "'interruption',json_extract(data,'$.state.interruption'),"
                      "'resume_generation',json_extract(data,'$.state.resume_generation'))"}, key=run_id)
         if run is None:
             raise KeyError(run_id)
         run['state'] = json.loads(run['state']) if isinstance(run['state'], str) else run['state']
+        continuation = _one(store, 'execution_intents', ['desired', 'continuation_status', 'retry_at'], key=run_id)
+        from .execution_continuation import diagnostic_view
+        diagnostic = diagnostic_view(store, run_id)
+        if diagnostic:
+            continuation = {**(continuation or {}), **diagnostic}
+        if continuation:
+            run['execution_continuation'] = continuation
         from .research_iteration import view as iteration_view
         run['research_iteration'] = iteration_view(store,run_id)
         from .validation_hold import current as validation_hold
@@ -693,8 +791,10 @@ def summary(engine, run_id):
                 'configuration_locked': bool(activity_count(store, 'codex_workflows', run_id, metadata=activity) or
                     _one(store, 'stage_contexts', ['id'], key=run_id + ':implementation')), 'details_loaded': False},
             'consensus': consensus, 'graph_status': graph, 'handoffs': _handoffs(store, run_id, activity=activity),
-            'research_map': command_summary(store, run, steps, architecture, activity=activity), 'billing': billing_summary(store, run_id),
+            'research_map': command_summary(store, run, steps, architecture, activity=activity),
             'implementation_progress': implementation_progress(store, run)}
+        if include_billing:
+            value['billing'] = billing_summary(store, run_id)
         progress = value['implementation_progress']
         if run['stage'] == 'implementation' and progress:
             value['research_map']['next_action'] = run.get('error') or progress['next_action']
@@ -845,14 +945,16 @@ def section(engine, run_id, name, *, intelligence, local_codex):
     return value
 
 
-def stage(engine, run_id, name, *, intelligence, local_codex):
+def stage(engine, run_id, name, *, intelligence, local_codex, include_progress=True):
     if name not in STAGES:
         raise KeyError(name)
     if name=='architecture_tuning':
         from .optimization_loop import view,current
         run=engine.store.get('runs',run_id)
-        value={'projection':'stage','stage':name,'optimization_loop':view(engine.store,run),
+        value={'projection':'stage','stage':name,
                'architecture_tuning':current(engine.store,run_id,engine.cycle(run_id))}
+        if include_progress:
+            value['optimization_loop'] = view(engine.store, run)
         from .architecture_adjustment_views import view as adjustments
         value['architecture_adjustments']=adjustments(engine.store,run)
         step=engine.store.get('steps',run_id+':'+name)
@@ -860,7 +962,7 @@ def stage(engine, run_id, name, *, intelligence, local_codex):
         return value
     if name in {'experiments', 'tuning', 'final_tests'}:
         from .experiment_views import view, _bounded
-        value = view(engine, run_id)
+        value = view(engine, run_id, tuning_detail=name == 'tuning')
         value.update(projection='stage', stage=name)
         fields = {k: _field(k) for k in ('id', 'run_id', 'stage', 'status', 'started_at', 'completed_at', 'error')}
         fields['output'] = _bounded('output', 131072)

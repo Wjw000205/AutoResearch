@@ -49,11 +49,13 @@ def propose(spec, evidence):
         raise ValueError('Adam betas require two values in [0,1)')
     base = next((u for u in evidence['units'] if u['id'] == spec['base_unit_id']), None)
     comparison = evidence['comparisons'].get(spec['base_unit_id'], {})
-    if not base or not base['complete'] or base['kind'] not in {'pilot', 'grid'} or not comparison.get('comparable'):
+    from .paper_baselines import control_available
+    if not base or not base['complete'] or base['kind'] not in {'pilot', 'grid'} or not control_available(comparison):
         raise ValueError('Broad tuning requires a completed paired control')
     originals = [(n, evidence['job_parameters'][n]) for n in base['jobs']
                  if evidence['job_parameters'][n]['seed'] == spec['validation_seed']]
-    if sorted(p['variant'] for _, p in originals) != ['baseline', 'proposed']:
+    expected = ['proposed'] if evidence.get('baseline_mode') == 'paper_reported' else ['baseline', 'proposed']
+    if sorted(p['variant'] for _, p in originals) != expected:
         raise ValueError('One fixed control seed and both methods are required')
     controls = [configured_value(p, spec['factor_path'], evidence) for _, p in originals if targets(spec, p)]
     if not controls or len({value_key(v) for v in controls}) != 1:
@@ -85,8 +87,18 @@ def propose(spec, evidence):
             name = identity + '-' + str(index)
             fresh.append(name)
         jobs.append((name, param))
-    if not fresh:
+    combo = evidence.get('combination_validation', {})
+    missing = {j['name'] for j in evidence['ledger']['jobs'] if j['state'] == 'missing'}
+    scripted = combo.get('version') in (2, 3) and combo.get('status') in ('waiting_single_factor', 'validating_combinations')
+    if not fresh and not (scripted and any(name in missing for name, _ in jobs)):
         raise ValueError('This exact configuration is already recorded; reuse it without a new execution')
+    if combo.get('version') in (2, 3) and combo.get('status') == 'validating_combinations':
+        # A Bayesian admission purchases only the selected point, not the
+        # rest of the one-factor neighborhood as another single-factor grid.
+        return {'id': identity, 'kind': 'grid', 'task_id': base['task_id'], 'jobs': jobs,
+                'new_job_names': fresh, 'base_unit_id': base['id'], 'factor_path': spec['factor_path'],
+                'admitted_trials': sum(name in fresh or name in missing for name, _ in jobs),
+                'bayesian_plan_sha256': combo['plan_sha256']}
     grid = {k: copy.deepcopy(spec[k]) for k in ('base_unit_id', 'factor_path', 'validation_seed',
              'grid_values', 'lower_bound', 'upper_bound', 'grid_rationale', 'scope_sha256')}
     grid.update(variant=spec.get('variant', 'shared'), value_kind=f['value_kind'], binding=copy.deepcopy(evidence['binding']),

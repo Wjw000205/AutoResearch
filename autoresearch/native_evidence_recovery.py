@@ -1,8 +1,9 @@
-"""One structured extraction retry after an output-free native overload.
+"""One structured extraction retry after an output-free native failure.
 
 The original turn must first be read back as terminal. Its receipt, reservation,
 task, schema and source pages remain intact. Unknown/policy/partial-output faults
 cannot authorize a new request. The retry still uses normal admission gates.
+Confirmed interruptions additionally require a later explicit task resume.
 """
 from __future__ import annotations
 
@@ -13,6 +14,27 @@ from datetime import datetime
 
 from .context_compiler import fingerprint
 from .storage import now
+
+
+def _interruption_resume(intelligence, run_id, source, generation_id=None):
+    run = intelligence.store.get('runs', run_id, {})
+    generation_id = generation_id or run.get('state', {}).get('resume_generation')
+    generation = intelligence.store.get('operator_resumes', generation_id or '', {})
+    native = intelligence.store.get('codex_reasoning', source['native_key'], {})
+    cp = native.get('checkpoint', {})
+    try:
+        failure = cp['first_failure']
+        failed_at, resumed_at = (datetime.fromisoformat(failure['observed_at']),
+                                datetime.fromisoformat(generation['created_at']))
+        if (generation.get('id') == generation_id and generation.get('run_id') == run_id
+                and generation.get('kind') == 'explicit_start_command'
+                and not generation.get('automatic_continuation')
+                and failed_at.tzinfo is not None and resumed_at.tzinfo is not None and failed_at < resumed_at
+                and all(failure.get(k) == cp.get(k) for k in ('thread_id', 'turn_id'))):
+            return generation
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _source(intelligence, run_id, plan):
@@ -36,11 +58,17 @@ def _source(intelligence, run_id, plan):
         selected = native.get('selection', {})
         chosen = profile(intelligence.store, run_id, provider, context)
         errors = cp.get('server_errors')
+        overload = (cp.get('status') == 'failed' and cp.get('error_code') == 'codex_turn_failed'
+            and isinstance(errors, list) and bool(errors)
+            and all(isinstance(error, dict) and error.get('category') == 'serverOverloaded'
+                    and error.get('will_retry') is False for error in errors))
+        interrupted = (cp.get('status') == 'interrupted' and not errors
+                       and cp.get('error_code') in (None, 'codex_cancelled_result_unknown'))
         if (native.get('id') != key or native.get('run_id') != run_id or native.get('role') != prepared['role']
                 or native.get('operation_id') != operation or native.get('schema') != prepared['schema']
                 or native.get('transport_schema') != TRANSPORT_SCHEMA or native.get('result') is not None
                 or any(chosen.get(field) != selected.get(field) for field in ('model', 'effort', 'timeout', 'purpose'))
-                or cp.get('status') != 'failed' or cp.get('error_code') != 'codex_turn_failed'
+                or not (overload or interrupted)
                 or cp.get('recovered_read_only') is not True or cp.get('version') != 1
                 or cp.get('model_provider') != 'openai' or cp.get('auth_mode') != 'chatgpt'
                 or cp.get('reasoning_only') is not True or cp.get('run_id') != run_id
@@ -50,9 +78,6 @@ def _source(intelligence, run_id, plan):
                 or cp.get('requested_effort') != selected.get('effort')
                 or cp.get('public_output_truncated') or cp.get('native_tool_violation')
                 or cp.get('public_messages') != [] or cp.get('activities')
-                or not isinstance(errors, list) or not errors
-                or any(not isinstance(error, dict) or error.get('category') != 'serverOverloaded'
-                       or error.get('will_retry') is not False for error in errors)
                 or not isinstance(native.get('instruction'), str)
                 or cp.get('instruction_sha256') != hashlib.sha256(native['instruction'].encode()).hexdigest()
                 or cp.get('output_schema_sha256') != hashlib.sha256(json.dumps(
@@ -77,7 +102,8 @@ def _source(intelligence, run_id, plan):
             'request_id': reservation['id'], 'thread_id': cp['thread_id'], 'turn_id': cp['turn_id'],
             'model': selected['model'], 'effort': selected['effort'], 'timeout': selected['timeout'],
             'output_limit': native['output_limit'], 'instruction_sha256': cp['instruction_sha256'],
-            'prepared_sha256': fingerprint(prepared), 'status': 'failed', 'category': 'serverOverloaded'}
+            'prepared_sha256': fingerprint(prepared), 'status': cp['status'],
+            'category': 'serverOverloaded' if overload else 'operator_interruption'}
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -104,6 +130,9 @@ def load(intelligence, run_id, plan):
             or saved.get('prepared') != expected or saved.get('prepared_sha256') != fingerprint(expected)
             or saved.get('attempt_number') != 1 or saved.get('attempt_limit') != 1):
         raise ProviderError('Native evidence recovery identity changed; no new extraction dispatched')
+    if source['status'] == 'interrupted' and _interruption_resume(
+            intelligence, run_id, source, saved.get('resume_generation')) is None:
+        raise ProviderError('Interrupted evidence recovery has no valid explicit resume binding')
     return copy.deepcopy(expected)
 
 
@@ -114,6 +143,10 @@ def claim(intelligence, run_id, plan, parent, *, hard_exceeded=False):
         return None  # An existing retry never grants another attempt on failure.
     source = _source(intelligence, run_id, plan)
     if source is None:
+        return None
+    generation = (_interruption_resume(intelligence, run_id, source)
+                  if source['status'] == 'interrupted' else None)
+    if source['status'] == 'interrupted' and generation is None:
         return None
     prepared = _prepared(plan)
     preview = intelligence.preflight_batch(run_id, [prepared] + ([] if hard_exceeded else [parent]))
@@ -127,13 +160,16 @@ def claim(intelligence, run_id, plan, parent, *, hard_exceeded=False):
         'prepared_sha256': fingerprint(prepared), 'attempt_number': 1, 'attempt_limit': 1,
         'created_at': now(), 'policy': 'Retry the same structured evidence task once after terminal readback. '
             'Original source, receipt and charged attempt retained; no raw-context bypass or scientific approval.'}
+    if generation:
+        audit['resume_generation'] = generation['id']
     def create(current):
         if current is not None:
             raise ProviderError('Evidence recovery already claimed; no concurrent duplicate dispatched')
         return audit
     intelligence.store.mutate('stage_contexts', key, create)
     intelligence.store.event(run_id, 'context.evidence_native_recovery',
-        '原证据整理请求回读确认为服务繁忙且无输出；保持原任务、模型、原文和结构，继续整理一次。',
+        ('原证据整理请求回读确认为中断且无输出；按本次显式恢复继续整理一次，保持原任务、模型、原文和结构。'
+         if generation else '原证据整理请求回读确认为服务繁忙且无输出；保持原任务、模型、原文和结构，继续整理一次。'),
         {'extraction_id': plan['id'], 'source_request_id': source['request_id'],
          'source_native_key': source['native_key'], 'attempt_number': 1, 'attempt_limit': 1,
          'new_model_attempt': True, 'raw_context_bypass': False, 'scientific_claims_verified': False})

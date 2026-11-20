@@ -66,13 +66,13 @@ def failure(record):
         'method_change_authorized': False, 'scientific_negative_result': False}
 
 
-def validation_records(store, run_id):
-    """Read bounded columns for ALL validation records, without raw output/arrays.
+def validation_records(store, run_id, *, trial_ids=None):
+    """Read bounded validation columns for the requested IDs, or all records.
 
     Unlike the UI's recent-256 window this cannot silently omit an old baseline.
     Oversized fields are explicit missing evidence and fail the coverage gate.
     """
-    return _records(store, run_id, validation_only=True)
+    return _records(store, run_id, validation_only=True, trial_ids=trial_ids)
 
 
 def report_records(store, run_id):
@@ -80,13 +80,17 @@ def report_records(store, run_id):
     return _records(store, run_id, validation_only=False)
 
 
-def _records(store, run_id, *, validation_only):
+def _records(store, run_id, *, validation_only, trial_ids=None):
     from .experiment_views import _projection
+    keys = () if trial_ids is None else tuple(run_id + ':' + trial for trial in trial_ids)
+    if trial_ids is not None and not keys:
+        return []
+    selected = "AND key IN (" + ','.join('?' for _ in keys) + ") " if keys else ''
     with store._read_db() as db:
         heads = db.execute("SELECT key,updated_at FROM records WHERE collection='experiments' "
             "AND json_extract(data,'$.run_id')=? "
-            + ("AND json_extract(data,'$.params.phase')='validation' " if validation_only else '') + "ORDER BY key",
-            (run_id,)).fetchall()
+            + ("AND json_extract(data,'$.params.phase')='validation' " if validation_only else '') + selected + "ORDER BY key",
+            (run_id, *keys)).fetchall()
     rows = []
     for key, updated in heads:
         row = _projection(store, key, updated)
@@ -109,6 +113,8 @@ def coverage(plan, trials, *, cycle, revision, code_sha256=None, strict=False, p
         if trial.get('superseded') or (trial.get('params') or {}).get('phase') != 'validation':
             continue
         if (trial.get('research_cycle') or 1) != cycle:
+            continue
+        if trial.get('status') == 'failed' and isinstance(trial.get('code_revision'),int) and trial['code_revision'] < revision:
             continue
         params = scientific_params(trial)
         # The database projection removes only the transport envelope; the
@@ -168,6 +174,11 @@ def coverage(plan, trials, *, cycle, revision, code_sha256=None, strict=False, p
 
 
 def ledger(engine, run_id, *, plan=None, rows=None):
+    state, _ = ledger_and_searches(engine, run_id, plan=plan, rows=rows)
+    return state
+
+
+def ledger_and_searches(engine, run_id, *, plan=None, rows=None):
     from .training_adjustment import _basis
     from .python_training import code_hash
     basis = _basis(engine, run_id)
@@ -186,9 +197,11 @@ def ledger(engine, run_id, *, plan=None, rows=None):
             if not row.get('code_sha256') and row.get('status') == 'completed':
                 environment, _ = _json_file(engine, run_id, row, 'environment.json', 1024 * 1024)
                 row['code_sha256'] = (environment or {}).get('code_sha256')
-    from .parameter_search import jobs as search_jobs
-    return coverage(plan, rows, cycle=engine.cycle(run_id), revision=program.get('revision', 0), additional_jobs=search_jobs(engine, run_id, plan),
+    from .parameter_search import catalog, new_jobs
+    searches = catalog(engine, run_id, plan)
+    state = coverage(plan, rows, cycle=engine.cycle(run_id), revision=program.get('revision', 0), additional_jobs=new_jobs(searches),
                     code_sha256=current_sha, strict=run['mode'] == 'live', primary_metric=basis['design']['primary_metric'])
+    return state, searches
 
 
 def require_complete(engine, run_id, *, plan=None):

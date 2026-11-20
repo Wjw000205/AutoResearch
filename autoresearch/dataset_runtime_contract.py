@@ -1,9 +1,28 @@
 """The actual host/adapter interface, shared by code delivery and review."""
 
 
+def asset_verification():
+    return {
+        'file': 'environment.json', 'field': 'dataset_assets',
+        'entry_fields': ['asset_id', 'manifest_sha256', 'files', 'provenance'],
+        'file_fields': ['path', 'trial_path', 'bytes', 'sha256', 'staged_stat'],
+        'stat_fields': ['size', 'mtime_ns', 'ctime_ns', 'device', 'inode'],
+        'stat_encoding': 'Use dataset_runtime.host_identity.portable_stat(path.stat()) for comparisons. On Windows device is the unsigned low 32 bits of st_dev so Python versions agree; other fields are exact. Other platforms retain the full device number. This helper is supplied and protected by the host.',
+        'guarantee': 'Before execution the host verifies the saved manifest and every entire source/staged file by size and SHA256. Staged stat records the copied file identity.',
+        'adapter_checks': 'Match config.dataset_assets and configured file binding to this receipt; use trial_path under cwd and verify file stat before/after reading permitted partitions. Never invent a receipt or substitute fixture metadata for a real asset.',
+        'manifest_sha256': 'Canonical JSON identity of the saved manifest, not the raw-byte SHA of a staged manifest file.',
+        'available_files': 'Only dataset files are staged. There is no acquisition manifest.json, dataset_runtime_binding or host-generated partition hash map in bootstrap.json.',
+        'partitions': 'The adapter derives split fingerprints from the allowed data it actually reads. Validation must not load held-out values; full-asset byte verification is the host responsibility.',
+    }
+
+
 def describe():
     return {
         'version': 2,
+        'yaml_runtime': {
+            'training': 'For a YAML-enabled program the admitted trial stages hyperparameters.yaml and hyperparameters.receipt.json. The receipt is also environment.json.hyperparameter_yaml. Its exact keys are revision_id, yaml_sha256, profile, params_sha256, effective_profile_sha256. The last hash is compact sorted UTF-8 JSON of the selected profile. The training output attests it as effective_hyperparameters_sha256.',
+            'dataset_code_check': 'The setup CPU check supplies params.json with phase=code_check and binds it to environment.json.params_sha256. It does not stage a per-training YAML or receipt. Check actual dispatch_samples against the frozen default YAML/schema and the actual check envelope. Test training-only receipt validation separately with isolated fixtures clearly identified as such; never present a fixture as a host receipt or require a nonexistent training receipt for the check.',
+        },
         'working_directory': 'The isolated trial directory containing experiment.py, params.json, environment.json, dataset_runtime/ and staged datasets/.',
         'configuration': {
             'file': 'params.json', 'kind': 'fully resolved flat parameters',
@@ -13,18 +32,7 @@ def describe():
             'authority': 'Host approved plan and exact invocation parameters; do not reread a fixed dataset profile to override CLI parameters.',
             'resolution': 'The host dispatches the selected *_params plus dataset, dataset_assets, benchmark metadata, variant, phase and seed. Root configuration fields are not automatically copied into these flat parameters. Declare required runtime fields in each profile, or obtain non-parameter metadata from its frozen configuration without overriding invocation values.',
         },
-        'asset_verification': {
-            'file': 'environment.json', 'field': 'dataset_assets',
-            'entry_fields': ['asset_id', 'manifest_sha256', 'files', 'provenance'],
-            'file_fields': ['path', 'trial_path', 'bytes', 'sha256', 'staged_stat'],
-            'stat_fields': ['size', 'mtime_ns', 'ctime_ns', 'device', 'inode'],
-            'stat_encoding': 'Use dataset_runtime.host_identity.portable_stat(path.stat()) for comparisons. On Windows device is the unsigned low 32 bits of st_dev so Python versions agree; other fields are exact. Other platforms retain the full device number. This helper is supplied and protected by the host.',
-            'guarantee': 'Before execution the host verifies the saved manifest and every entire source/staged file by size and SHA256. Staged stat records the copied file identity.',
-            'adapter_checks': 'Match config.dataset_assets and configured file binding to this receipt; use trial_path under cwd and verify file stat before/after reading permitted partitions. Never invent a receipt or substitute fixture metadata for a real asset.',
-            'manifest_sha256': 'Canonical JSON identity of the saved manifest, not the raw-byte SHA of a staged manifest file.',
-            'available_files': 'Only dataset files are staged. There is no acquisition manifest.json, dataset_runtime_binding or host-generated partition hash map in bootstrap.json.',
-            'partitions': 'The adapter derives split fingerprints from the allowed data it actually reads. Validation must not load held-out values; full-asset byte verification is the host responsibility.',
-        },
+        'asset_verification': asset_verification(),
         'cpu_checks': {
             'execution': 'checks.py source is embedded into trial-root experiment.py; cwd is the trial directory. Use Path.cwd(), not the saved checks.py source location.',
             'params': {'phase': 'code_check', 'dataset_assets': 'current asset bindings'},

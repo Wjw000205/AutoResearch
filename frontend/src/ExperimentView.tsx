@@ -51,8 +51,8 @@ function datasetSummary(summary: Json | null | undefined, trials: Json[]) {
     benchmark_tasks: (summary.benchmark_tasks ?? []).filter((t: Json) => trials.some(row => row.params?.dataset === t.dataset))};
 }
 
-export function ExperimentView({ experiments, evaluation, runId, summary, datasetQueue, currentCycle }: {
-  experiments: Json[]; evaluation?: TrialEvaluation; runId?: string; summary?: Json | null; datasetQueue?: Json; currentCycle?: number;
+export function ExperimentView({ experiments, evaluation, runId, summary, datasetQueue, currentCycle, singleDataset = false }: {
+  experiments: Json[]; evaluation?: TrialEvaluation; runId?: string; summary?: Json | null; datasetQueue?: Json; currentCycle?: number; singleDataset?: boolean;
 }) {
   const [dataset, setDataset] = useState('');
   const [kind, setKind] = useState('comparison');
@@ -71,12 +71,12 @@ export function ExperimentView({ experiments, evaluation, runId, summary, datase
     : categories.find(c => categoryRows(c.id).length)?.id ?? 'baseline';
   const selected = categoryRows(chosen);
   return <section className="dataset-experiments" aria-label="按数据集查看实验">
-    <div className="dataset-switcher" role="group" aria-label="选择实验数据集">{partitions.filter(p => !p.historical).map(p => <button type="button" key={p.id} aria-pressed={current.id === p.id} onClick={() => setDataset(p.id)}>
-      <strong>{p.name}</strong><span>{p.trials.filter(t => t.status === 'running').length ? '正在运行' : p.trials.length ? `${p.trials.filter(t => !t.superseded && t.params?.phase !== 'code_check' && t.status === 'completed').length} 次训练完成` : '待配置 / 运行'}</span></button>)}</div>
+    {!singleDataset && <div className="dataset-switcher" role="group" aria-label="选择实验数据集">{partitions.filter(p => !p.historical).map(p => <button type="button" key={p.id} aria-pressed={current.id === p.id} onClick={() => setDataset(p.id)}>
+      <strong>{p.name}</strong><span>{p.trials.filter(t => t.status === 'running').length ? '正在运行' : p.trials.length ? `${p.trials.filter(t => !t.superseded && t.params?.phase !== 'code_check' && t.status === 'completed').length} 次训练完成` : '待配置 / 运行'}</span></button>)}</div>}
     {partitions.some(p => p.historical) && <details className="result-source dataset-history"><summary>历史数据与实验</summary>{partitions.filter(p => p.historical).map(p => <button type="button" key={p.id} aria-pressed={current.id === p.id} onClick={() => setDataset(p.id)}>{p.name} · {p.trials.length} 条记录</button>)}</details>}
     <header className="dataset-section-heading"><div><h3>{current.name}</h3><p>{scientific.filter(t => t.status === 'completed').length} 次训练完成 · {rows.filter(t => t.params?.phase === 'code_check').length} 次接口检查{rows.some(t => t.superseded) ? ` · ${rows.filter(t => t.superseded).length} 条旧版本记录` : ''}</p></div><span className="result-tag">{datasetQueue?.attempts_unlimited ? '实验不限次数' : '逐批验证'}</span></header>
     {!rows.length ? <p className="dataset-empty">本数据集尚未开始运行。配置、接口检查和训练结果会分别显示在这里。</p> : <>
-      <ExperimentSummary summary={datasetSummary(summary, rows)} />
+      <ExperimentSummary summary={datasetSummary(summary, rows)} experiments={rows} />
       <div className="experiment-kind-tabs" role="group" aria-label="选择实验类型">{categories.map(c => <button type="button" key={c.id} aria-pressed={chosen === c.id} disabled={!categoryRows(c.id).length} onClick={() => setKind(c.id)}>{c.name}<span>{categoryRows(c.id).length}</span></button>)}</div>
       <ExperimentResults key={`${runId}:${current.id}:${chosen}`} experiments={selected} runId={runId} evaluation={partitions.length === 1 ? evaluation : undefined} />
       {runId && <DatasetConsole key={`${runId}:${current.id}`} runId={runId} trials={rows} />}

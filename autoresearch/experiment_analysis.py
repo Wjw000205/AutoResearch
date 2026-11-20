@@ -68,26 +68,41 @@ def freeze_sources(engine, run_id, program, bundle=None, *, delivery_support=Fal
 def frozen(engine, run_id, context, args, *, source_page=False):
     ref = context.get('validation_evidence') or {}
     if args['evidence_id'] != ref.get('id') or args['expected_sha256'] != ref.get('sha256'):
-        raise ValueError('Analysis must use this exact frozen decision evidence')
+        from .tool_navigation import NavigationError
+        calls = ([{'name': 'experiments.inspect_module' if source_page else 'experiments.compare',
+            'arguments': {'evidence_id': ref['id'], 'expected_sha256': ref['sha256'], 'offset': 0, 'limit': 4000}}]
+            if ref.get('id') and ref.get('sha256') else [])
+        raise NavigationError('Analysis must use this exact frozen decision evidence',
+            code='frozen_evidence_identity_required', next_calls=calls)
+    record = None
     if source_page:
         from .scope_read_session import verified_record
         record = verified_record(engine, 'experiment_evidence', ref['id'], run_id, ref['sha256'],
                                  error='Decision evidence is missing, changed or not an analysis snapshot')
-        if record is not None:
-            if 'binding' not in record['summary']:
-                raise ValueError('Decision evidence is missing, changed or not an analysis snapshot')
-            return record['summary']
-    record = engine.store.get('experiment_evidence', ref['id']) or {}
+    if record is None:
+        record = engine.store.get('experiment_evidence', ref['id']) or {}
+        if record.get('run_id') != run_id or sha(record.get('summary')) != ref['sha256']:
+            raise ValueError('Decision evidence is missing, changed or not an analysis snapshot')
     evidence = record.get('summary')
-    if record.get('run_id') != run_id or sha(evidence) != ref['sha256'] or 'binding' not in evidence:
+    if not isinstance(evidence,dict):
         raise ValueError('Decision evidence is missing, changed or not an analysis snapshot')
+    if 'binding' not in evidence:
+        # Older paper-template handoffs bound the source inside matrix_contract.
+        # This exact immutable binding can serve source pages only.
+        scope = context.get('dataset_planning',{}).get('matrix_contract') or {}
+        if (not source_page or not scope.get('root_bundle_sha256') or scope != evidence.get('matrix_contract')
+                or scope.get('prior_model_sources') != evidence.get('code_sources')
+                or evidence['code_sources']['id'] != run_id+':analysis-source:'+scope['root_bundle_sha256']):
+            raise ValueError('Decision evidence is missing, changed or not an analysis snapshot')
     return evidence
 
 
 def _rows(evidence, unit_id):
     unit = next((u for u in evidence['units'] if u['id'] == unit_id), None)
     if not unit:
-        raise ValueError('Unknown analysis batch; inspect /units first')
+        from .tool_navigation import NavigationError
+        raise NavigationError('Unknown analysis batch; inspect /units first', code='analysis_unit_unavailable',
+            details={'available_unit_ids': [u['id'] for u in evidence['units'][:25]]})
     keys = set(unit['params_sha256'])
     return unit, [r for r in evidence['records'] if sha(r['params']) in keys]
 
@@ -235,7 +250,13 @@ def inspect_module(engine, run_id, context, args):
         result = _page(value, args)
         return {**result, 'view': 'index', 'source_read': False, 'evidence_sha256': args['expected_sha256']}
     if path not in files or 'text' not in files[path]:
-        raise ValueError('Requested module is absent/unreadable in the executed source snapshot')
+        from .tool_navigation import NavigationError
+        raise NavigationError('Requested module is absent/unreadable in the executed source snapshot',
+            code='module_path_unavailable', next_calls=[{'name': 'experiments.inspect_module', 'arguments': {
+                'evidence_id': args['evidence_id'], 'expected_sha256': args['expected_sha256'],
+                **({'snapshot': args['snapshot']} if 'snapshot' in args else {}), 'offset': 0, 'limit': 4000}}],
+            details={'requested_snapshot': args.get('snapshot', 'current'),
+                     'available_paths': list(files)[:25], 'paths_truncated': len(files) > 25})
     item, view = files[path], args.get('view', 'symbols')
     source = item['text']
     if hashlib.sha256(source.encode()).hexdigest() != item['sha256']:

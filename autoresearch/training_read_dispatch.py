@@ -66,8 +66,10 @@ def _targets(engine, run_id, context, proposal, original, required):
         identity = resolve(source_files(engine.store, run_id, context), path)
         args = {**base, 'path': identity['path'], 'view': 'source', 'snapshot': 'current'}
         meta = inspect_module(engine, run_id, context, args)
+        prior = original.get('source_page_ranges', {}).get(identity['path'], {})
         targets.append({'name': 'experiments.inspect_module', 'arguments': args,
-            'sha256': meta['source_sha256'], 'total_chars': meta['total_chars'], 'ranges': [],
+            'sha256': meta['source_sha256'], 'total_chars': meta['total_chars'],
+            'ranges': copy.deepcopy(prior.get('ranges', [])) if prior.get('sha256') == meta['source_sha256'] else [],
             **({'source_reference': identity} if identity['path'] != path else {})})
     for trial in sorted(required - set(original.get('training_trials_read', []))):
         args = {**base, 'kind': 'training', 'trial_id': trial}
@@ -113,6 +115,8 @@ def _verify(engine, run_id, role, assignment):
     cited, valid, pages, kinds = set(answer['read_receipts']), set(), [], set()
     for row in engine.store.get('handoff_progress', hid, {}).get('tool_results', []):
         call, result = row.get('call', {}), row.get('result', {})
+        if not isinstance(result, dict):
+            continue
         receipt = result.get('receipt_sha256')
         if receipt not in cited:
             continue
@@ -130,8 +134,15 @@ def _verify(engine, run_id, role, assignment):
                 kinds.add(args['kind'])
             if body.get('source_read') or (call['name'] == 'experiments.analyze' and args['kind'] == 'training'):
                 pages.append({'name': call['name'], 'arguments': args,
+                    **({'receipt_sha256': receipt} if payload['context'].get('experiment_decision', {}).get('directed_review_reading') else {}),
                     'sha256': body.get('source_sha256', body.get('content_sha256')),
                     'total_chars': body['total_chars'], 'range': [body['offset'], body['end']]})
+        elif call.get('name') == 'experiments.compare' and payload['context'].get('experiment_decision', {}).get('directed_review_reading'):
+            from .experiment_tools import compare
+            if body != compare(engine, run_id, payload['context'], args):
+                raise ResearchBlocked('Directed reviewer page differs from the frozen comparison')
+            pages.append({'name': call['name'], 'arguments': args, 'sha256': body['content_sha256'], 'receipt_sha256': receipt,
+                          'total_chars': body['total_chars'], 'range': [body['offset'], body['end']]})
         elif not _supplementary_analysis_read(engine, run_id, payload['context'], call, result):
             raise ResearchBlocked('Training supplement cites an unsupported or unrelated receipt')
         valid.add(receipt)
@@ -171,8 +182,8 @@ def _merge(reads, targets, proof):
     return result
 
 
-def _satisfied(reads, required, modules):
-    return (len(reads) == 3 and {r.get('role') for r in reads} == ROLES
+def _satisfied(reads, required, modules, roles=ROLES):
+    return (len(reads) == len(roles) and {r.get('role') for r in reads} == set(roles)
         and all(required.issubset(r.get('training_trials_read', [])) and r.get('source_paths')
             and modules.issubset(r.get('source_paths', [])) for r in reads))
 
@@ -197,10 +208,12 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
         await checkpoint(training_pending_proposal=pending, status='proposing')
     audits = copy.deepcopy(record.get(KEY, {}))
     saved = audits.get(key)
-    if not saved and _satisfied(reads, required, modules):
+    from .independent_full_review import reviewers
+    roles = reviewers(record.get('analyses', []))
+    if not saved and _satisfied(reads, required, modules, roles):
         return reads
-    if len(reads) != 3 or {r.get('role') for r in reads} != ROLES:
-        raise ResearchBlocked('Training supplement requires the three original independent role analyses')
+    if len(reads) != len(roles) or {r.get('role') for r in reads} != set(roles):
+        raise ResearchBlocked('Training supplement requires the original independently assigned reviewer reads')
     if not saved:
         saved = audits[key] = {'version': 1, 'proposal': copy.deepcopy(proposal), 'proposal_sha256': key,
             'evidence': copy.deepcopy(record['evidence']), 'initial_reads': copy.deepcopy(reads),
@@ -212,14 +225,13 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
     effective = copy.deepcopy(saved['initial_reads'])
     from .source_read_identity import credit_existing
     effective = credit_existing(engine.store, run_id, context, effective, modules)
-    engineer = next(r for r in effective if r['role'] == 'engineer')
-    author_basis = (next(r for r in saved['initial_reads'] if r['role'] == 'engineer')
-                    if 'author_read' in saved else engineer)
+    basis_reads = saved['initial_reads'] if 'author_read' in saved else effective
+    author_basis = next((r for r in basis_reads if r['role'] == 'engineer'), {})
     additional = author_reads(engine, run_id, proposal, record['evidence'], modules - set(author_basis.get('source_paths', [])))
     if 'author_read' in saved and saved['author_read'] != additional:
         raise ResearchBlocked('Retained proposal author read changed')
     saved['author_read'] = additional
-    if additional:
+    if additional and 'engineer' in roles:
         effective = merge_reads(effective, additional)
     await checkpoint(**{KEY: audits}, status='reading_training')
     for original in list(effective):
@@ -246,7 +258,7 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
                         'retained_* 已经由本角色读过，不必重读；本次只补缺口，不重做方案、不训练、不改代码。'
                         '源码补读无需再做训练分析。只在 read_receipts 引用本次实际工具回执，'
                         '原答复和已读页会保留；未读完会自动派发剩余页。'
-                        '记录新发现、反证和局限，suggested_action=diagnose。补读不是批准，随后仍须三方独立投票。',
+                        '记录新发现、反证和局限，suggested_action=diagnose。补读后仍须由本次指派的评审独立投票。',
                     'context': request, 'schema': analysis_schema(request)})
                 await checkpoint(**{KEY: audits}, status='reading_training')
             assignment = assignments[index]
@@ -259,7 +271,7 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
             assignment['read'] = proof
             await checkpoint(**{KEY: audits}, analysis_reads=effective, status='reading_training')
             index += 1
-    if not _satisfied(effective, required, modules):
+    if not _satisfied(effective, required, modules, roles):
         raise ResearchBlocked('Training supplement has no readable source for the declared intervention')
     saved['status'] = 'complete'
     await checkpoint(**{KEY: audits}, analysis_reads=effective, status='proposing')
@@ -267,11 +279,13 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
 
 
 def complete(record):
+    from .independent_full_review import reviewers
     saved = record.get(KEY, {}).get(record.get('proposal_sha256'))
     return not saved or (saved.get('status') == 'complete'
         and saved.get('evidence') == record.get('evidence') and saved.get('proposal') == record.get('proposal')
         and saved.get('proposal_sha256') == sha(record.get('proposal'))
-        and _satisfied(record.get('analysis_reads', []), set(saved['required_training_trials']), set(saved['module_paths'])))
+        and _satisfied(record.get('analysis_reads', []), set(saved['required_training_trials']), set(saved['module_paths']),
+                       reviewers(record.get('analyses', []))))
 
 
 def vote_context(record, context):

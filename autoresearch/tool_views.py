@@ -19,6 +19,15 @@ def _availability(role, name):
             return {'role': role, 'protocol': ' or '.join(inherited) if protocol is not None else None,
                     'condition': condition + (' 更高层的笔记、PDF 或论文目录协议也继承此能力。' if index < 4 and protocol else '')}
     conditions = {
+        'reviews.read_material': ('independent_full_review; exact frozen policy/material', '本独立角色按精确冻结材料和字符范围读原文；目录不是已读证据，实际投递另行核验。'),
+        'reviews.record_notes': ('independent_full_review; same-role submitted receipts', '保存或按ID回读本人原观察；结构化代码结论绑定精确版本和范围，未决问题与原回执保留，笔记不代表批准。'),
+        'materials.request_read': ('assignment_contract; exact frozen dependency', '按当前冻结目录申请决定性代码或文档页，宿主核验来源、范围及责任；补读不转移审核责任或授予执行权限。'),
+        'experiments.cleanup': ('experiment_workflow_protocol=1; completed attempts; exact saved preview', '仅按宿主可重建缓存清理预览选择文件；实际清理仍核验本任务及原预览，不删除科学回执或数据。'),
+        'experiments.files': ('assignment_contract; frozen source/yaml/validation/host catalog', '按当前任务目录导航文件，沿返回的精确版本read_call读取；文件索引不能代替原文和执行证据。'),
+        'hyperparameters.read': ('assignment_contract; frozen paired control or YAML revision', '读取受当前任务约束的原配对控制或精确YAML版本，不批准修改或启动执行。'),
+        'hyperparameters.revise': ('assignment_contract; authorized YAML revision', '在宿主允许的参数路径生成不可变YAML修订，保留原版本；仍须独立审核及原科学和资源门禁。'),
+        'bayes.write_script': ('assignment_contract; engineer; reviewed dataset scope', '保存当前任务的参数选择脚本供独立审核；保存脚本不代表批准搜索或实验。'),
+        'bayes.start_search': ('assignment_contract; exact independently approved script and plan', '仅由宿主按独立批准的脚本和计划启动受预算、资源和停止条件约束的验证搜索。'),
         'experiments.status': ('experiment_workflow_protocol=1', '分页核对当前周期全部冻结验证任务及剩余运行次数；台账完整不代表科学验收通过。'),
         'experiments.read': ('experiment_workflow_protocol=1', '按当前任务、周期及投影哈希读取单个验证实验；诊断尾部有长度上限，留出集结果不可读。'),
         'experiments.compare': ('experiment_workflow_protocol=1; validation_evidence', '按冻结的统计证据 ID、SHA256 和 JSON 路径分页复核验证结果，不执行实验或更换选参。'),
@@ -34,7 +43,7 @@ def _availability(role, name):
         'datasets.download': ('dataset_tools_protocol=1; scout or engineer', '按已读论文的数据集名从作者/基准维护者公开仓库联网下载，或沿实际来源链下载；限制网络/解压/磁盘用量，不启动训练。'),
         'code.locate': ('code_review or code_repair_tool_review=1', '只定位当前冻结交付的文件、函数及文字位置；不注入源码，不授予读取或修改权限。'),
         'code.read': ('code_review or code_repair_tool_review=1', '按文件哈希及字符范围读取相关代码；原文消费后退出上下文，精确回执保留并可回查。'),
-        'code.record_notes': ('code_review or code_repair_tool_review=1', '保存绑定真实读取回执的简短观察和未决问题；笔记不代表实现文档、代码或实验已获批准。'),
+        'code.record_notes': ('code_review or code_repair_tool_review=1', '保存精确源码版本/范围关联的结论与未决问题，或用action=read和note_id回查本人原观察；笔记不代表批准。'),
         'documents.recall': ('code_review or code_repair_tool_review=1', '检索本角色在冻结范围内已读过的同版本文档及条款笔记；版本变化或记忆缺失时才补读原文。'),
         'artifacts.list': ('delivery_directory_protocol=1 and implementation_alignment_protocol=1; code_review', '仅导航当前冻结代码评审交接的交付目录；按页返回文件标识、路径和哈希，不代表已读文件或验收通过。'),
         'architecture.draw_diagrams': ('architecture_diagram_authoring_protocol=2', '仅 engineer 当前同周期、同 SHA 的已批准架构绘图交接可用；保存图示不代表科学审批或实现验收。'),
@@ -59,17 +68,22 @@ def _availability(role, name):
 
 def tool_catalog(store, run_id=None):
     """Expose the execution registry, not a new authorization or model request."""
-    from .tool_contracts import VERSION, argument_schema
+    from .tool_contracts import VERSION, inventory_schema
     settings = get_settings(store)
     providers = {row['id']: row for row in settings.get('providers', [])}
     role_tools = {role: Harness.executable_tools(role) for role in ROLES}
     tools = []
     for name in sorted({name for names in role_tools.values() for name in names}):
         help_text = TOOL_HELP[name]
-        contract, separator, _ = help_text.partition('} ')
+        schema = inventory_schema(name)
+        argument_start = help_text.find('arguments=')
+        contract_text = help_text[argument_start:] if argument_start >= 0 else ''
+        contract, separator, _ = contract_text.partition('} ')
+        contract = (contract + '}' if separator else contract) if contract_text else (
+            'arguments=' + json.dumps(schema, ensure_ascii=False, sort_keys=True))
         tools.append({'name': name, 'description': help_text,
-                      'arguments_contract': contract + '}' if separator else help_text,
-                      'arguments_schema': argument_schema(name), 'tool_contract_version': VERSION,
+                      'arguments_contract': contract,
+                      'arguments_schema': schema, 'tool_contract_version': VERSION,
                       'roles': [role for role in ROLES if name in role_tools[role]],
                       'category': name.split('.', 1)[0],
                       'availability': [_availability(role, name) for role in ROLES if name in role_tools[role]],

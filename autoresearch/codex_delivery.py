@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import copy
 import hashlib
 import json
-import math
 import re
 import shutil
 import subprocess
@@ -14,9 +12,8 @@ import sys
 from pathlib import Path
 
 from .config import ROOT
-from .lab import ExperimentRunner, assess_resources, hardware_profile
-from .python_environments import apply_execution_preferences
 from .storage import now, redact
+from .delivery_files import io_path
 
 
 def validate_project_dir(value: str) -> str:
@@ -80,35 +77,11 @@ async def codex_status(project_dir: str | None = None) -> dict:
                     raise
 
 
-class CheckStore:
-    """Reuse bounded execution without adding smoke scores to research trials."""
-    names = {'experiments': 'codex_checks', 'experiment_attempts': 'codex_check_attempts'}
-
-    def __init__(self, store):
-        self.store = store
-
-    def get(self, collection, *args, **kwargs):
-        return self.store.get(self.names.get(collection, collection), *args, **kwargs)
-
-    def list(self, collection, *args, **kwargs):
-        return self.store.list(self.names.get(collection, collection), *args, **kwargs)
-
-    def put(self, collection, *args, **kwargs):
-        return self.store.put(self.names.get(collection, collection), *args, **kwargs)
-
-    def batch(self, puts, deletes=()):
-        return self.store.batch([(self.names.get(c, c), k, v) for c, k, v in puts],
-                                [(self.names.get(c, c), k) for c, k in deletes])
-
-    def event(self, run_id, kind, message, data):
-        return self.store.event(run_id, kind.replace('experiment.', 'codex.check.'), message, data)
-
-
 def inspect_delivery(directory: Path, spec: dict) -> dict:
     """Read actual bytes and declared requirement pointers; declarations are not proof."""
     directory = Path(directory)
     issues, files = [], []
-    if not directory.is_dir():
+    if not io_path(directory).is_dir():
         return {'approved': False, 'issues': ['尚未生成交付目录'], 'files': []}
     from .delivery_files import regular_files, identity
     try:
@@ -122,8 +95,8 @@ def inspect_delivery(directory: Path, spec: dict) -> dict:
         issues.append('必须实际交付 experiment.py 和 implementation.json')
     if not issues:
         try:
-            code = (directory / 'experiment.py').read_bytes().decode('utf-8')
-            manifest = json.loads((directory / 'implementation.json').read_text(encoding='utf-8'))
+            code = io_path(directory / 'experiment.py').read_bytes().decode('utf-8')
+            manifest = json.loads(io_path(directory / 'implementation.json').read_text(encoding='utf-8'))
             if not isinstance(manifest, dict):
                 raise ValueError('manifest')
             tree = ast.parse(code)
@@ -170,7 +143,8 @@ def inspect_delivery(directory: Path, spec: dict) -> dict:
             'scope': '文件与声明核对；映射、静态检查和运行成功均不能单独证明方法正确。'}
 
 
-async def verify_codex_delivery(engine, run_id, workspace, spec, *, cancel=None, on_progress=None, yaml_protocol=0) -> dict:
+async def verify_codex_delivery(engine, run_id, workspace, spec, *, cancel=None, on_progress=None, yaml_protocol=0,
+                                workflow_id=None) -> dict:
     def report(step, label, **details):
         if on_progress:
             on_progress({'step': step, 'label': label, **details})
@@ -197,29 +171,26 @@ async def verify_codex_delivery(engine, run_id, workspace, spec, *, cancel=None,
     result['runtime_sha256'] = (result.get('runtime_bundle') or {}).get('sha256') or result.get('code_sha256')
     if not result['approved']:
         return result
-    yaml_program = None
+    state = engine.store.get('codex_workflows',workflow_id,{})
+    specification = next((r for r in reversed(state.get('specifications', [])) if r.get('approved') is True), {})
+    if state.get('run_id') != run_id or not specification or specification.get('spec') != spec:
+        raise ValueError('Delivery verification requires its own approved implementation workflow')
+    manifest = json.loads(io_path(directory / 'implementation.json').read_bytes())
+    if manifest.get('implementation_document_sha256') != specification['document']['sha256']:
+        return {**result, 'approved': False, 'issues': ['实际交付没有绑定批准的实现 Markdown SHA256']}
     if yaml_protocol == 1:
         from .yaml_migration import inspect_contract
         try:
-            contract = inspect_contract(result.get('runtime_bundle') or {'files': []})
-        except (ValueError, KeyError, TypeError, OSError) as exc:
-            return {**result, 'approved': False, 'issues': ['YAML 超参数交付合同未通过：' + str(exc)]}
-        yaml_program = {'code': result['code'], 'revision': 0,
-            'hyperparameter_yaml_protocol': 1, 'hyperparameter_contract': contract}
+            scope = state.get('yaml_configuration_scope')
+            inspect_contract(result.get('runtime_bundle') or {'files':[]},
+                             **({'expected_scope':scope} if scope else {}))
+        except (ValueError,KeyError,TypeError,OSError) as exc:
+            return {**result,'approved':False,'issues':['YAML 超参数交付合同未通过：'+str(exc)[:1000]]}
     from . import code_verification
-    admission = code_verification.policy(engine, run_id)
+    admission = code_verification.policy(engine, run_id, workflow_id=workflow_id)
     if admission:
-        from . import definition_code_followup as followup
-        state = engine.store.get('codex_workflows',admission['workflow_id'],{})
-        specification = next((r for r in state.get('specifications',[]) if r.get('approved')
-                              and r.get('spec')==spec),{})
-        if followup.applicable(state,specification):
-            result.update(approved=False, definition_checks_deferred=True,
-                scope='补充定义交付的静态检查；独立入口复审和新增非训练计时仍待完成，未重跑旧测试。')
-            result['issues'].append('新增资源计时代码等待独立复审和宿主一次性取证。')
-            return result
         report('bounded_checks', '宿主执行已批准的有界代码检查，不启动完整模型训练')
-        receipt = await code_verification.run(engine, run_id, directory, cancel=cancel)
+        receipt = await code_verification.run(engine, run_id, directory, cancel=cancel, workflow_id=workflow_id)
         after = await asyncio.to_thread(inspect_delivery, directory, spec)
         result['host_verification'] = receipt
         result['bounded_checks_only'] = True
@@ -230,185 +201,24 @@ async def verify_codex_delivery(engine, run_id, workspace, spec, *, cancel=None,
             result['issues'].append('有界检查期间冻结交付发生变化')
         result['approved'] = not result['issues']
         return result
-    run = engine.store.get('runs', run_id)
-    report('plan', '核对冻结实验计划与共同任务参数')
-    @operation
-    def read_inputs():
-        return engine.outputs(run_id)['design'], engine.experiment_plan(run_id)
-    design, plan = await asyncio.to_thread(read_inputs)
-    engine.check_active(run_id)
-    if not plan or not plan.get('validation_pairs') or not plan.get('ablation_candidates'):
-        return {**result, 'approved': False, 'issues': ['缺少完整冻结实验计划，不能选择代码验收参数。']}
-    from .fair_comparison import validate_plan, validate_invocation, strict_equal
-    try:
-        validate_plan(plan, design)
-    except ValueError as exc:
-        return {**result, 'approved': False, 'issues': ['验收的共同任务条件未对齐：' + str(exc)]}
-    from . import comparison_transport as comparison
-    transport = await asyncio.to_thread(operation(comparison.runtime_transport), engine, run_id, spec=spec)
-    result['protocol_repair'] = transport.get('protocol_repair') if transport else None
-    result['validation_policy_sha256'] = comparison.digest({'contract': transport.get('contract') if transport else None,
-        'evaluation_contract_version': run['config'].get('evaluation_contract_version'), 'delivery_verifier': 2})
-    engine.check_active(run_id)
-    resource = {**design['resource_plan'], 'required_packages': sorted(set(
-        [*design['resource_plan'].get('required_packages', []), *result['dependencies']]))}
-    report('resources', '检查本机资源和运行依赖')
-    measured = await asyncio.to_thread(hardware_profile)
-    measured = await asyncio.to_thread(apply_execution_preferences, run['config'], measured)
-    admitted = assess_resources(resource, measured)
-    if not admitted['approved']:
-        return {**result, 'approved': False, 'issues': ['当前资源或依赖不满足验收要求', *admitted.get('reasons', [])]}
-    limits = {**admitted.get('limits', {}), 'execution_mode': run['config'].get('execution_mode', 'local'),
-              'required_packages': resource['required_packages']}
-    from . import codex_execution_reuse as reuse
-    replay = reuse.replay_policy(engine, run_id, result)
-    if replay:
-        limits['historical_execution_policy'] = replay
-    # These are the frozen full branch invocations, not reduced smoke inputs.
-    # Respect the admitted plan and user ceiling; an unrelated 120-second cap
-    # made correctly scoped training fail before its approved resource deadline.
-    limits['timeout_seconds'] = min(float(limits.get('timeout_seconds', 120)), run['config'].get('experiment_timeout', 120))
-    if result.get('runtime_bundle'):
-        limits['code_bundle'] = result['runtime_bundle']
-    if transport:
-        try:
-            comparison.io_limits(limits)
-        except ValueError as exc:
-            return {**result, 'approved': False, 'issues': [str(exc)]}
-        limits['comparison_transport'] = transport
-    runner = ExperimentRunner(CheckStore(engine.store), root / 'codex-acceptance')
-    # Use one prespecified validation configuration only. Held-out tests remain
-    # reserved for the existing frozen final-evaluation stage.
-    first_pair = plan['validation_pairs'][0]
-    first_ablation = plan['ablation_candidates'][0]
-    pair_seed = first_pair.get('seed', plan['selection_seed'])
-    checks = [(first_pair['baseline'], pair_seed), (first_pair['proposed'], pair_seed),
-              (first_ablation, first_ablation.get('seed', plan['selection_seed']))]
-    if transport:
-        # Smoke each branch only as a real producer; do not fabricate reference
-        # records or execute the entire scientific matrix inside acceptance.
-        producers = [params for _, params in comparison.ordered_validation(plan, transport['contract'])[:-1]]
-        if len(producers) == 2:
-            checks = [(p, p['seed']) for _, p in comparison.ordered_validation(plan, transport['contract'])]
-        else:
-            checks = []
-            for variant in ('baseline', 'proposed', 'ablation'):
-                candidate = next((p for p in producers if p['variant'] == variant), None)
-                if candidate is None:
-                    return {**result, 'approved': False, 'issues': ['运输计划没有用于三分支固定验收的生产者调用，不能伪造比较参照。']}
-                checks.append((candidate, candidate['seed']))
-    fingerprints = None
-    transport_records = []
-    for check_number, (frozen_params, seed) in enumerate(checks, 1):
+    if workflow_id is not None and state.get('implementation_acceptance_protocol') == 1:
+        # New document contracts approve definitions, not the legacy three-fit
+        # smoke protocol. Keep code conformance and execution admission separate:
+        # reviewers see the actual frozen source/reports, while experiment
+        # dispatch still requires the existing source-bound runtime admission.
+        from .implementation_documents import validate_review_snapshot
+        await engine._read_consensus_check(run_id, validate_review_snapshot,
+            engine, run_id, state, specification)
         engine.check_active(run_id)
-        if cancel and cancel.is_set():
-            raise asyncio.CancelledError()
-        params = {**copy.deepcopy(frozen_params), 'phase': 'validation', 'seed': seed}
-        try:
-            validate_invocation(plan, params)
-        except ValueError as exc:
-            result['issues'].append('验收的共同任务条件未对齐：' + str(exc))
-            break
-        if transport:
-            try:
-                params = await asyncio.to_thread(comparison.prepare_inputs, transport, params, transport_records)
-            except ValueError as exc:
-                result['issues'].append('运输验收输入未闭合：' + str(exc))
-                break
-            engine.check_active(run_id)
-        # A repaired host runtime must not reuse an old failed execution receipt.
-        # Its identity is separate; the previous immutable check remains history.
-        from . import codex_execution_reuse as reuse
-        if yaml_program:
-            from .hyperparameter_yaml import prepare_trial
-            limits['hyperparameter_yaml'] = prepare_trial(engine, run_id, yaml_program, params, use_pending=False)
-        check_id = 'codex-' + reuse.execution_identity(result, params, limits)[:24]
-        variant = params.get('variant', 'unknown')
-        label = {'baseline': '基线', 'proposed': '候选方法', 'ablation': '消融'}.get(variant, variant)
-        report('smoke', f'运行{label}分支验收（{check_number}/{len(checks)}）',
-               check_id=check_id, variant=variant, completed=len(result['smoke']), total=len(checks),
-               timeout_seconds=limits['timeout_seconds'], checks=copy.deepcopy(result['smoke']))
-        try:
-            record = await asyncio.to_thread(reuse.find, engine, run_id, result, params, limits)
-        except (ValueError, OSError) as exc:
-            result['issues'].append('已保存运行证据无法复用：' + str(exc))
-            result['failure_kind'] = 'codex_execution_evidence_invalid'
-            break
-        if record:
-            report('contract', f'复用{label}已保存结果，重新核验输出协议（{check_number}/{len(checks)}）',
-                check_id=record['id'], variant=variant, completed=len(result['smoke']), total=len(checks))
-        elif replay:
-            result['issues'].append('仅复用核验未找到与当前交付、参数和原授权资源一致的完整证据；已停止，不启动新运行。')
-            result['failure_kind'] = 'codex_execution_evidence_invalid'
-            break
-        else:
-            record = await runner.run(run_id, result['code'], params, check_id, limits, cancel)
-        report('contract', f'核对{label}分支的指标、数据划分和输出契约',
-               check_id=check_id, variant=variant, completed=len(result['smoke']), total=len(checks))
-        if transport:
-            evidence, errors = await asyncio.to_thread(operation(engine.check_evaluation_contract), run_id, record, params)
-            engine.check_active(run_id)
-        else:
-            evidence, errors = engine.check_evaluation_contract(run_id, record, params)
-        if yaml_program:
-            from .hyperparameter_yaml import check_result
-            errors.extend(check_result(record, limits['hyperparameter_yaml']))
-        from .execution_diagnostics import failure_diagnostic, failure_message
-        diagnostic = failure_diagnostic(record)
-        if diagnostic:
-            # A deliberate resource/contract rejection is the root cause. Keep
-            # the secondary protocol errors, but don't hide the actual failure
-            # behind missing metrics from a process that exited unsuccessfully.
-            errors = [failure_message(diagnostic), *errors]
-        if transport and record.get('status') == 'completed':
-            try:
-                record['comparison_transport'] = await asyncio.to_thread(comparison.validate_result, transport, params, record)
-                engine.check_active(run_id)
-                if params['comparison_inputs']['role'] != 'producer':
-                    for criterion in plan.get('acceptance', {}).get('criteria', []):
-                        comparison.acceptance_value(evidence, criterion['metric'], criterion)
-            except ValueError as exc:
-                errors.append(str(exc))
-        metric = design['primary_metric']
-        value = record.get('metrics', {}).get(metric)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-            errors.append(f'没有返回所需有限数值指标 {metric}')
-        if any(k.startswith('test_') for k in record.get('metrics', {})):
-            errors.append('验证阶段错误地返回独立测试指标')
-        if isinstance(evidence, dict):
-            if not strict_equal(evidence.get('actual_params'), params):
-                errors.append('actual_params 与实际输入不一致')
-            from .split_identity import compatible
-            identity = evidence
-            if fingerprints is not None and not compatible(identity, fingerprints):
-                errors.append('不同分支的数据或划分不一致')
-            fingerprints = identity
-        else:
-            errors.append('缺少数据与划分来源声明')
-        if record['status'] != 'completed':
-            errors.append('本地运行未完成：' + record['status'])
-        if transport and not errors:
-            transport_records.append(record)
-        result['smoke'].append(redact({k: record.get(k) for k in
-            ['id', 'status', 'exit_code', 'duration_seconds', 'stdout', 'stderr', 'error', 'params', 'metrics', 'artifact_path']} | {
-                'command': [limits.get('python_executable') if limits['execution_mode'] == 'local' else 'python', '-I', 'bootstrap.py', 'bootstrap.json'], 'passed': not errors,
-                'execution_reuse': record.get('execution_reuse'),
-                'issues': errors, **({'failure_diagnostic': diagnostic} if diagnostic else {}),
-                'scope': '验证分支运行检查，非科研实验结果、完整测试覆盖或最终测试。'}))
-        result['issues'].extend(errors)
-        report('branch_done', f'{label}分支验收' + ('未通过' if errors else '已通过'),
-               completed=len(result['smoke']), total=len(checks), checks=copy.deepcopy(result['smoke']))
-        if any(error.startswith('Undeclared comparison array:') for error in errors):
-            result['failure_kind'] = 'codex_protocol_conflict'
-            break  # Same host schema conflict affects all branches; do not retrain them.
-        if errors:
-            break  # The acceptance batch already failed; do not run more training.
-    report('integrity', '复核验收前后的交付文件一致性',
-           completed=len(result['smoke']), total=len(checks), checks=copy.deepcopy(result['smoke']))
-    after = await asyncio.to_thread(inspect_delivery, directory, spec)
-    if after['delivery_hash'] != result['delivery_hash']:
-        result['issues'].append('验收期间交付文件发生变化，须重新提交评审')
-    result['approved'] = not result['issues']
+        report('code_review', '文件与语法核对完成，交独立代码审查；宿主运行检查仍待准入')
+        result.update(code_conformance_only=True,
+            resource_admission={'approved': False, 'reason': 'current_delivery_execution_evidence_pending'},
+            host_checks={'status': 'not_run', 'requirement_ids': [c['id'] for c in spec['acceptance_checks']],
+                         'training_authorized': False, 'scientific_approval': False},
+            scope='当前交付的文件、清单与语法核对；独立代码审查待完成。开发者测试摘要保留为原始证据，'
+                  '不代表宿主 CPU/CUDA 检查、资源准入、正式训练或科研验收通过。')
+        return result
+    result['scope']='文件、清单和语法检查；真实实验在独立代码审核后按冻结计划派发。'
     return result
 
 
@@ -419,14 +229,15 @@ def local_codex_view(engine, run_id) -> dict:
     generation = run.get('state', {}).get('implementation_generation')
     generation_filter = " AND json_extract(data,'$.implementation_generation')=?" if generation else ''
     fields = ('id', 'run_id', 'cycle', 'kind', 'status', 'blocked_kind', 'proposal_hash', 'spec_hash',
-        'implementation_generation', 'implementation_indexed_review_protocol', 'current_revision',
+        'implementation_generation', 'implementation_review_strategy','implementation_indexed_review_protocol', 'current_revision',
         'project_root', 'workspace', 'thread_id', 'model', 'reasoning_effort', 'created_at', 'updated_at')
     columns = ','.join(f"'{key}',json_extract(data,'$.{key}')" for key in fields)
     records = progress._project(engine.store, f"""SELECT json_object({columns},
         'reason',substr(json_extract(data,'$.reason'),1,2000)) FROM records
         WHERE collection='codex_workflows' AND json_extract(data,'$.run_id')=?
-            AND json_type(data,'$.implementation_indexed_review_protocol')='integer'
-            AND json_extract(data,'$.implementation_indexed_review_protocol')=1
+            AND (json_extract(data,'$.implementation_review_strategy')='document_code' OR
+                 (json_type(data,'$.implementation_indexed_review_protocol')='integer'
+                 AND json_extract(data,'$.implementation_indexed_review_protocol')=1))
             {generation_filter}
         ORDER BY json_extract(data,'$.cycle') DESC,updated_at DESC,key DESC LIMIT 20""",
         (run_id,generation) if generation else (run_id,))
@@ -434,10 +245,18 @@ def local_codex_view(engine, run_id) -> dict:
     current = dict(records[-1]) if records else None
     checks = []
     if current:
-        rows = progress._specifications(engine.store, current['id'], revision=current.get('current_revision'))
+        from .code_model_migration import projection as worker_model_projection
+        current.update(worker_model_projection(engine.store, run, current))
+        rows = (progress._specifications(engine.store,current['id'],latest=True)
+                if current.get('implementation_review_strategy')=='document_code' else
+                progress._specifications(engine.store,current['id'],revision=current.get('current_revision')))
         # Only the active immutable document is exposed in the default panel.
         current['specifications'] = rows[-1:] if rows else []
         current['document'] = (rows[-1] if rows else {}).get('document')
+        if current.get('implementation_review_strategy')=='document_code':
+            details = progress._cycle_detail(engine.store,run,{'workflow':current})['details']
+            current['document_reviews'] = details['document_audit']['roles']
+            current['code_reviews'] = details['code_delivery']['reviews']
         attempt = progress._attempt(engine.store, current['id'])
         current['attempts'] = []
         if attempt:
@@ -506,4 +325,5 @@ def cleanup_codex_workspaces(engine, run_id) -> None:
     for target, project in targets:
         validate_tree(target, project)
         if target.exists():
-            shutil.rmtree(target)
+            from .delivery_files import io_path
+            shutil.rmtree(io_path(target))

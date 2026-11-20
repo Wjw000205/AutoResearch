@@ -6,9 +6,11 @@ import copy
 from . import dataset_planning as planning
 from .dataset_budgets import SCHEMA as BUDGET
 from .experiment_workflow import sha
+from .experiment_configuration import DATA_READING_GUIDANCE
 from .storage import now
 
-SCHEMA = planning.obj({'dataset': planning.TEXT,
+from .dataset_contract import name_schema
+SCHEMA = planning.obj({'dataset': name_schema(**planning.TEXT),
     'implementation_brief': {'type': 'string', 'minLength': 1, 'maxLength': 6000},
     'protocol': planning.obj({key: planning.TEXT for key in (
         'task', 'input_output', 'split', 'preprocessing', 'evaluation', 'baseline_comparison')}),
@@ -32,7 +34,7 @@ dataset_binding 是当前队列已经指定并取得的数据资产。核对其�
 完整理由、协议和任务单保存，当前回复只含该 schema 的必要字段。'''
 
 
-WRITE += planning.SEED_GUIDANCE
+WRITE += '\n' + DATA_READING_GUIDANCE + planning.SEED_GUIDANCE
 
 
 def resolve(store, saved):
@@ -42,7 +44,7 @@ def resolve(store, saved):
     plan = store.get(planning.COLLECTION, ref['id'])
     if (not plan or plan.get('run_id') != saved['run_id'] or plan.get('status') != 'approved'
             or plan.get('result_sha256') != ref['sha256'] or sha(plan.get('result')) != ref['sha256']
-            or len(plan.get('votes', [])) != 3 or {v['role'] for v in plan['votes']} != {'director','engineer','scout'}
+            or not planning.full_review.members(plan.get('votes',[]))
             or not all(v['approve'] for v in plan['votes']) or ref['request_sha256'] != sha(saved['request'])):
         raise ValueError('Codex task requires a current, independently reviewed agent work order')
     planning.approval(store, plan)
@@ -71,7 +73,7 @@ def repair_assignment(engine, run_id, saved):
     The delivered configuration still goes through the normal independent gate.
     """
     from .dataset_experiments import source_evidence
-    from .dataset_codex import _repair_packet, previous_files
+    from .dataset_codex import _repair_packet, repair_inputs
     previous_id = saved.get('previous_codex_job_id')
     if not saved.get('repair_sequence') or not previous_id:
         return None
@@ -80,14 +82,25 @@ def repair_assignment(engine, run_id, saved):
         raise ValueError('Configuration repair must reference this setup\'s prior delivery')
     evidence = source_evidence(engine, run_id, saved)
     repair = evidence.get('configuration_repair') or {}
-    files = previous_files(job)
+    files, recovery = repair_inputs(engine, run_id, saved, job, repair)
     if not files or not repair.get('kind') or not repair.get('message'):
         return None
-    request, packet = _repair_packet(saved, repair, job)
+    request, packet = _repair_packet(saved, repair, job, previous_sources=files)
+    if recovery:
+        packet['protected_source_recovery'] = recovery
+    protocol = saved.get('project_protocol')
+    if protocol:
+        from .weather_project_protocol import verify
+        reviewed = verify(engine.store, run_id, protocol)
+        if (reviewed['proposal']['setup_id'] != saved['id']
+                or reviewed['proposal']['source_program_sha256'] != saved['source_program_sha256']):
+            raise ValueError('Project protocol belongs to a different setup or architecture')
     return {'kind': 'existing_configuration_repair', 'request_sha256': sha(saved['request']),
+        **({'project_protocol': protocol} if protocol else {}),
         'dataset_binding': bind_current(engine, run_id, saved),
         'previous_job_id': previous_id, 'previous_files_sha256': sha(files),
         'repair_packet_sha256': sha(packet),
+        **({'protected_source_recovery': recovery} if recovery else {}),
         'frozen_budget_plan': request['dataset_configuration'].get('repair', {}).get('frozen_budget_plan'),
         'scientific_approval': False, 'execution_authorized': False,
         'instruction': '直接修复 repair.json 中的具体缺项，复用已交付文件。配置参数由 task.json 和设计字段决定；'
@@ -105,6 +118,14 @@ async def ensure(engine, harness, run_id, saved):
     direct = await asyncio.to_thread(repair_assignment, engine, run_id, saved)
     engine.check_active(run_id)
     if direct:
+        if direct['dataset_binding']['targets'][0]['dataset'] == 'Weather':
+            from .weather_project_protocol import confirm
+            job = engine.store.get('dataset_codex_jobs', direct['previous_job_id'])
+            proof = await confirm(engine, harness, run_id, saved, job)
+            engine.check_active(run_id)
+            if proof:
+                saved['project_protocol'] = proof
+                direct = {**direct, 'project_protocol': proof}
         if saved.get('direct_repair') != direct:
             saved.update(direct_repair=direct, dataset_binding=direct['dataset_binding'],
                 status='repairing_configuration', updated_at=now())
@@ -133,9 +154,11 @@ async def ensure(engine, harness, run_id, saved):
     evidence.update(dataset_binding=binding, dataset_configuration=request['dataset_configuration'],
         requested_targets=targets, method=method, configuration_repair=repair,
         dataset_budget=request.get('dataset_budget'))
+    if request.get('dataset_catalog'):
+        evidence.update(dataset_catalog=copy.deepcopy(request['dataset_catalog']), dataset_request_protocol=2)
     unbounded = (request.get('dataset_budget') or {}).get('status') == 'unlimited'
     schema = copy.deepcopy(SCHEMA)
-    schema['properties']['dataset'] = {'const': targets[0]['dataset']}
+    schema['properties']['dataset'] = name_schema(const=targets[0]['dataset'])
     if unbounded:
         schema['properties']['budget_plan'] = {'type': 'null'}
     if previous_job and previous_job.get('partial_delivery'):
@@ -148,8 +171,55 @@ async def ensure(engine, harness, run_id, saved):
         if frozen and not unbounded and result['budget_plan'] != frozen:
             raise ValueError('Work order must preserve the approved dataset budget')
     from .dataset_order_identity_recovery import author_request
-    plan = await planning._reviewed(engine, harness, run_id, scope=scope, evidence=evidence,
-        author='engineer', instruction=WRITE, schema=schema, checker=check, author_request=author_request)
+    from . import dataset_protocol_evidence as supplemental
+    original_key = run_id + ':dataset-plan:' + sha({'version': 1, 'scope': scope, 'evidence': sha(evidence)})
+    if not engine.store.get(planning.COLLECTION, original_key):
+        note = engine.store.get('literature_notes', targets[0]['note_id'])
+        if note and note.get('note_sha256'):
+            proof = binding['verified_sources'][0]
+            evidence['dataset_binding'] = {**binding, 'literature_lookup': {'note_id': note['id'],
+                'expected_sha256': note['note_sha256'], 'source_note_record_sha256': proof['source_note_sha256'],
+                'scope': 'Use expected_sha256 for literature.protocols; source_note_record_sha256 hashes the whole archived row.'}}
+            original_key = run_id + ':dataset-plan:' + sha({'version': 1, 'scope': scope, 'evidence': sha(evidence)})
+    def prior_gap():
+        prior = engine.store.get(planning.COLLECTION, original_key) or {}
+        if supplemental.needs_evidence(prior.get('issues', [])):
+            return supplemental.retained_order(engine.store, prior)
+        return None
+    retained = prior_gap()
+    if not retained:
+        try:
+            plan = await planning._reviewed(engine, harness, run_id, scope=scope, evidence=evidence,
+                author='engineer', instruction=WRITE, schema=schema, checker=check, author_request=author_request,
+                route_protocol_gaps=True)
+        except planning.ProtocolEvidenceNeeded:
+            retained = prior_gap()
+            if not retained:
+                raise
+    bundle, issues = None, []
+    while retained:
+        prior_bundle = bundle
+        bundle = await supplemental.supplement(engine, harness, run_id, saved, binding, retained,
+                                               issues=issues, prior=prior_bundle)
+        if prior_bundle and (bundle['fields'], bundle['protocols']) == (prior_bundle['fields'], prior_bundle['protocols']):
+            from .engine import ResearchBlocked
+            raise ResearchBlocked('定向补读后证据仍相同，已保留工单及三方意见；待补来源：' + ' '.join(issues)[:700])
+        from .dataset_configuration_queue import current
+        queue = current(engine.store, run_id) or {}
+        transitions = [b['operator_close'] for b in queue.get('batches', []) if b.get('operator_close')
+                       and b['operator_close'].get('next_dataset') == targets[0]['dataset']]
+        enriched = {**evidence, 'protocol_evidence': bundle, 'retained_order_sha256': retained['result_sha256'],
+                    'operator_transition': transitions[-1] if transitions else None}
+        try:
+            plan = await planning._reviewed(engine, harness, run_id, scope=scope, evidence=enriched, retained=retained,
+                author='engineer', instruction=WRITE, schema=schema, checker=check, route_protocol_gaps=True)
+            break
+        except planning.ProtocolEvidenceNeeded as gap:
+            failed = engine.store.get(planning.COLLECTION, gap.plan_id)
+            retained = supplemental.retained_order(engine.store, failed)
+            if not retained:
+                raise
+            issues = failed['issues']
     engine.check_active(run_id)
     saved.update(agent_work_order={'id': plan['id'], 'sha256': plan['result_sha256'],
         'request_sha256': sha(saved['request']), 'author_handoff_id': plan['author_handoff_id']},

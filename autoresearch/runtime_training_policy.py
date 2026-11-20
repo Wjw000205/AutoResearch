@@ -33,9 +33,19 @@ def validate_record(store, run_id, record, program, *, files=True):
             or policy.get('scientific_success') is not False):
         raise ValueError('Runtime training policy does not match this approved release')
     votes = record.get('votes', [])
-    if len(votes) != 3 or {v.get('role') for v in votes} != {'director', 'engineer', 'scout'}:
-        raise ValueError('Runtime training policy needs three independent reviews')
+    from . import independent_full_review as full
+    if not full.members(votes):
+        raise ValueError('Runtime training policy needs its exact independent reviewer set')
     for vote in votes:
+        if full.KEY in vote:
+            frozen = full.authenticate(store, run_id, vote)
+            full.validate_delivery(store, run_id, vote)
+            result = full.answer(vote)
+            if (result.get('policy_sha256') != record['sha256'] or result.get('approve') is not True
+                    or result.get('issues') != [] or result.get('scientific_success') is not False
+                    or frozen['context'].get('runtime_training_policy') != policy):
+                raise ValueError('Runtime policy full review differs from the exact amendment')
+            continue
         result = vote.get('result', {})
         transcript = store.get('transcripts', vote.get('transcript_id', '')) or {}
         if (result.get('policy_sha256') != record['sha256'] or result.get('approve') is not True

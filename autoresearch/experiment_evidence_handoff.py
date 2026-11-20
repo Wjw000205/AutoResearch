@@ -106,6 +106,9 @@ def _file(engine, run_id, trial, relative, *, json_content=False):
         return {**result, 'status': 'unavailable', 'reason': 'Saved artifact cannot be read as requested'}
 
 
+READ_ONLY_SCOPE = {'execution_authorized': False, 'scientific_approval': False}
+
+
 def collect(engine, run_id, evidence, ref, trial_ids=None):
     """Read original validation records only; do not run/import candidate code."""
     from .experiment_decisions import _safe_rows
@@ -126,18 +129,39 @@ def collect(engine, run_id, evidence, ref, trial_ids=None):
             raise ValueError('Artifact request is outside current validation evidence')
         key = run_id + ':' + row['id']
         with engine.store._read_db() as db:
-            saved = db.execute(
-                "SELECT updated_at, CASE WHEN length(json_extract(data,'$.evaluation.details'))<=524288 "
-                "THEN json_extract(data,'$.evaluation.details') END FROM records "
-                "WHERE collection='experiments' AND key=?", (key,)).fetchone()
+            saved = db.execute("""
+                WITH original AS (
+                    SELECT updated_at, json_extract(data,'$.evaluation') AS evaluation
+                    FROM records WHERE collection='experiments' AND key=?
+                ), payloads AS (
+                    SELECT updated_at, json_extract(evaluation,'$.details') AS nested,
+                        CASE WHEN json_extract(evaluation,'$.phase')='validation'
+                                  AND json_extract(evaluation,'$.details') IS NULL
+                             THEN json_remove(evaluation, '$.actual_params', '$.dataset_id', '$.split_fingerprints',
+                                 '$.split_identity_protocol', '$.split_materialization', '$.phase', '$.seed',
+                                 '$.source', '$.identity_consistent', '$.note', '$.details') END AS flat
+                    FROM original
+                )
+                SELECT updated_at, nested IS NULL,
+                    CASE WHEN length(CAST(coalesce(nested,flat) AS BLOB))<=524288
+                         THEN coalesce(nested,flat) END FROM payloads
+                """, (key,)).fetchone()
         current = _projection(engine.store, key, saved[0]) if saved else None
         if not current or _safe_rows([current])[0] != row:
             raise ValueError('Original validation record changed before artifact handoff')
-        details = ({'status': 'available', 'source': 'saved_evaluation.details',
-                    'data': _validation_only(json.loads(saved[1])), 'sha256': hashlib.sha256(saved[1].encode()).hexdigest()}
-                   if saved[1] else {'status': 'unavailable', 'reason': 'Missing or exceeds bounded read limit'})
+        details = {'status': 'unavailable', 'reason': 'Missing or exceeds bounded read limit'}
+        if saved[2]:
+            fields = _validation_only(json.loads(saved[2]))
+            if fields or not saved[1]:
+                source = 'saved_evaluation' if saved[1] else 'saved_evaluation.details'
+                details = {'status': 'available', 'source': source, 'data': fields,
+                           'sha256': hashlib.sha256(saved[2].encode()).hexdigest()}
+                if saved[1]:
+                    details['hash_scope'] = 'saved_diagnostics_before_validation_filter'
         model = _file(engine, run_id, current, 'artifacts/model_provenance.json', json_content=True)
         checkpoint = _file(engine, run_id, current, 'artifacts/best.pt')
+        from .experiment_files import _reports, WEIGHT_SUFFIXES
+        saved_weights = sorted(_reports(engine, run_id, current, WEIGHT_SUFFIXES))
         data = model.get('data') or {}
         detail_data = details.get('data') or {}
         if not isinstance(data, dict) or not isinstance(detail_data, dict):
@@ -160,9 +184,11 @@ def collect(engine, run_id, evidence, ref, trial_ids=None):
             'common_initialization_names': data.get('common_initialization_names'),
             'scope': 'Saved program-reported provenance plus current file-byte hashes. No independent model execution or checkpoint restore proof.',
         }
+        if saved_weights:
+            summary['saved_weight_files'] = [{'path': path, 'bytes': size} for path, size in saved_weights]
+            summary['weight_file_scope'] = 'Names and sizes only. Selection or restoration requires separate execution evidence.'
         trials.append({'summary': summary, 'evaluation_details': details, 'model_provenance': model})
-    material = {'binding': evidence['binding'], 'source_evidence': ref, 'trials': trials,
-                'execution_authorized': False, 'scientific_approval': False}
+    material = {'binding': evidence['binding'], 'source_evidence': ref, 'trials': trials, **READ_ONLY_SCOPE}
     if trial_ids is not None:
         material['artifact_trial_ids'] = sorted(trial_ids)
     return enrich(material, pairs, requested_ids)
@@ -189,8 +215,9 @@ async def prepare(engine, run_id, record, proposal, evidence, ref, checkpoint):
     engineer_reads = next((r for r in prior_reads if r['role'] == 'engineer'), {})
     source_paths = {p for r in prior_reads for p in r.get('source_paths', [])}
     modules = proposal.get('training_response', {}).get('module_paths', [])
+    from .independent_full_review import REVIEWERS
     value = {'version': 1, 'status': 'assigned', 'owner': 'engineer', 'provider': 'host',
-             'reviewers': ['director', 'engineer', 'scout'], 'request': copy.deepcopy(proposal),
+             'reviewers': list(REVIEWERS), 'request': copy.deepcopy(proposal),
              'request_sha256': sha(proposal), 'evidence': supplement,
             'required_paths': (['/parameter_search_audit'] if is_search_audit else
                                ['/yaml_candidate_audit/control','/yaml_candidate_audit/candidate',
@@ -281,7 +308,10 @@ def request(record, context, instruction, schema):
 
 def bound_evidence(engine, run_id, record, proposal):
     """Resolve only this decision's authenticated supplemental namespace."""
-    digest = proposal.get('artifact_evidence_sha256')
+    return archived_evidence(engine, run_id, record, proposal.get('artifact_evidence_sha256'))
+
+
+def archived_evidence(engine, run_id, record, digest):
     if not digest:
         return None
     saved = record.get(KEY) or {}
@@ -309,7 +339,14 @@ def assignment_key(engine, run_id, role, purpose, instruction, context, schema):
     return key
 
 
-def require_reads(engine, run_id, role, purpose, instruction, context, schema):
+class MissingArtifactPages(ValueError):
+    def __init__(self, role, pages):
+        self.pages = pages
+        paths = list(dict.fromkeys(page['path'] for page in pages))
+        super().__init__(f'{role} must read the supplied artifact summaries before deciding: {paths}')
+
+
+def require_reads(engine, run_id, role, purpose, instruction, context, schema, *, prior_handoffs=()):
     """Full summary reads must belong to this role's exact paid assignment."""
     key = assignment_key(engine, run_id, role, purpose, instruction, context, schema)
     saved = context['experiment_decision'][KEY]
@@ -317,13 +354,36 @@ def require_reads(engine, run_id, role, purpose, instruction, context, schema):
     archive = engine.store.get('experiment_evidence', ref['id']) or {}
     if archive.get('run_id') != run_id or sha(archive.get('summary')) != ref['sha256']:
         raise ValueError('Read-only artifact evidence changed')
-    progress = engine.store.get('handoff_progress', key) or {}
+    rows = []
+    continuation = context.get('artifact_review_request', {}).get('page_continuation') or {}
+    from . import independent_full_review as full
+    if full.KEY in context:
+        raw = (engine.store.get('decisions',key) or {}).get('result')
+        vote = full.stamp_vote(role,raw,key,context[full.KEY])
+        allowed = full.reading_handoffs(engine.store,run_id,vote)[1:]
+        if list(prior_handoffs) != allowed:
+            raise ValueError('Full-review artifact continuation has a different authenticated source chain')
+    elif list(prior_handoffs) != continuation.get('source_handoffs', []):
+        raise ValueError('Artifact read continuation has a different source chain')
+    for owner in (*prior_handoffs, key):
+        if owner != key:
+            source = engine.store.get('handoffs', owner) or {}
+            if (source.get('to_role') != role or source.get('run_id') != run_id
+                    or source.get('status') != 'completed'):
+                raise ValueError('Artifact reads cannot be inherited from another role or an unfinished review')
+        progress = engine.store.get('handoff_progress', owner) or {}
+        if progress.get('id', owner) != owner or progress.get('run_id', run_id) != run_id:
+            raise ValueError('Artifact read progress belongs to another handoff')
+        rows.extend(progress.get('tool_results', []))
     coverage = {p: [] for p in saved['required_paths']}
     kinds, sources, receipts = set(), set(), []
     from .experiment_decisions import _pointer
     texts = {p: encoded(_pointer(archive['summary'], p)) for p in coverage}
-    for row in progress.get('tool_results', []):
+    for row in rows:
         call, result = row.get('call') or {}, row.get('result') or {}
+        if (call.get('name') not in {'experiments.analyze', 'experiments.inspect_module', 'experiments.compare'}
+                or not isinstance(result, dict)):
+            continue
         args = call.get('arguments') or {}
         authenticated = result.get('receipt_sha256') == sha({'call': call,
             'result': {k: v for k, v in result.items() if k != 'receipt_sha256'}})
@@ -347,17 +407,13 @@ def require_reads(engine, run_id, role, purpose, instruction, context, schema):
             continue
         coverage[path].append((start, end))
         receipts.append(result['receipt_sha256'])
-    missing = []
-    for path, windows in coverage.items():
-        cursor = 0
-        for start, end in sorted(windows):
-            if start > cursor:
-                break
-            cursor = max(cursor, end)
-        if cursor < len(texts[path]):
-            missing.append(path)
+    from .training_read_dispatch import _gaps
+    missing = [{'path': path, 'offset': offset, 'limit': min(6000, end - offset)}
+               for path, windows in coverage.items()
+               for start, end in _gaps(len(texts[path]), windows)
+               for offset in range(start, end, 6000)]
     if missing:
-        raise ValueError(f'{role} must read the supplied artifact summaries before deciding: {missing}')
+        raise MissingArtifactPages(role, missing)
     resolutions = []
     if role == 'engineer' and purpose.startswith('experiment_decide:'):
         required = saved['author_additional_reads']
@@ -372,13 +428,14 @@ def require_reads(engine, run_id, role, purpose, instruction, context, schema):
             try:
                 files = source_files(engine.store, run_id, context)
                 resolutions = [verified_alias(engine.store, run_id, context,
-                    progress.get('tool_results', []), reference, files=files)
+                    rows, reference, files=files)
                     for reference in sorted(unresolved)]
             except ValueError as exc:
                 raise ValueError('Engineer must complete the assigned comparison/source reads before the next decision: '
                                  + str(exc)) from exc
     return {'role': role, 'handoff_id': key, 'evidence_sha256': ref['sha256'], 'paths': list(coverage),
             'analysis_kinds': sorted(kinds), 'source_paths': sorted(sources), 'receipt_sha256s': sorted(set(receipts)),
+            **({'prior_handoff_ids': list(prior_handoffs)} if prior_handoffs else {}),
             **({'source_reference_resolutions': resolutions} if resolutions else {})}
 
 

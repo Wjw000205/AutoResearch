@@ -33,6 +33,14 @@ const tasks: Record<string, { name: string; summary: string; expected: string; r
 };
 
 export function experimentTaskDescription(purpose: string, role?: string) {
+  if (/^experiment_diagnose:[a-f0-9]{64}:(?:training-read-repair|training-supplement-v1)(?::|$)/.test(purpose)) return {
+    name: '补读本轮训练证据', summary: '核对本角色缺少的训练报告或源码页，并提交读取回执。',
+    expected: '补充观察与对应证据回执',
+  };
+  if (/^experiment_diagnose:[a-f0-9]{64}:optimization-read-1:/.test(purpose)) return {
+    name: '补读优化对照证据', summary: '补齐本角色尚未核对的对照分析或相关源码，供本批次评审使用。',
+    expected: '对照结论与对应证据回执',
+  };
   if (/^experiment_diagnose:[a-f0-9]{64}:artifact-review-1:[a-f0-9]{64}$/.test(purpose)) return {
     name: '独立复核运行产物',
     summary: '复用工程师已读取的产物快照，由三方逐项核对公共初始化、容量及检查点关联，记录一致项、冲突与真实缺口。',

@@ -6,6 +6,9 @@ Initial opinions and their exact reads are never replaced by the effective view.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned
+
+import asyncio
 import copy
 
 from .storage import now
@@ -104,6 +107,13 @@ def _entries(record, role, unit=None):
 def _units(engine, run_id, record):
     from .architecture_documents import units
     from .engine import digest
+    if record.get('io_template_review') == 1:
+        return []  # Each peer reviews the whole template directly in its final handoff.
+    from .architecture_review_budget import KEY, checked
+    if record.get(KEY):
+        policy = checked(record[KEY], record['document'])
+        if record.get('unit_cap') != policy['unit_chars']:
+            raise ValueError('Architecture unit size differs from its frozen reading budget')
     pages = units(engine, run_id, record['document'], cap=record.get('unit_cap'))
     # These two navigation labels were added after existing paid review scopes
     # were frozen. Keep their original identity without altering actual reads;
@@ -153,6 +163,7 @@ def check_entry(engine, run_id, record, role, unit, entry, previous=None):
             or context.get('architecture_review_recovery_protocol') != VERSION
             or context.get('architecture_document') != record['document']
             or context.get('design_hash') != record['design_hash']
+            or context.get('architecture_review_read_budget') != record.get('architecture_review_read_budget')
             or result.get('document_sha256') != record['document']['sha256']
             or context.get('review_unit') != unit
             or assignment.get('input_hash') != digest({k: frozen.get(k) for k in ('instruction', 'context', 'schema')})
@@ -163,6 +174,13 @@ def check_entry(engine, run_id, record, role, unit, entry, previous=None):
             or entry.get('amends_sha256') != (digest(previous) if previous else None)):
         raise ResearchBlocked('架构补证据意见链与原独立意见不一致。')
     if final:
+        if context.get('io_template_review') != record.get('io_template_review'):
+            raise ResearchBlocked('输入输出模板评审与原交接协议不一致。')
+        if record.get('io_template_review') == 1 and previous is None:
+            required = [{'result': {'section_id': s['id'], 'char_start': s['start'], 'char_end': s['end']}}
+                        for s in record['document']['sections']]
+            if not read_coverage(engine, run_id, record['document'], required, hid):
+                raise ResearchBlocked('模板与输入输出组合表尚未完整交付给本角色。')
         if result.get('design_hash') != record['design_hash']:
             raise ResearchBlocked('架构终审设计版本不一致。')
         own = [v for v in effective_source(record)['unit_reviews'] if v['role'] == role]
@@ -236,6 +254,8 @@ def _checked_entries(engine, run_id, record, role, unit=None):
 def gate(engine, run_id, record):
     from .architecture_documents import PEERS
     from .engine import ResearchBlocked
+    from .architecture_review_budget import validate_parent
+    validate_parent(engine, run_id, record)
     expected_units = _units(engine, run_id, record)
     for validation in [*record.get('review_delivery_repairs', []),
                        *([record['review_delivery_validation']] if record.get('review_delivery_validation') else [])]:
@@ -260,7 +280,7 @@ def gate(engine, run_id, record):
 
 
 def _context(engine, run_id, design, record, role):
-    from .execution_contract import constraints
+    from .execution_contract import current_constraints
     from .architecture_convergence import context as progress_context
     documents = [record['document'], record['approved_proposal']]
     context = {}
@@ -276,11 +296,19 @@ def _context(engine, run_id, design, record, role):
         design_hash=record['design_hash'], research_cycle=record['cycle'],
         indexed_documents=list({d['document_id']: d for d in documents}.values()),
         architecture_required_documents=[record['document']['document_id']],
-        execution_constraints=constraints(engine.store.get('runs', run_id)['config']))
+        execution_constraints=current_constraints(engine.store, run_id))
     if design is not None:
         context.update(progress_context(engine, run_id, 'architecture', design, role=role, structured=True))
     from .dataset_transition import review_scope
     context.update(review_scope(engine.store, run_id))
+    from .dataset_contract import from_design
+    request_catalog = from_design(design) if design is not None else None
+    if request_catalog:
+        context.update(dataset_catalog=copy.deepcopy(request_catalog), dataset_request_protocol=2)
+    from .architecture_review_budget import KEY
+    if record.get(KEY):
+        context[KEY] = copy.deepcopy(record[KEY])
+        context['prior_same_version_reviews'] = [copy.deepcopy(v) for v in record.get('inherited_unit_reviews', []) if v['role'] == role]
     return context
 
 
@@ -392,18 +420,38 @@ def _check_repair(engine, run_id, record, role, unit, validation):
     return frozen
 
 
+def _active_handoffs(record):
+    # Old reviews stored just the last active assignment. Keep its exact ID on resume.
+    legacy = record.get('active_review_handoff')
+    return {**({legacy['role']: legacy} if legacy else {}), **record.get('active_review_handoffs', {})}
+
+
+def _set_active(record, active):
+    if record.get('io_template_review') == 1:
+        record['active_review_handoffs'] = {**_active_handoffs(record), active['role']: active}
+    else:
+        record['active_review_handoff'] = active
+
+
+def _role_validation(record, role, scope_id):
+    validations = [*record.get('review_delivery_repairs', []), record.get('review_delivery_validation') or {}]
+    return next((v for v in reversed(validations) if v.get('role') == role and v['scope_id'] == scope_id), {})
+
+
 def _prepare_delivery_repair(engine, h, run_id, record, role, unit, entry, diagnostic):
     from .engine import ResearchBlocked, digest
     assignment, frozen, result = _delivery_integrity(engine, run_id, record, role, unit, entry)
-    prior = record.get('review_delivery_validation') or {}
+    scope_id = unit['id'] if unit else 'final'
+    prior = _role_validation(record, role, scope_id)
     if prior.get('repair_handoff_id') == entry['handoff_id']:
         _check_repair(engine, run_id, record, role, unit, prior)
         prior.update(status='repair_failed', repair_invalid_entry=copy.deepcopy(entry),
                      repair_diagnostic=diagnostic, updated_at=now())
         engine.store.put('architecture_reviews', record['id'], record)
         raise ResearchBlocked('架构交付补正仍未通过同版本核验；原交付和补正均已保留，停止重复提交。')
-    if prior:
-        record.setdefault('review_delivery_repairs', []).append(copy.deepcopy(prior))
+    if record.get('review_delivery_validation'):
+        # A concurrent peer may still be updating its own repair after this one is queued.
+        record.setdefault('review_delivery_repairs', []).append(record['review_delivery_validation'])
     source_id = entry['handoff_id']
     repair_context = {**copy.deepcopy(frozen['context']), 'architecture_review_delivery_repair': {
         'source_handoff_id': source_id, 'source_response_sha256': digest(result),
@@ -415,9 +463,12 @@ def _prepare_delivery_repair(engine, h, run_id, record, role, unit, entry, diagn
         '保留原答复及核验错误。本次仅补正该交付的版本、范围、问题账本或读取缺口，保持同一设计和独立判断。'
         '先按本次范围实际补读所需原文；原答复和历史读取不新增本次阅读信用。'
         '返回完整同协议结果，不得为通过格式核验而取消真实异议或虚构批准。仅有这一次补正交接。')
+    if unit:
+        from .architecture_read_batch import attach_review_ranges, RANGE_GUIDANCE
+        repair_context = attach_review_ranges(repair_context)
+        instruction += RANGE_GUIDANCE
     purpose = assignment['purpose'] + ':delivery-repair-v1'
     hid = h._handoff(run_id, role, purpose, instruction, repair_context, frozen['schema'])['id']
-    scope_id = unit['id'] if unit else 'final'
     validation = {'status': 'repair_pending', 'role': role, 'scope_id': scope_id,
         'source_handoff_id': source_id, 'source_response_sha256': digest(result),
         'source_input_hash': assignment['input_hash'],
@@ -425,8 +476,8 @@ def _prepare_delivery_repair(engine, h, run_id, record, role, unit, entry, diagn
         'invalid_entry': copy.deepcopy(entry), 'diagnostic': diagnostic,
         'repair_handoff_id': hid, 'created_at': now()}
     record['review_delivery_validation'] = validation
-    record['active_review_handoff'] = {'role': role, 'scope_id': scope_id, 'handoff_id': hid,
-        'predecessor_sha256': entry.get('amends_sha256')}
+    _set_active(record, {'role': role, 'scope_id': scope_id, 'handoff_id': hid,
+        'predecessor_sha256': entry.get('amends_sha256')})
     engine.store.put('architecture_reviews', record['id'], record)
     engine.store.event(run_id, 'architecture.review_delivery_repair_prepared',
         '架构独立交付已收到但尚未接收；原意见保留，已安排一次同版本定向补正。',
@@ -442,15 +493,16 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
     previous = entries[-1] if entries else None
     from .architecture_validation import operation
     context = await engine._read_consensus_check(
-        run_id, operation(_context), engine, run_id, design, record, role)
+        run_id, operation(_context), engine, run_id, design, copy.deepcopy(record), role)
     source_recovery = _source_index_recovery(engine, run_id, context, entries) if previous else None
     if previous:
         _remaining_limit(record, entries, source_recovery=source_recovery)
     if source_recovery:
         context['architecture_source_index_recovery'] = source_recovery
     final = unit is None
-    validation = record.get('review_delivery_validation') or {}
-    if validation.get('role') == role and validation.get('scope_id') == ('final' if final else unit['id']):
+    scope_id = 'final' if final else unit['id']
+    validation = _role_validation(record, role, scope_id)
+    if validation:
         _check_repair(engine, run_id, record, role, unit, validation)
         if validation['status'] == 'repair_failed':
             raise ResearchBlocked('架构交付的一次补正已失败；原交付和诊断均已保留，不能重放原缓存。')
@@ -461,11 +513,20 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
             '完整处理 previous_architecture_review.issue_ledger 中本角色的问题，以稳定 ID '
             '逐项保留、闭合或有依据地重开；不能用同义改述生成新问题绕过原裁决。')
         purpose = 'design_document_review:' + record['design_hash'] + ':recovery-v1'
+        if record.get('io_template_review') == 1:
+            context.update(io_template_review=1, document_read_window_protocol=3)
+            instruction = ('请独立审核随本次交接提供的完整架构模板、任务协议及输入输出组合表。'
+                '宿主按模板核对了每行的全部字段。检查各输入输出维度的替换路径、模型适配、预算、数据隔离及验收条件，'
+                '一次给出覆盖整批组合的意见。按需补读决定性证据并处理本角色已有的问题。'
+                '贝叶斯脚本和选参属于后续参数微调阶段。')
+            purpose += ':io-template-v1'
     else:
         context['review_unit'] = unit
+        from .architecture_read_batch import attach_review_ranges, RANGE_GUIDANCE
+        context = attach_review_ranges(context)
         instruction = ('独立评议 review_unit 指定的精确范围，首次必须按 documents.read 读完该范围。'
             '核对批准机制、实现、隔离、比较、验收和资源；跨章节证据按目录定向核对。'
-            'previous_architecture_review 含你本人已保存的历史裁决，保留未受改动影响的条款。')
+            'previous_architecture_review 含你本人已保存的历史裁决，保留未受改动影响的条款。') + RANGE_GUIDANCE
         purpose = 'design_document_section:' + unit['id'] + ':recovery-v1'
     if previous:
         context['previous_architecture_evidence_review'] = previous
@@ -478,12 +539,23 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
             '本次必须逐段实际读取这些恢复的原文，并核对原问题，不得再次只读继承说明。'
             '这只是来源访问修复，不是问题已解决、科学批准或作者修改；仍由你独立判断。')
     instruction += REVIEW + INSTRUCTION
+    from .architecture_review_budget import KEY
+    if context.get(KEY):
+        instruction += ('\n本阶段采用大窗口：宿主在首次模型请求前把本组全部原文分页投递到 tool_results。'
+            '直接阅读已投递正文，按完整批次独立评议，不必为满足格式重复索取同一页。'
+            'prior_same_version_reviews 是本角色原范围的有效历史意见，保留其判断；它们不是新批次批准。'
+            '额外决定性证据仍可按索引补读。阅读分组数不限制纠错、补证或独立科学判断。')
     if final:
         instruction += PROGRESS_REVIEW
     shape = schema(final=final)
-    active = record.get('active_review_handoff', {})
-    scope_id = 'final' if final else unit['id']
-    if active.get('role') == role and active.get('scope_id') == scope_id and active.get('predecessor_sha256') == (digest(previous) if previous else None):
+    active = _active_handoffs(record).get(role, {})
+    from .architecture_review_restart import assignment as restart_assignment
+    restarted = restart_assignment(engine, run_id, record, role, unit)
+    if restarted:
+        purpose, instruction, context, shape = (restarted[k] for k in ('purpose', 'instruction', 'context', 'schema'))
+        hid = h._handoff(run_id, role, purpose, instruction, context, shape)['id']
+        record.pop('prepared_review_restart')
+    elif active.get('role') == role and active.get('scope_id') == scope_id and active.get('predecessor_sha256') == (digest(previous) if previous else None):
         hid = active['handoff_id']
         assignment = engine.store.get('handoffs', hid, {})
         frozen = engine.store.get('handoff_inputs', hid, {})
@@ -499,11 +571,23 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
         instruction, context, shape = comparison.assignment(engine, run_id, role, purpose,
             instruction, context, shape, comparison.REVIEW_GUIDANCE)
         hid = h._handoff(run_id, role, purpose, instruction, context, shape)['id']
-    record['active_review_handoff'] = {'role': role, 'scope_id': scope_id, 'handoff_id': hid,
-                                      'predecessor_sha256': digest(previous) if previous else None}
+    _set_active(record, {'role': role, 'scope_id': scope_id, 'handoff_id': hid,
+                         'predecessor_sha256': digest(previous) if previous else None})
     if validation.get('repair_handoff_id') == hid:
         validation.update(status='repairing', updated_at=now())
     engine.store.put('architecture_reviews', record['id'], record)
+    if context.get(KEY) and unit and not previous and not engine.store.get('handoff_progress', hid):
+        from .architecture_read_batch import review_calls
+        from .document_index import read
+        receipts = []
+        for call in review_calls(context):
+            engine.check_active(run_id)
+            receipts.append({'call': call, 'result': read(engine, run_id, call['arguments'])})
+        h._save_progress(run_id, hid, {'turn': 0, 'seen': {}, 'tool_results': receipts})
+    if context.get('io_template_review') == 1 and not previous and not engine.store.get('handoff_progress', hid):
+        from .architecture_documents import units
+        pages = operation(units)(engine, run_id, record['document'])
+        h._save_progress(run_id, hid, {'turn': 0, 'seen': {}, 'tool_results': [p for group in pages for p in group]})
     result = await h.ask(run_id, role, purpose, instruction, context, shape)
     entry = {**result, 'role': role, 'handoff_id': hid}
     if unit:
@@ -512,7 +596,7 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
         entry['amends_sha256'] = digest(previous)
     try:
         await engine._read_consensus_check(
-            run_id, operation(check_entry), engine, run_id, record, role, unit, entry, previous)
+            run_id, operation(check_entry), engine, run_id, copy.deepcopy(record), role, unit, entry, previous)
     except (ResearchBlocked, ValueError) as exc:
         return _prepare_delivery_repair(engine, h, run_id, record, role, unit, entry, str(exc))
     if validation.get('repair_handoff_id') == hid:
@@ -528,25 +612,47 @@ async def _dispatch(engine, h, run_id, design, record, role, unit, entries):
 
 
 async def advance(engine, h, run_id, design, record):
-    """Exactly one scoped decision or evidence amendment per graph dispatch."""
+    """Dispatch independent whole-template peers together; keep segmented scopes ordered."""
     from .architecture_documents import PEERS, _json
     from .engine import ResearchBlocked
     from .architecture_validation import operation
+    from .architecture_review_budget import validate_parent
+    await engine._read_consensus_check(run_id, operation(validate_parent), engine, run_id, record)
     record.update(status='reviewing')
     expected_units = _units(engine, run_id, record)
     record['unit_count'] = len(expected_units)
     engine.store.put('architecture_reviews', record['id'], record)
+    pending = []
+    scope_change = False
+    parallel = record.get('io_template_review') == 1
+    scope_error = '架构评议要求改变已批准科学范围；原异议保留，不能自动改写批准。'
     for role in PEERS:
         for unit in [*expected_units, None]:
             entries = await engine._read_consensus_check(
                 run_id, operation(_checked_entries), engine, run_id, record, role, unit)
             if entries and entries[-1]['disposition'] == 'scope_change':
-                raise ResearchBlocked('架构评议要求改变已批准科学范围；原异议保留，不能自动改写批准。')
+                if not parallel:
+                    raise ResearchBlocked(scope_error)
+                scope_change = True
+                continue
             if entries and entries[-1]['disposition'] != 'needs_evidence':
                 continue
-            return await _dispatch(engine, h, run_id, design, record, role, unit, entries)
+            if not parallel:
+                return await _dispatch(engine, h, run_id, design, record, role, unit, entries)
+            pending.append((role, entries))
+    if pending:
+        results = await gather_owned(*(_dispatch(engine, h, run_id, design, record, role, None, entries)
+                                         for role, entries in pending), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return record
+    if scope_change:
+        raise ResearchBlocked(scope_error)
     effective = effective_source(record)
     approved = all(v['disposition'] == 'approve' for v in [*effective['unit_reviews'], *effective['reviews']])
+    if approved:
+        await engine._read_consensus_check(run_id, operation(gate), engine, run_id, record)
     record.update(status='approved' if approved else 'rejected', completed_at=now())
     engine.store.put('architecture_reviews', record['id'], record)
     if record.get('architecture_progress_protocol') == 1:
@@ -557,5 +663,4 @@ async def advance(engine, h, run_id, design, record):
                        {'document_sha256': record['document']['sha256'], 'design_hash': record['design_hash'], 'approved': approved})
     if not approved:
         raise ResearchBlocked('统一架构评议未通过，真实修改意见已保存。')
-    gate(engine, run_id, record)
     return record

@@ -75,42 +75,27 @@ def validate_source(engine, run_id, row, packet):
     frozen = engine.store.get('handoff_inputs', source_id, {})
     source = {'handoff_id': source_id, 'role': packet['role'],
         'result': marker.get('original_report'), 'context': frozen.get('context', {})}
+    from .implementation_report_amendments import restore_provenance
+    restore_provenance(source, marker)
     if KEY in source['context']:
         policy.fail('同一次读取窗口故障只能恢复一次。')
     flow.validate_report(engine, run_id, row, source)
-    before, after = source['context'], packet['context']
+    from .implementation_document_review_scope import replay_read_contract
+    expected_context = opt_in(source['context'])
+    expected_context[KEY] = copy.deepcopy(marker)
+    source_handoff = engine.store.get('handoffs', source_id, {})
+    purpose = source_handoff.get('purpose', '') + ':read-window-recovery:' + digest(source_id)[:16]
+    before, after = replay_read_contract(expected_context, packet['context'], engine, run_id,
+        packet=packet, purpose=purpose), packet['context']
     scope, prior = after[policy.CONTEXT], before[policy.CONTEXT]
     expected = diagnostic(engine, source)
     if (expected is None or marker.get('diagnostic') != expected
             or marker.get('source_result_sha256') != digest(source['result'])
             or after.get('document_read_window_protocol') != window.RETAINED_VERSION
-            or any(after.get(k) != before.get(k) for k in ('acceptance_workflow_id', 'acceptance_budget', 'indexed_documents'))
+            or any(after.get(k) != before.get(k) for k in ('acceptance_workflow_id', 'acceptance_budget',
+                'indexed_documents', 'implementation_document_review_scope'))
             or any(scope.get(k) != prior.get(k) for k in prior if k != 'required_sections')
-            or scope.get('required_sections') != {cid: policy.required_sections(row, prior['contract'], [cid])
-                                                  for cid in prior['assigned_criteria']}):
+            or scope.get('required_sections') != (prior['required_sections'] if before.get('implementation_document_review_scope') else {cid: policy.required_sections(row, prior['contract'], [cid]) for cid in prior['assigned_criteria']})):
         policy.fail('读取窗口恢复改变了冻结身份、原结论或验收范围。')
 
 
-async def recover(engine, h, run_id, state, row, packet):
-    from . import implementation_acceptance_flow as flow
-    from .implementation_delivery_correction import validate_or_correct
-    packet = await validate_or_correct(engine, h, run_id, state, row, packet)
-    detail = diagnostic(engine, packet)
-    if detail is None:
-        return packet
-    source = engine.store.get('handoffs', packet['handoff_id'])
-    context = opt_in(packet['context'])
-    scope = context[policy.CONTEXT]
-    scope['required_sections'] = {cid: policy.required_sections(row, scope['contract'], [cid])
-                                  for cid in scope['assigned_criteria']}
-    context[KEY] = {'version': 1, 'source_handoff_id': packet['handoff_id'],
-        'source_result_sha256': digest(packet['result']), 'original_report': copy.deepcopy(packet['result']),
-        'diagnostic': detail, 'attempt': 1, 'attempt_limit': 1, 'scientific_approval': False,
-        'instruction': '原报告因正文从窗口移出而留下 UNKNOWN。本次保持原角色、合同、问题及关闭条件，'
-            '补齐实际阅读后复核原 UNKNOWN；保留已有判断的依据，不扩张无关问题。'
-            '原报告不是本交接的阅读证据；所有引用须本交接实际读取。不得自动把 UNKNOWN 或旧 PASS 改成通过。'}
-    recovered = await flow.ask(engine, h, run_id, state,
-        source['purpose'] + ':read-window-recovery:' + digest(packet['handoff_id'])[:16], packet['role'],
-        policy.GUIDANCE + GUIDANCE + '\n恢复读取窗口造成的未完成核验，返回同一范围的完整独立报告。',
-        context, policy.REPORT_SCHEMA)
-    return await validate_or_correct(engine, h, run_id, state, row, recovered)

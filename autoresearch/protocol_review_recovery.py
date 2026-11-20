@@ -1,4 +1,6 @@
 """Same-version protocol readback, separate from scientific cycle revision."""
+
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
 import asyncio
 import copy
 
@@ -19,24 +21,28 @@ def accepted(vote, context):
 
 
 def checked_votes(engine, record):
+    from . import independent_full_review as full_review
     from .engine import ROLES, ResearchBlocked
     votes = record['votes']
-    if len(votes) != 3 or {v.get('role') for v in votes} != set(ROLES):
+    if not full_review.members(votes):
         raise ResearchBlocked('实验协议补读缺少完整原始三方意见。')
     for vote in votes:
+        if full_review.KEY in vote:
+            full_review.authenticate(engine.store, record['run_id'], vote)
+            full_review.validate_delivery(engine.store, record['run_id'], vote, engine=engine)
         hid = record['handoffs'].get(vote['role'], '')
         decision = engine.store.get('decisions', hid, {})
         handoff = engine.store.get('handoffs', hid, {})
         source = engine.store.get('handoff_inputs', hid, {}).get('context', {})
         if (decision.get('run_id') != record['run_id'] or decision.get('role') != vote['role']
-                or decision.get('result') != {k: v for k, v in vote.items() if k != 'role'}
+                or decision.get('result') != full_review.answer(vote)
                 or handoff.get('status') != 'completed' or handoff.get('to_role') != vote['role']
                 or any(source.get(k) != record[k] for k in ('design_hash', 'proposal_hash', 'revision_hash'))):
             raise ResearchBlocked('实验协议原始意见与实际交付回执不一致。')
     return votes
 
 
-def reject(engine, run_id, purpose, instruction, context, votes, handoffs):
+def reject(engine, run_id, purpose, instruction, context, votes, handoffs, *, request_revision=False):
     """Persist dissent without claiming a failed experiment or changing design."""
     from .engine import ResearchBlocked
     identity = key(run_id, context['revision_hash'])
@@ -53,6 +59,12 @@ def reject(engine, run_id, purpose, instruction, context, votes, handoffs):
         record['history'].append({k: copy.deepcopy(previous[k]) for k in
             ('votes', 'handoffs', 'context', 'purpose', 'instruction')})
     checked_votes(engine, record)
+    if request_revision:
+        record['status'] = 'revision_requested'
+        engine.store.put(COLLECTION, identity, record)
+        engine.store.event(run_id, 'experiment.protocol_revision_requested',
+            '协议修改意见已保存，交回实验工程师修订。', {'protocol_review_id': identity})
+        return record
     engine.store.put(COLLECTION, identity, record)
     position = engine.store.get('graph_status', run_id, {})
     engine.store.put('graph_status', run_id, {**position, 'id': run_id, 'run_id': run_id,
@@ -117,12 +129,15 @@ def activate(engine, run_id, *, expected_failure_hash=None):
     if record.get('recovery_round', 0) >= 1:
         raise ResearchBlocked('同版本协议补读已用尽；保留未决意见，停止重复评议。')
     design = engine.outputs(run_id)['design']
-    from .experiment_plan import build_plan
-    plan = build_plan(design, run['config']['max_trials'])
-    rh = digest({'plan': plan, 'acceptance': design['acceptance'],
-        'iteration_policy': design['iteration_policy'],
-        'task_primary_threshold': run['config'].get('min_relative_improvement', .01)})
-    if digest(design) != record['design_hash'] or rh != record['revision_hash']:
+    from .experiment_plan import build_for_engine
+    from .performance_policy import classify
+    from .protocol_amendments import revision_hash
+    plan = build_for_engine(engine, run_id, design, run['config']['max_trials'])
+    metric = plan.get('matrix_acceptance', {}).get('metric', design['primary_metric'])
+    versions = [design['acceptance'], classify(design['acceptance'], metric)]
+    hashes = {revision_hash(plan, a, design['iteration_policy'], run['config'].get('min_relative_improvement', .01))
+              for a in versions}
+    if digest(design) != record['design_hash'] or record['revision_hash'] not in hashes:
         raise ResearchBlocked('协议或架构已变更；补读不能沿用旧版批准。')
     record.update(status='reading', recovery_round=1, activated_at=now())
     writes = [(COLLECTION, record['id'], record)]
@@ -154,6 +169,23 @@ def activate(engine, run_id, *, expected_failure_hash=None):
 
 
 async def review(engine, h, run_id, purpose, instruction, context, schema):
+    from . import independent_full_review as full_review
+    # Complete historical groups remain authentic history. Unfinished groups
+    # are not turned into two approvals: both reviewers inspect a fresh common
+    # full-material request, with every original objection retained as input.
+    recovery = engine.store.get(COLLECTION, key(run_id, context['revision_hash']))
+    if recovery:
+        context = copy.deepcopy(context)
+        context['prior_protocol_votes'] = copy.deepcopy(recovery['votes'])
+        instruction += '\n保留的旧审核意见是待独立处置的问题，逐项核验并给出当前位置与修改要求；不得继承其批准。'
+    votes = await full_review.group(h, run_id, purpose, instruction, context, schema)
+    if full_review.reviewers(votes) == full_review.REVIEWERS:
+        return votes, {v['role']: v[full_review.KEY]['handoff_id'] for v in votes}
+    from .engine import Harness
+    return votes, {v['role']: Harness.decision_key(run_id, v['role'], purpose, instruction, context, schema) for v in votes}
+
+
+async def _legacy_review(engine, h, run_id, purpose, instruction, context, schema):
     from .engine import Harness, ROLES, ResearchBlocked
     recovery = engine.store.get(COLLECTION, key(run_id, context['revision_hash']))
     retained, handoffs = {}, {}
@@ -187,6 +219,11 @@ async def review(engine, h, run_id, purpose, instruction, context, schema):
     from . import comparison_task_policy as comparison
     assignments = {role: comparison.assignment(engine, run_id, role, purpose,
         instruction, context, schema, comparison.REVIEW_GUIDANCE) for role in roles}
+    if context.get('protocol_amendment_parent'):
+        from .protocol_amendments import seed
+        for role, (task, ctx, shape) in assignments.items():
+            hid = h._handoff(run_id, role, purpose, task, ctx, shape)['id']
+            await seed(engine, h, run_id, hid, ctx)
     if engine.store.get('runs', run_id)['mode'] == 'live' and hasattr(h.intelligence, 'preflight_batch'):
         pending = [role for role in roles if not engine.store.get('decisions',
             Harness.decision_key(run_id, role, purpose, *assignments[role]))]
@@ -200,11 +237,11 @@ async def review(engine, h, run_id, purpose, instruction, context, schema):
             await engine._read_consensus_check(run_id, h.intelligence.preflight_batch, run_id, requests)
     tasks = [asyncio.create_task(h.ask(run_id, role, purpose, *assignments[role])) for role in roles]
     try:
-        raw = await asyncio.gather(*tasks)
+        raw = await gather_owned(*tasks)
     except BaseException:
         for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            cancel_owned(task)
+        await gather_owned(*tasks, return_exceptions=True)
         raise
     for role, vote in zip(roles, raw):
         retained[role] = {'role': role, **vote}

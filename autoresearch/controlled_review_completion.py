@@ -1,6 +1,7 @@
 """One same-reviewer supplement; original paid inputs and decisions stay immutable."""
 import copy
 from .experiment_workflow import sha
+from . import independent_full_review as full
 
 SUPPLEMENT = '''补齐你本人本次受控诊断评审漏读的证据，然后独立重新确认或拒绝。
 rapid_revision.source_completion 中保留你本人原答复及真实读取索引；这些索引不是新阅读或宿主批准。
@@ -12,12 +13,12 @@ rapid_revision.source_completion 中保留你本人原答复及真实读取索�
 def _owned(engine, record, vote, context, purpose, instruction):
     from .engine import Harness
     from .rapid_experiment_revision import VOTE
-    key=Harness.decision_key(record['run_id'],vote['role'],purpose,instruction,context,VOTE)
+    key=full.decision_key(engine,record['run_id'],vote,purpose,instruction,context,VOTE)
     owner=engine.store.get('handoffs',key) or {}
     frozen=engine.store.get('handoff_inputs',key) or {}
     saved=(engine.store.get('decisions',key) or {}).get('result')
     if (owner.get('run_id')!=record['run_id'] or owner.get('to_role')!=vote['role']
-            or frozen.get('context')!=context or saved!={k:v for k,v in vote.items() if k!='role'}):
+            or full.source_context(frozen.get('context',{}))!=full.source_context(context) or saved!=full.answer(vote)):
         raise ValueError('Controlled review owner, frozen input or original decision changed')
     return key
 
@@ -26,7 +27,13 @@ def _authentic(engine, record, context, key, refs):
     from .experiment_analysis import inspect_module
     from .experiment_tools import compare
     rows=[]
-    for row in (engine.store.get('handoff_progress',key) or {}).get('tool_results',[]):
+    frozen=(engine.store.get('handoff_inputs',key) or {}).get('context',{})
+    ids=[key]
+    if full.KEY in frozen:
+        raw=(engine.store.get('decisions',key) or {}).get('result')
+        ids=full.reading_handoffs(engine.store,record['run_id'],full.stamp_vote(
+            engine.store.get('handoffs',key)['to_role'],raw,key,frozen[full.KEY]))
+    for row in [r for own in ids for r in engine.store.get('handoff_progress',own,{}).get('tool_results',[])]:
         call,value=row.get('call',{}),row.get('result',{})
         if value.get('receipt_sha256') not in refs:continue
         body={k:v for k,v in value.items() if k!='receipt_sha256'}
@@ -56,11 +63,11 @@ def validate(engine, record, vote, context):
     from .controlled_training_checks import REVIEW
     context=record.get('review_contexts',{}).get(vote['role'],context)
     purpose=record.get('review_purpose') or 'rapid_review:controlled:'+record['candidate']['amendment_sha256']
-    supplement=record.get('source_completions',{}).get(vote['role'])
+    supplement=None if full.KEY in vote else record.get('source_completions',{}).get(vote['role'])
     original=supplement['original_vote'] if supplement else vote
     key=_owned(engine,record,original,context,purpose,record.get('review_instruction') or REVIEW)
     rows=_authentic(engine,record,context,key,original['read_receipts'])
-    if record.get('prior_review'):
+    if record.get('prior_review') and full.KEY not in vote:
         from .causal_review_repair import inherited_rows
         rows += [r for r in inherited_rows(engine,record,vote['role'])
                  if r['result']['receipt_sha256'] in original['read_receipts']]
@@ -87,10 +94,28 @@ def validate(engine, record, vote, context):
 async def complete(engine,harness,record,context,save):
     from .engine import ResearchBlocked
     from .rapid_experiment_revision import VOTE
+    from .controlled_training_checks import REVIEW
     proofs=[]
     base_context=context
     for index,vote in enumerate(record['votes']):
         context=record.get('review_contexts',{}).get(vote['role'],base_context)
+        if full.KEY in vote:
+            def check(current):
+                proof,_=validate(engine,record,current,context)
+                if not proof['complete']:
+                    error=ValueError('补齐完整候选源码及controlled_admission后独立重新判断。')
+                    error.missing_read_targets=proof['missing_ranges']
+                    error.covered_chars=full.read_progress(engine.store,record['run_id'],current,
+                        {'experiments.inspect_module','experiments.compare'})
+                    raise error
+                return proof
+            current=await full.ask(harness,record['run_id'],vote['role'],
+                record.get('review_purpose') or 'rapid_review:controlled:'+record['candidate']['amendment_sha256'],
+                record.get('review_instruction') or REVIEW,
+                context,VOTE,binding=vote[full.KEY]['policy'],validator=check)
+            all_votes=copy.deepcopy(record['votes']);all_votes[index]=current;save(votes=all_votes)
+            proofs.append(check(current))
+            continue
         assignment=record.get('source_completions',{}).get(vote['role'])
         # Resume an interrupted supplement through Harness' immutable decision cache.
         if not assignment:

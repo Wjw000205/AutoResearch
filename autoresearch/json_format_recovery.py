@@ -319,8 +319,8 @@ def repair_evidence_background_kind(text: str, schema: dict, metadata: dict) -> 
     the evidence compiler must still validate every source anchor.
     """
     from jsonschema import Draft202012Validator
-    from .context_reduction import SCHEMA, LEGACY_SCHEMA
-    if (schema not in (SCHEMA, LEGACY_SCHEMA) or not completed_output(metadata)
+    from .context_reduction import SCHEMA, LENGTH_BOUND_SCHEMA, LEGACY_SCHEMA
+    if (schema not in (SCHEMA, LENGTH_BOUND_SCHEMA, LEGACY_SCHEMA) or not completed_output(metadata)
             or not isinstance(text, str) or len(text) > 128_000):
         return None
     try:

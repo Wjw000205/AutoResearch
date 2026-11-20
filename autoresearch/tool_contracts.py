@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, validators
 from jsonschema.exceptions import best_match
+from .supplemental_reads import schema as supplemental_read_schema
+from .code_reading_memory import code_notes_schema
 
 
 VERSION = 1
@@ -205,11 +207,18 @@ def _catalog():
     media = {**page_binding, 'page': _integer(1), 'crop': _CROP}
     paper = _paper()
     schemas = {
+        'materials.request_read': supplemental_read_schema(),
         'hardware.inspect': _object(),
         'resources.assess': _object({'plan': _resource_plan()}, ['plan']),
         'memory.search': _object({'query': _text(minimum=0), 'limit': _nullable(_integer(1))}, ['query']),
         'experiments.history': _object({'scope': {'enum': ['all', 'current']}, 'cycle': _nullable(_integer(1))}),
         'experiments.status': _object({'offset': _integer(0), 'limit': _integer(1, 25), 'expected_sha256': _HASH}),
+        'experiments.files': {**_object({'area': {'enum': ['source', 'yaml', 'validation', 'host']},
+            'query': _text(200, minimum=0), 'path': _text(500), 'expected_sha256': _HASH,
+            'offset': _integer(0), 'limit': _integer(1, 6000)}),
+            'allOf': [{'if': {'required': ['path']}, 'then': {'required': ['area'],
+                'properties': {'area': {'enum': ['host', 'validation']}}, 'not': {'required': ['query']}},
+                'else': {'properties': {'limit': _integer(1, 30)}, 'not': {'required': ['expected_sha256']}}}]},
         'experiments.cleanup': _object({'action': {'enum': ['preview', 'delete']},
             'trial_id': _text(120), 'preview_id': _ID, 'expected_sha256': _HASH,
             'file_ids': _array(_HASH, 1, 20, unique=True)}, ['action', 'trial_id']),
@@ -230,6 +239,8 @@ def _catalog():
             'snapshot': {'enum': ['current', 'candidate']},
             'path': _text(2048), 'view': {'enum': ['symbols', 'source']}, 'query': _text(200, minimum=0),
             'offset': _integer(0), 'limit': _integer(1, 6000)}, ['evidence_id', 'expected_sha256']),
+        'bayes.write_script': _object({'selection_script': _text(12000)}, ['selection_script']),
+        'bayes.start_search': _object({'script_id': _ID, 'plan_id': _ID}, ['script_id', 'plan_id']),
         'hyperparameters.read': {**_object({'revision_id': _ID, 'expected_sha256': _HASH,
             'base_unit_id': _ID, 'validation_seed': _integer(0), 'offset': _integer(0), 'limit': _integer(1, 6000)}),
             'oneOf': [{'required': ['revision_id', 'expected_sha256'], 'not': {'required': ['base_unit_id']}},
@@ -248,8 +259,7 @@ def _catalog():
         'documents.recall': _object({**document_binding, 'section_id': _ID, 'query': _text(200, minimum=0),
             'offset': _integer(0), 'limit': _integer(1, 4)}, document_binding),
         'code.read': _paged({'id': _ID, 'expected_sha256': _HASH}, ['id', 'expected_sha256'], maximum=6000),
-        'code.record_notes': _object({'notes': _array(_object({'key': _text(160), 'statement': _text(1200),
-            'receipt_sha256s': _array(_LOWER_HASH, 1, 20, unique=True)}, ['key', 'statement', 'receipt_sha256s']), 1, 6)}, ['notes']),
+        'code.record_notes': code_notes_schema(),
         'code.validate': _object({'code': _text(minimum=0)}, ['code']),
         'python.run': _object({'trial_name': _text(120, nonblank=True),
             'plan_sha256': _LOWER_HASH, 'code_sha256': _LOWER_HASH},
@@ -278,6 +288,7 @@ def _catalog():
             'section': {'type': 'string', 'pattern': r'^(analysis|source|curation_source:.+)$'}},
             ['version_id'], continuation_hash='expected_sha256'),
         'sources.list': _object(),
+        'sources.identity': _object(page_binding, page_binding),
         'datasets.discover': _object({'paper_id': _ID, 'offset': _integer(0), 'limit': _integer(1, 20)}),
         'datasets.inspect': _object({'asset_id': _ID, 'expected_sha256': _LOWER_HASH,
                                     'offset': _integer(0), 'limit': _integer(1, 20)}),
@@ -404,6 +415,8 @@ def _compact_schema(schema, name):
 
 _SCHEMAS = {name: _compact_schema(schema, name) for name, schema in _catalog().items()}
 TOOL_NAMES = frozenset({*_SCHEMAS, 'implementation.write_document',
+                        'reviews.read_material',
+                        'reviews.record_notes',
                         'implementation.edit_document', 'implementation.locate_document',
                         'implementation.record_self_check', 'architecture.draw_diagrams'})
 
@@ -422,11 +435,40 @@ def argument_schema(name, context=None):
     return relax(_argument_schema(name,context))
 
 
+def inventory_schema(name):
+    """Read-only registry documentation; never an execution parameter adapter."""
+    if name == 'reviews.read_material':
+        from .independent_full_review import PAGE_LIMIT
+        return {**_object({'policy_sha256': _LOWER_HASH, 'material_sha256': _LOWER_HASH,
+            'material_id': _ID, 'offset': _integer(0), 'limit': _integer(1, PAGE_LIMIT)},
+            ['policy_sha256', 'material_sha256', 'offset', 'limit']),
+            'x-autoresearch-runtime-binding-required': True,
+            'description': 'Navigation only. Dispatch requires the exact frozen role/material contract and allowed IDs.'}
+    return argument_schema(name)
+
+
 def _argument_schema(name, context=None):
     """Return an isolated schema; never mutate an approved input contract."""
     if name not in TOOL_NAMES:
         raise ToolArgumentsError(name, code='unknown_tool')
     context = context if isinstance(context, dict) else {}
+    if name == 'reviews.read_material':
+        from .independent_full_review import tool_schema
+        return tool_schema(context)
+    if name == 'reviews.record_notes':
+        from .full_review_notes import schema
+        return schema(context)
+    if name == 'code.record_notes':
+        from .code_reading_memory import code_notes_schema
+        return code_notes_schema()
+    from .implementation_document_review_scope import wire_enabled, read_schema
+    if wire_enabled(context) and name == 'documents.read':
+        return read_schema(context)
+    from . import code_review_catalog
+    if (context.get(code_review_catalog.PROTOCOL) == code_review_catalog.VERSION
+            and (name in code_review_catalog.READ_TOOLS
+                 or name == 'documents.list' and 'code_review_assignment' in context)):
+        return code_review_catalog.read_schema(name,copy.deepcopy(_SCHEMAS[name]))
     if name == 'python.run' and context.get('training_context_protocol') == 1:
         from .python_training import arguments
         result = copy.deepcopy(_SCHEMAS[name])
@@ -555,7 +597,22 @@ def _error_path(error):
 
 
 def validate_arguments(name, args, context=None):
-    """Validate before dispatch; object ownership/receipt gates remain handlers."""
+    """Validate before dispatch; ownership gates remain in handlers."""
+    from .implementation_document_review_scope import wire_enabled, permitted_read
+    if wire_enabled(context or {}):
+        from .supplemental_reads import TOOL, enabled
+        if name == TOOL and enabled(context):
+            if not StrictToolValidator(argument_schema(name, context)).is_valid(args):
+                raise ToolArgumentsError(name)
+            validate_value_semantics(name, args)
+            return
+        if name != 'documents.read' or not permitted_read(context, args):
+            raise ToolArgumentsError(name, code='scoped_read_outside_assignment')
+        # The frozen range predicate checks exact identities, strict integer
+        # types, optional defaults and every admitted key without rebuilding
+        # a document-sized JSON schema for each historical receipt.
+        validate_value_semantics(name, args)
+        return
     schema = argument_schema(name, context)
     Draft202012Validator.check_schema(schema)
     error = best_match(_StrictValidator(schema).iter_errors(args))

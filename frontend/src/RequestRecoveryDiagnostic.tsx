@@ -49,13 +49,18 @@ const noveltyEvidenceGates = [
 // Translate only this known harness state and its two server projection prefixes.
 // Public transcripts and unrecognized provider errors must retain their original text.
 const projectionPrefixes = ['', '处理阻塞后从当前检查点继续：', '处理失败原因后恢复当前检查点：'];
-export function jsonContractDiagnostic(message: string): { kind: 'working_note_hash' | 'schema' | 'syntax'; title: string; description: string } | null {
+export function jsonContractDiagnostic(message: string): { kind: 'working_note_hash' | 'review_binding' | 'schema' | 'syntax'; title: string; description: string } | null {
   let diagnostic = message;
   for (const prefix of projectionPrefixes.filter(Boolean)) {
     if (diagnostic.startsWith(prefix)) { diagnostic = diagnostic.slice(prefix.length); break; }
   }
   const finalPrefix = 'Final-only completion did not finish: ';
   if (diagnostic.startsWith(finalPrefix)) diagnostic = diagnostic.slice(finalPrefix.length);
+  const reviewHash = /^Provider JSON failed schema validation at \$\.alignment_binding\.(design_hash|experiment_plan_hash|architecture_document_sha256): must satisfy pattern$/.exec(diagnostic);
+  if (reviewHash) {
+    const document = reviewHash[1] === 'experiment_plan_hash' ? '实验计划' : reviewHash[1] === 'design_hash' ? '研究设计' : '架构文档';
+    return { kind: 'review_binding', title: `评审引用的${document}哈希格式有误`, description: `评审已返回。宿主核对该角色实际收到的${document}版本。能确认只多抄或漏抄一位时，会自动补正并继续核验原评审意见。` };
+  }
   if (/^Provider JSON failed schema validation at \$\.working_notes\[\d+\]\.anchors\[\d+\]\.expected_sha256: must satisfy pattern$/.test(diagnostic)) {
     return { kind: 'working_note_hash', title: '阅读笔记引用格式待核对', description: 'JSON 已解析，但阅读笔记引用的文档哈希不符合 64 位格式。恢复时，系统核对已保存的真实读取回执，只有唯一可验证的引用才自动修复；原答复和笔记内容保留。无法匹配时仍暂停。' };
   }

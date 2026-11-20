@@ -114,6 +114,11 @@ def trial_limit(store, run_id, default):
 def budget(store, run_id):
     queue = current(store, run_id)
     if not queue:
+        from .experiment_attempt_policy import current as attempt_policy
+        policy = attempt_policy(store, run_id)
+        if policy:
+            return {'status':'unlimited', 'scope':'all_task_datasets', 'mode':policy['body']['mode'],
+                    'attempt_limit':None, 'policy_id':policy['id'], 'completion_rule':policy['body']['completion_rule']}
         return None
     active = batch(store, run_id)
     if not active:
@@ -239,7 +244,7 @@ def context_view(store, run_id):
         'budget': budget(store, run_id)}
 
 
-def advance(engine, run_id):
+def advance(engine, run_id, *, operator_close=None):
     """Called by the worker after its graph finishes, under the lifecycle lock."""
     from . import record_archive
     from .dataset_experiments import current as setup
@@ -248,17 +253,43 @@ def advance(engine, run_id):
     queue = current(engine.store, run_id)
     if not queue or queue['status'] != 'active':
         return False
-    engine.check_active(run_id)
     run = engine.store.get('runs', run_id)
     active = queue['batches'][-1]
+    expected_queue = copy.deepcopy(queue)
+    if operator_close is None:
+        engine.check_active(run_id)
+    else:
+        remaining = queue['body']['targets'][len(queue['batches']):]
+        if (run['status'] != 'paused' or not remaining or not operator_close.get('instruction', '').strip()
+                or operator_close.get('dataset') != active['dataset']
+                or operator_close.get('next_dataset') != remaining[0]['dataset']):
+            raise ValueError('Operator transition requires a paused task and the exact current and next datasets')
     if active['cycle'] != engine.cycle(run_id):
         raise ResearchBlocked('本数据集发生了方法版本修订；剩余数据配置保留，需先对齐新方法版本。')
     report = engine.store.get('steps', run_id + ':report') or {}
     saved = setup(engine, run_id) or {}
-    if report.get('status') != 'completed' or report.get('cycle', 1) != active['cycle'] or saved.get('status') != 'ready':
+    if saved.get('status') != 'ready' or (operator_close is None and
+            (report.get('status') != 'completed' or report.get('cycle', 1) != active['cycle'])):
         raise ResearchBlocked('本数据集尚无完整的流程结束记录，不能切换下一份配置。')
-    from .dataset_optimization import require_stable
-    require_stable(engine, run_id)
+    from . import dataset_optimization as optimization
+    frozen_id = run_id + ':frozen-architecture'
+    extra_puts = []
+    expected = [(COLLECTION, queue['id'], expected_queue), ('runs', run_id, run)]
+    if operator_close is None:
+        optimization.require_stable(engine, run_id)
+    elif not engine.store.get(optimization.COLLECTION, frozen_id):
+        from .experiment_decisions import _binding
+        basis, binding = _binding(engine, run_id)
+        certificate = optimization.certificate(engine.store, run_id, binding, 'accept_architecture')
+        if not certificate:
+            raise ResearchBlocked('当前架构缺少独立批准，不能作为后续数据集的冻结架构。')
+        body = {'binding': binding, 'certificate_id': certificate['id'], 'core_contract_version': 2,
+                'certificate_kind': 'accept_architecture', 'scientific_approval': False,
+                'operator_close': copy.deepcopy(operator_close),
+                'core_files': optimization.core_files(basis['bundle'], basis['program'], include_configs=True)}
+        extra_puts.append((optimization.COLLECTION, frozen_id, {'id': frozen_id, 'run_id': run_id,
+                           'body': body, 'sha256': sha(body), 'created_at': now()}))
+        expected.append((optimization.COLLECTION, frozen_id, None))
     program = engine.store.get('programs', run_id)
     source_release = None
     if len(queue['batches']) < len(queue['body']['targets']) and program != saved['program']:
@@ -284,6 +315,10 @@ def advance(engine, run_id):
     review = engine.store.get('steps', run_id + ':validation_review') or {}
     stopped = review.get('output', {}).get('decision') == 'stop'
     active['outcome'] = 'stopped' if stopped else 'reviewed'
+    if operator_close is not None:
+        active.update(status='deferred_by_operator', outcome='unresolved', scientific_approval=False,
+                      operator_close=copy.deepcopy(operator_close))
+        active['closed_at'] = active.pop('completed_at')
     pending = queue['body']['targets'][len(queue['batches']):]
     if not pending:
         queue.update(status='finished', updated_at=now())
@@ -314,12 +349,12 @@ def advance(engine, run_id):
             following['graph_thread_id'] = following['setup_id']
             following['previous_setup_id'] = deferred['setup_id']
     queue['batches'].append(following)
-    engine.store.batch([(COLLECTION, queue['id'], queue), ('programs', run_id, program),
+    engine.store.batch([*extra_puts, (COLLECTION, queue['id'], queue), ('programs', run_id, program),
         ('runs', run_id, {**run, 'stage': 'tuning', 'progress': min(run.get('progress', 0), 70),
             'state': {**run['state'], 'research_cycle': cycle}, 'updated_at': now()}),
         ('graph_status', run_id, {'id': run_id, 'run_id': run_id, 'cycle': cycle,
-            'node': 'tuning', 'status': 'running', 'updated_at': now()})],
-        [(c, k) for c, k in keys if c != 'programs'])
+            'node': 'tuning', 'status': 'waiting' if operator_close else 'running', 'updated_at': now()})],
+        [(c, k) for c, k in keys if c != 'programs'], expected=expected)
     engine.store.event(run_id, 'experiment.next_configuration', '本份实验已归档，继续配置下一个数据集。',
         {'queue_id': queue['id'], 'dataset': pending[0]['dataset'], 'cycle': cycle})
     return True

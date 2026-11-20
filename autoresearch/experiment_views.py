@@ -33,6 +33,7 @@ def _projection(store, key, updated):
         for name in ('artifact_path', 'error', 'provenance', 'code_revision', 'code_sha256', 'fingerprint', 'experiment_plan_sha256', 'superseded_reason'):
             fields[name] = _bounded(name, 4096)
         fields['bundle_sha256'] = _bounded('limits.code_bundle.sha256', 128)
+        fields['fit_monitor_protocol'] = "json_extract(data,'$.limits.fit_monitor_protocol')"
         fields['metrics'] = _bounded('metrics')
         fields['metrics_complete'] = "length(json_extract(data,'$.metrics'))<=32768"
         fields['evaluation_errors'] = _bounded('evaluation_errors', 4096)
@@ -43,7 +44,7 @@ def _projection(store, key, updated):
         params = "json_remove(json_extract(data,'$.params'),'$.comparison_inputs')"
         fields['params'] = f"CASE WHEN length({params})<=65536 THEN {params} ELSE NULL END"
         fields['transport_payload_omitted'] = "json_type(data,'$.params.comparison_inputs') IS NOT NULL"
-        identity = ('dataset_id', 'split_fingerprints', 'phase', 'split_identity_protocol', 'split_materialization', 'tuning_budget')
+        identity = ('dataset_id', 'split_fingerprints', 'phase', 'split_identity_protocol', 'split_materialization', 'tuning_budget', 'validation_origins_sha256')
         fields['evaluation'] = 'json_object(' + ','.join("'" + name + "'," + _bounded('evaluation.' + name, 4096) for name in identity) + ')'
         fields['has_split_identity_protocol'] = "json_type(data,'$.evaluation.split_identity_protocol') IS NOT NULL"
         fields['time_limits'] = "json_object('wall_seconds',json_extract(data,'$.limits.timeout_seconds'),'cpu_seconds',json_extract(data,'$.limits.cpu_seconds'),'policy',json_extract(data,'$.limits.runtime_training_policy.mode'))"
@@ -53,6 +54,8 @@ def _projection(store, key, updated):
         if row is None:
             return None  # A newer saved result will appear on the next read.
         value = json.loads(row[0])
+        if value.get('fit_monitor_protocol') is None:
+            value.pop('fit_monitor_protocol')
         protocol_present = value.pop('has_split_identity_protocol')
         value['evaluation'] = {k: v for k, v in value['evaluation'].items()
                                if v is not None or k == 'split_identity_protocol' and protocol_present}
@@ -78,14 +81,15 @@ def trials(store, run_id):
     return values, len(heads) > MAX_TRIALS
 
 
-def view(engine, run_id):
+def view(engine, run_id, *, tuning_detail=False):
     # Trial heads, cycle, plan and policy must belong to one saved revision,
     # including when an operator changes the research cycle during a read.
     with engine.store.read_snapshot() as store:
-        return _view(store, run_id)
+        return _view(store, run_id, tuning_detail=tuning_detail)
 
 
-def _view(store, run_id):
+def _view(store, run_id, *, tuning_detail=False):
+    from .dataset_tuning_view import view as dataset_tuning_view
     from .evaluation import evaluate_trials, unconfigured_evaluation
     from .experiment_summary import build
     from .run_views import _one, _field
@@ -129,6 +133,7 @@ def _view(store, run_id):
     grid = grid_view(store, run_id, current_values, plan=plan,
                      truncated=truncated or any(not r['params_complete'] for r in values))
     return {'projection': 'view', 'section': 'experiments', 'loaded_sections': ['experiments'],
+            **({'tuning_datasets': dataset_tuning_view(store, run_id, values, truncated)} if tuning_detail else {}),
             'parameter_grid': grid,
             'revision': token, 'experiments': values, 'evaluation': evaluation,
             'experiments_truncated': truncated, 'experiment_summary': summary}
@@ -269,7 +274,8 @@ def console(engine, run_id, trial_id=None):
                   notices=[e for e in (state_error, log_error, observation_error) if e])
     from .training_convergence import analyze
     from .training_adjustment import records
-    result['convergence'] = analyze(log, phase=trial['params'].get('phase'), **monitor)
+    result['convergence'] = analyze(log, phase=trial['params'].get('phase'),
+                                    paired_stages=trial.get('fit_monitor_protocol') == 1, **monitor)
     saved = records(engine.store, run_id, trial_id=trial['id'])
     result['loss_discussion'] = saved[0] if saved else None
     from .training_review_recovery import view as loss_review_view

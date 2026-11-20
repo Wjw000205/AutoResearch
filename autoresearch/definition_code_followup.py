@@ -51,7 +51,7 @@ def attach(engine, run_id, state, specification, attempt, context):
         'repair_id':state[definitions.FIELD]['id'],'spec_hash':specification['spec_hash'],
         'document_sha256':specification['document']['sha256'],
         'snapshot_sha256':attempt['snapshot']['files_hash'],
-        'definition_addition':definitions.addition_ref(engine,run_id,state,specification),
+        **definitions.addition_context(engine,run_id,state,specification),
         'timing_authorization':definitions.timing_authorization(engine,state),
         'changed_paths':sorted(p for p in before.keys() | after.keys() if before.get(p)!=after.get(p)),
         'full_acceptance_ids':[r['id'] for r in specification['spec']['acceptance_checks']],

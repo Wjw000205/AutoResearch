@@ -8,7 +8,7 @@ SPECIFICATION_FAILURE_KINDS = frozenset({
 })
 CODE_FAILURE_KINDS = frozenset({'codex_code_no_progress', 'codex_delivery_rejected',
     'codex_protocol_conflict', 'codex_execution_evidence_invalid', 'codex_repair_unverified',
-    'codex_definition_required', 'codex_verification_pending'})
+    'codex_definition_required', 'codex_verification_pending', 'codex_review_replay_incompatible'})
 IMPLEMENTATION_FAILURE_KINDS = SPECIFICATION_FAILURE_KINDS | CODE_FAILURE_KINDS
 
 
@@ -46,6 +46,25 @@ class ImplementationDeliveryCorrection(ImplementationCodeBlocked):
     def __init__(self, message, *, diagnostic, **details):
         super().__init__('代码交付需要修正：' + message, kind='codex_repair_unverified',
                          details={'diagnostic': diagnostic, **details})
+
+
+class ImplementationReviewReplayBlocked(ImplementationCodeBlocked):
+    """A historical host contract needs attention, not a new code edit."""
+
+    def __init__(self, message, *, diagnostic, **details):
+        super().__init__('历史评审回放待核实：' + message,
+                         kind='codex_review_replay_incompatible',
+                         details={'diagnostic': diagnostic, 'recovery_target': 'harness_contract', **details})
+
+
+class ImplementationAmendmentReadRequired(ImplementationCodeBlocked):
+    """A saved opinion cited a known file whose body was not supplied yet."""
+
+    def __init__(self, paths):
+        self.paths = sorted(set(paths))
+        super().__init__('代码修改依据待核实：意见纠正引用的代码尚未提供正文，须由原作者补读确认。',
+            kind='codex_repair_unverified', details={'diagnostic': 'amendment_code_read_required',
+                                                   'paths': self.paths})
 
 
 def block(engine, run_id, failure, step):

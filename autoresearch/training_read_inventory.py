@@ -43,8 +43,18 @@ def project(context, rows):
     summaries = []
     for trial, pages in reports.items():
         pages = pages[:32]
+        index = context.get('tuning_point_reads') or {}
+        if trial in index.get('complete', {}).get('training', []):
+            summaries.append({'trial_id': trial, 'pages': pages, 'missing_ranges': [],
+                              'delivered_complete': True, 'origin': 'verified_same_role_prior_point'})
+            continue
         totals = {p['total_chars'] for p in pages}
         missing = _gaps(next(iter(totals)), [(p['offset'], p['end']) for p in pages]) if len(totals) == 1 else None
+        inherited = next((p for p in index.get('partial', []) if p['kind'] == 'training' and p['key'] == trial), None)
+        if inherited:
+            old_gaps = inherited['missing_ranges']
+            missing = old_gaps if missing is None else [[max(a,c), min(b,d)] for a,b in old_gaps
+                                                        for c,d in missing if max(a,c) < min(b,d)]
         summaries.append({'trial_id': trial, 'pages': pages, 'missing_ranges': missing,
                           'delivered_complete': bool(pages) and missing == []})
     return {'version': 1, 'evidence_sha256': ref.get('sha256'), 'training_reports': summaries,

@@ -200,7 +200,7 @@ def _inherited_scope(engine, h, run_id, source_id, context, progress, state, bin
             previous = [definitions.validate_previous(engine, run_id, state, context, binding['revision'])]
         elif acceptance.enabled(context) and acceptance.enabled(state):
             from .implementation_acceptance_flow import validate_repair_previous
-            previous = [validate_repair_previous(engine, run_id, state, binding['revision'])]
+            previous = [validate_repair_previous(engine, run_id, state, binding['revision'], author_context=context)]
         else:
             from . import implementation_indexed_replies as replies
             replies.validate_previous(engine, run_id, state, binding['revision'])
@@ -310,6 +310,11 @@ def _successor(engine, h, run_id, state, source_id):
     if note_view:
         next_context['predecessor_document_notes'] = note_view
     task = TASK
+    from .implementation_acceptance import enabled as acceptance_enabled
+    if acceptance_enabled(next_context):
+        from .implementation_protocol_contracts import author_task
+        task = ('\n保存续接：复用前驱真实读取和笔记；只补齐当前任务允许的保存与证据核对。'
+                + author_task(next_context))
     from .implementation_acceptance_author import tool_limit as acceptance_author_limit, GUIDANCE as COMPLETION_GUIDANCE
     acceptance_limit = acceptance_author_limit(next_context)
     if acceptance_limit is not None:
@@ -323,7 +328,8 @@ def _successor(engine, h, run_id, state, source_id):
             f"本次最多 {revision['save_tool_turn_budget']} 轮保存/检查，逐项完成冻结修改清单")
         task = task.replace('最终仅提交工具实际回传的 submission',
             '最终提交工具实际回传的 submission 身份、全部 issue_responses 和 revision_completion')
-    next_instruction = inputs['instruction'] + task
+    from .implementation_protocol_contracts import successor_instruction
+    next_instruction = successor_instruction(inputs['instruction'], next_context) + task
     from . import implementation_definition_repair as definitions
     if next_context.get(definitions.PROTOCOL) == 1:
         next_context = definitions.author_capacity(next_context, state)
@@ -377,27 +383,3 @@ def validate_call(engine, run_id, key, context, call, *, request_context=None):
         raise ValueError('实现文档保存阶段只能写文档和检查自己实际保存的当前草稿，不能重复读取原输入。')
 
 
-async def ask(engine, h, run_id, state, purpose, instruction, context):
-    """Return the actual submitting handoff, including one save successor."""
-    from .implementation_document_readability import new_assignment
-    schema = author.submission_schema(context)
-    instruction, context = new_assignment(h, run_id, purpose, instruction, context, schema)
-    original = h._handoff(run_id, 'engineer', purpose, instruction, context, schema)
-    source_id = original['id']
-    if not engine.store.get('stage_contexts', source_id + ':save-predecessor:v1'):
-        progress = engine.store.get('handoff_progress', source_id, {})
-        if _source(h, run_id, source_id, progress) is None:
-            try:
-                result = await h.ask(run_id, 'engineer', purpose, instruction, context, schema)
-                return result, source_id
-            except SaveRequired:
-                pass
-    child, inputs = await engine._read_consensus_check(run_id, _successor, engine, h, run_id, state, source_id)
-    engine.check_active(run_id)
-    # A completed successor is replayed from its frozen decision without model
-    # dispatch. Its historical provider need not match today's research model.
-    # Unfinished saves still require the original author/model identity.
-    if not engine.store.get('decisions', child['id']):
-        validate_identity(h, inputs['context'])
-    result = await h.ask(run_id, 'engineer', child['purpose'], inputs['instruction'], inputs['context'], inputs['schema'])
-    return result, child['id']

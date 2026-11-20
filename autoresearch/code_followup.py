@@ -21,14 +21,13 @@ host_verification 是宿主本轮真实有界检查回执，包含执行范围�
 
 
 def enabled(engine, run_id, state):
-    policy = verification.policy(engine, run_id)
-    return bool(policy and policy['workflow_id'] == state['id'])
+    return bool(verification.policy(engine, run_id, workflow_id=state['id']))
 
 
 def evidence(receipt, attempt):
     keys = ('id','sha256','status','passed','identity','allowance_seconds','duration_seconds',
             'inherited_seconds','shared_allowance_seconds','exit_code','command',
-            'stdout_tail','stderr_tail','error','artifacts')
+            'stdout_tail','stderr_tail','error','artifacts','error_phase','error_traceback','input_staging')
     value = {k:copy.deepcopy(receipt[k]) for k in keys if k in receipt}
     # Source hashes occur once in identity; the original reports remain sealed
     # artifacts. Do not repeat every file hash inside each report in context.
@@ -55,11 +54,16 @@ def validate_evidence(engine, run_id, attempt, value):
         repair.fail('宿主测试复审的冻结执行证据发生变化。')
 
 
-def record_definitions(engine, run_id, state, source):
+def record_definitions(engine, run_id, state, source, *, issue_ids=None):
     requests = []
     for issue in source['issues']:
-        if issue['binding']['disposition'] not in {'needs_definition','spec_conflict'}:
+        if issue_ids is not None and issue['issue_id'] not in issue_ids:
             continue
+        if (issue.get('binding') or {}).get('disposition') not in {'needs_definition','spec_conflict'}:
+            continue
+        from .host_constraint_reconciliation import owns as host_owns
+        if host_owns(issue):
+            continue  # Actual host policy/ledger facts cannot be authored into a SPEC.
         binding = issue['binding']
         value = {'run_id':run_id,'workflow_id':state['id'],'source_sha256':repair.sha(source),
             'implementation_document':source['implementation_document'],'issue':copy.deepcopy(issue),
@@ -74,53 +78,3 @@ def record_definitions(engine, run_id, state, source):
     return requests
 
 
-async def prepare(engine,h,run_id,state,specification,attempt,source,save):
-    """Skip the extra mapping round when independent issue bindings exist."""
-    if any(not i.get('binding') for i in source['issues']):
-        return await repair._legacy_proposal(engine,h,run_id,state,specification,attempt,source,save)
-    if all(i['binding']['disposition']=='repair_code' for i in source['issues']):
-        return source,clarification.mapping(source),None
-    cached=attempt.get('verification_followup')
-    from . import definition_code_followup, definition_execution_followup
-    if (definition_code_followup.applicable(state,specification)
-            and attempt.get('acceptance',{}).get('definition_checks_deferred')
-            and not any(i['binding']['disposition'] in {'repair_code','needs_definition','spec_conflict'} for i in source['issues'])):
-        resolved,proposal,cached=await definition_execution_followup.prepare(
-            engine,h,run_id,state,specification,attempt,source,save)
-    elif cached and cached.get('status')=='completed':
-        resolved=await engine._read_consensus_check(run_id,clarification.verify,
-            engine,run_id,state,specification,attempt,source,cached)
-        proposal=clarification.mapping(resolved)
-    elif (attempt.get('acceptance',{}).get('bounded_checks_only')
-            or attempt.get('acceptance',{}).get('definition_checks_deferred')):
-        # These votes already consumed the same real test receipt. Do not ask
-        # the same three reviewers a second time before routing their findings.
-        resolved,proposal,cached=source,clarification.mapping(source),None
-    else:
-        attempt['execution_progress']={'step':'bounded_checks','label':'宿主执行原有界测试，保留已完成阶段；不启动训练',
-                                       'started_at':now(),'updated_at':now()}
-        save(status='acceptance',blocked_kind=None,reason=None)
-        receipt=await verification.run(engine,run_id,attempt['snapshot']['workspace'],cancel=engine.cancellations.get(run_id))
-        engine.check_active(run_id)
-        resolved,proposal,cached=await clarification.clarify(engine,h,run_id,state,specification,attempt,
-            source,clarification.mapping(source),save,host_verification=evidence(receipt,attempt),record_key='verification_followup')
-    definitions=record_definitions(engine,run_id,state,resolved)
-    attempt['definition_request_ids']=definitions
-    if definitions:
-        from .implementation_definition_repair import begin
-        from .implementation_failures import ImplementationSpecificationPending
-        begin(engine,run_id,state,specification,attempt,resolved,definitions,save)
-        raise ImplementationSpecificationPending()
-    if resolved['issues'] and not any(i['binding']['disposition']=='repair_code' for i in resolved['issues']):
-        from .implementation_failures import ImplementationCodeBlocked
-        kind='codex_definition_required' if definitions else 'codex_verification_pending'
-        message=('实现文档缺少必要定义：已保存对应条款与原审查问题，等待定向补定义和独立审核。' if definitions else
-                 '宿主有界测试已有真实回执；仍有原用例未完成，等待按剩余额度安排，未重复训练或重写代码。')
-        attempt['execution_progress']={'step':'definition_required' if definitions else 'verification_pending',
-            'label':message,'started_at':now(),'updated_at':now()}
-        save(status='blocked',blocked_kind=kind,reason=message)
-        raise ImplementationCodeBlocked(message,kind=kind,details={'workflow_id':state['id'],
-            'attempt':attempt['index'],'definition_request_ids':definitions,
-            'host_verification_receipt_id':(cached or {}).get('host_verification',
-                attempt.get('acceptance',{}).get('host_verification',{})).get('id')})
-    return resolved,proposal,cached

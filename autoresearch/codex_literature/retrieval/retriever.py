@@ -6,6 +6,7 @@ from . import semantic_scholar, crossref, openalex, arxiv, pubmed, europe_pmc
 from .dedup import deduplicate
 from .ranking import rank_papers
 from ..models import normalize
+from ...async_ownership import gather as gather_owned
 
 ADAPTERS = {m.__name__.rsplit('.', 1)[-1]: m for m in
             (semantic_scholar, crossref, openalex, arxiv, pubmed, europe_pmc)}
@@ -33,7 +34,7 @@ class LiteratureRetriever:
             names.extend(['pubmed', 'europe_pmc'])
         if any(n not in ADAPTERS for n in names):
             raise ValueError('Unknown scholarly source')
-        batches = await asyncio.gather(*(ADAPTERS[s].search(self.service._fetch, query, limit, **options)
+        batches = await gather_owned(*(ADAPTERS[s].search(self.service._fetch, query, limit, **options)
                                         for s in names), return_exceptions=True)
         return names, batches
 
@@ -49,7 +50,7 @@ class LiteratureRetriever:
         if not backwards and not forwards:
             raise ValueError('Select at least one citation direction')
         relations = [r for enabled, r in ((backwards, 'references'), (forwards, 'citations')) if enabled]
-        batches = await asyncio.gather(*(semantic_scholar.neighbors(self.service._fetch, paper, r, limit)
+        batches = await gather_owned(*(semantic_scholar.neighbors(self.service._fetch, paper, r, limit)
                                         for r in relations), return_exceptions=True)
         errors = [safe_error(r, b) for r, b in zip(relations, batches) if isinstance(b, Exception)]
         records = deduplicate([p for batch in batches if isinstance(batch, list) for p in batch])
@@ -57,7 +58,7 @@ class LiteratureRetriever:
         # identifier/title/author verification before acquiring a full text.
         verified = []
         for start in range(0, len(records), 6):
-            verified.extend(await asyncio.gather(*(self.service.verify(p) for p in records[start:start + 6])))
+            verified.extend(await gather_owned(*(self.service.verify(p) for p in records[start:start + 6])))
         return {'papers': verified, 'seed_paper_id': paper['id'], 'errors': errors,
                 'directions': relations, 'limit_per_direction': limit,
                 'exhaustive': False, 'provenance': 'live_citation_metadata', 'full_text_read_count': 0}

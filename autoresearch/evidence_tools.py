@@ -108,6 +108,36 @@ class SourceEvidenceService:
             'next_offset': end if end < len(links) else None, 'untrusted': True,
             'primary_source_reading': False, 'scope': 'Retained navigation only; targets have not been read or verified.'}
 
+    def identity(self, run_id, source_id, *, expected_sha256):
+        """Retrieve existing identity records for an Agent to assess, not approve."""
+        from .paper_bindings import valid_binding, readings_for
+        from .paper_identity import canonical, digest
+        document = self.document(run_id, source_id)
+        if document['text_sha256'] != expected_sha256:
+            raise ValueError('Source identity lookup requires the exact retained text version')
+        physical = document.get('source_alias_id', source_id)
+        bound = valid_binding(self.store, run_id, physical)
+        links = []
+        paper = {}
+        if bound:
+            identity = self.store.get('paper_identities', canonical(self.store, bound['canonical_paper_id']), {})
+            paper = {k:v for k,v in identity.get('paper',{}).items() if k in
+                ('id','title','authors','doi','arxiv_id','year','verified','verification')}
+            for link, reading in readings_for(self.store, run_id, bound['paper_id']):
+                if (reading.get('text_sha256') != document['text_sha256']
+                        or reading.get('content_sha256') != document['content_sha256']):
+                    continue
+                value = {k:reading[k] for k in ('paper_id','source_id','identity_verified','document_identity_verified',
+                    'alternate_version','alternate_identifier','identity_match_basis','version_warning','url') if k in reading}
+                value.update(record_id=link['id'], reading_sha256=digest(reading))
+                if value not in links: links.append(value)
+        return {'source_id':source_id, 'source_alias_id':physical,'text_sha256':document['text_sha256'],
+            'content_sha256':document.get('content_sha256'),'original_artifact_id':document.get('original_artifact_id'),
+            'url':document.get('url'),'paper':paper,'stored_identity_links':links,
+            'provenance':'retained_source_and_existing_identity_records', 'new_source_reading':False,
+            'scientific_approval':False,'publication_preprint_equivalence_verified':False,
+            'scope':'Retrieved records only. The requesting Agent must check the configuration citation, archived PDF version and identity linkage; metadata does not establish publication equivalence or scientific acceptance.'}
+
     def document(self, run_id: str, source_id: str) -> dict:
         """Scoped, hash-checked retained text and pages for local memory indexing."""
         self._require_run(run_id)

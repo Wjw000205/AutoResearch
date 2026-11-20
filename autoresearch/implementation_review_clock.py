@@ -107,11 +107,13 @@ def usage(db, run_id, record, at):
             'as_of': at}
 
 
-def charge(store, run_id, policy, *, consume=False, at=None):
+def charge(store, run_id, policy, *, consume=False, at=None, operation_id=None):
     at = at or now()
     with store._db() as db:
         db.execute('BEGIN IMMEDIATE')
         store._guard_run(db, run_id)
+        admission = run_id + ':' + operation_id if consume and operation_id else None
+        admitted = bool(admission and _get(db, 'implementation_review_admissions', admission))
         record = _get(db, COLLECTION, run_id)
         if record is None:
             run = _get(db, 'runs', run_id, {})
@@ -139,10 +141,13 @@ def charge(store, run_id, policy, *, consume=False, at=None):
         exhausted = []
         if record['max_seconds'] is not None and elapsed >= record['max_seconds']:
             exhausted.append('项目级审核时间预算耗尽')
-        if record['max_calls'] is not None and record['calls'] >= record['max_calls']:
+        if record['max_calls'] is not None and record['calls'] - int(admitted) >= record['max_calls']:
             exhausted.append('项目级审核调用预算耗尽')
-        if consume and not exhausted:
+        if consume and not exhausted and not admitted:
             record['calls'] += 1
+            if admission:
+                _put(store, db, 'implementation_review_admissions', admission,
+                     {'id':admission,'run_id':run_id,'operation_id':operation_id}, at)
         _put(store, db, COLLECTION, run_id, record, at)
     return exhausted
 

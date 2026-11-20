@@ -22,12 +22,14 @@ GUIDANCE = ('\n逐条自检必须落地：每核对一批条件，立即用 impl
     'blocked 无新依据时不重复搜索或登记，先处理 remaining 中其他条件。'
     '依赖按冻结验收合同及引用章节保守绑定；变化时 invalidated 要重新核对。'
     '继承结论保留原始证据版本，不伪造当前版本阅读。最终 acceptance_completion 逐条复制仍有效结论，'
-    '并给齐累计 patch_reports；没有 incomplete/未登记项时立即最终报告，真实 blocked 必须保留，'
+    '并给齐累计 patch_reports；没有 incomplete/未登记项时检查提交前置条件，真实 blocked 必须保留，'
     '不能通过改成 complete 绕过来源缺口。自检全部 complete 后才进入独立审核。')
 GUIDANCE += ('\n每累计8次成功读取而没有保存新的自检记录，下一请求先登记本批结论（可如实为 incomplete/blocked），'
     '或保存已完成修改；登记之前暂不继续扩展阅读。失败或相同调用重放不重置此计数。')
 from .implementation_condition_roles import GUIDANCE as ROLE_GUIDANCE
 GUIDANCE += ROLE_GUIDANCE
+GUIDANCE += ('\ncheckpoint_ready 仅表示条件已登记；ready_to_report 还要求本交接同版成功保存和实际报告证据交付。'
+    '继承检查点不提供这些回执。缺少时继续本交接保存、读取和登记；最终报告仍须通过累计范围和完整提交校验。')
 
 
 def schema():
@@ -177,12 +179,78 @@ def project(engine, run_id, hid, context, row):
           and r.get('result',{}).get('saved') is True]])
     reads = sum(r.get('call',{}).get('name')=='documents.read' and 'text' in r.get('result',{})
                 for r in ledger[boundary:])
+    checkpoint_ready = bool(checks) and not remaining
+    prerequisites = _submission_prerequisites(engine, run_id, hid, context, row, author_checks, valid)
     return {'version':1, 'document_id':row['document']['document_id'], 'spec_hash':row['spec_hash'],
         'valid':checks, 'invalidated':invalid, 'remaining':remaining,
         'reads_since_checkpoint':reads,'checkpoint_due':reads>=8,
         'counts':dict(Counter(c['status'] for c in author_checks)), 'review_pending':review,
-        'ready_to_report':bool(checks) and not remaining,
+        'checkpoint_ready':checkpoint_ready, 'submission_prerequisites':prerequisites,
+        'ready_to_report':checkpoint_ready and all(prerequisites.values()),
+        'submission_validation_required':True,
         'scientific_approval':False, 'reading_credit':False}
+
+
+def _submission_prerequisites(engine, run_id, hid, context, row, checks, candidates):
+    """Readiness hints, never an alternative to _prepare_submission.
+
+    Even frozen continuations get this disposable projection. No inherited
+    evidence is reattributed, and no final-only transition can mint a save.
+    """
+    from .implementation_authoring import COLLECTION as DRAFT, TOOL, _checked, pointer
+    from .implementation_acceptance_flow import validate_refs
+    from .implementation_revision_batch import status
+    draft = engine.store.get(DRAFT, hid)
+    ledger = engine.store.get('handoff_progress', hid, {}).get('tool_results', [])
+    saved = False
+    if draft:
+        _checked(engine, run_id, draft)
+        saved = pointer(draft) == pointer({'row': row}) and any(
+            r.get('call', {}).get('name') == draft.get('write_tool', TOOL)
+            and (r['call'].get('arguments') == draft['write_arguments'] if 'write_arguments' in draft
+                 else r['call'].get('arguments', {}).get('specification') == row['spec']
+                 and r['call']['arguments'].get('expected_sha256') == draft.get('previous_sha256'))
+            and r.get('result', {}).get('saved') is True
+            and r['result'].get('submission') == pointer(draft)
+            for r in ledger)
+    progress = status(engine, hid, context, draft)
+    # Self-checks retain their original version and author. They may survive an
+    # unrelated edit; requiring their citations to be current-SHA readings here
+    # would contradict validate()/reusable() and force needless checkpoint work.
+    checkpoint_evidence = True
+    for check in checks:
+        if check['status'] != 'complete':
+            continue
+        try:
+            if not reusable(engine, run_id, hid, context, row, check['issue_id'],
+                    {k:v for k,v in check.items() if k != 'issue_id'}, candidates=candidates):
+                checkpoint_evidence = False
+        except (ValueError, RuntimeError):
+            checkpoint_evidence = False
+    # A report needs its own actual current-document delivery, independently of
+    # inherited checks. This is only a prerequisite: the final report's complete
+    # ranges and cumulative claims are still checked by _prepare_submission.
+    delivered = False
+    doc = row['document']
+    reading = {**context, 'indexed_documents':[*context['indexed_documents'], doc]}
+    for receipt in ledger:
+        call, result = receipt.get('call', {}), receipt.get('result', {})
+        if (call.get('name') != 'documents.read' or not isinstance(result, dict)
+                or result.get('document_id') != doc['document_id']
+                or result.get('sha256') != doc['sha256'] or not result.get('text')):
+            continue
+        ref = {'document_id':doc['document_id'], 'document_sha256':doc['sha256'],
+            'section_id':result['section_id'], 'offset':result['offset'], 'limit':len(result['text'])}
+        try:
+            validate_refs(engine, run_id, hid, reading, [ref], current=doc,
+                          field='submission_readiness.evidence')
+        except (ValueError, RuntimeError):
+            continue
+        delivered = True
+        break
+    return {'own_current_save':bool(saved), 'own_current_evidence':delivered,
+            'checkpoint_evidence_valid':checkpoint_evidence,
+            'saved_work_complete':not progress.get('failed_units') and not progress.get('missing_conditions')}
 
 
 @operation

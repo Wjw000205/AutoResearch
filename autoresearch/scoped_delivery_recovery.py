@@ -65,10 +65,11 @@ def prepare(engine, run_id, revision_id, *, host_fix_sha256, instruction):
     job = record.get('codex_work_item') or {}
     work = current(job)
     receipt = work.get('checkpoint') or {}
-    config = run['config']
+    from .code_model_migration import job_profile
+    selected = job_profile(engine, run_id, job, work=work)
     if (receipt.get('status') != 'completed' or not _bound(receipt, run_id, work,
             Path(job['workspace']), engine.run_dir(run_id).resolve(),
-            config.get('codex_model') or None, config.get('codex_reasoning_effort') or None)):
+            selected['model'] or None, selected['effort'] or None)):
         raise ValueError('Original native delivery needs a bound completed receipt')
     order_raw = source.read_file(job['workspace'], 'work_order.json')
     order = json.loads(order_raw)

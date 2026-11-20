@@ -64,18 +64,22 @@ def prepare_delivery_invocation():
         if path.is_symlink() or path.is_junction():
             raise ValueError('Linked invocation receipt')
         originals[name] = path.read_bytes()
-        if (snapshot / name).exists() or (snapshot / name).is_symlink():
-            raise ValueError('Candidate occupied a host invocation receipt')
     params = json.loads(originals['params.json'])
     environment = json.loads(originals['environment.json'])
     digest = hashlib.sha256(json.dumps(params, sort_keys=True, ensure_ascii=False,
                                        allow_nan=False).encode('utf-8')).hexdigest()
     if (params.get('phase') != 'code_check' or environment.get('params_sha256') != digest
             or environment.get('code_sha256') != hashlib.sha256((root / 'experiment.py').read_bytes()).hexdigest()
-            or environment.get('check_workspace_layout') != CHECK_WORKSPACE_LAYOUT):
+            or environment.get('check_workspace_layout') not in (CHECK_WORKSPACE_LAYOUT, 'rapid-v2')):
         raise ValueError('Invocation receipts do not bind this check launcher')
     for name, raw in originals.items():
-        with (snapshot / name).open('xb') as stream:
-            stream.write(raw)
-        if (snapshot / name).read_bytes() != raw:
+        target = snapshot / name
+        if target.is_symlink() or target.is_junction():
+            raise ValueError('Linked diagnostic receipt')
+        if environment['check_workspace_layout'] == CHECK_WORKSPACE_LAYOUT:
+            if target.exists():
+                raise ValueError('Candidate occupied a host invocation receipt')
+            with target.open('xb') as stream:
+                stream.write(raw)
+        if target.read_bytes() != raw:
             raise ValueError('Invocation receipt copy changed')

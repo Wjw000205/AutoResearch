@@ -17,7 +17,8 @@ def audit(engine, run_id, role, repair, answer):
     hid = authenticate(engine, run_id, role, repair['purpose'], payload, answer)
     rows = retained_rows(engine, run_id, role, context) + _valid_rows(engine, hid,
         context['evidence_sha256'], run_id=run_id, context=context)
-    pages = missing_pages(engine, run_id, context, rows)
+    from .tuning_point_reads import items_for
+    pages = missing_pages(engine, run_id, context, rows, items_for(engine, run_id, context, role))
     if not pages:
         return None
     return {'version': 1, 'source_handoff_id': hid, 'source_answer_sha256': sha(answer),

@@ -15,6 +15,10 @@ class CodexLiterature:
         return await self.retriever.search(query, top_k=top_k, year_from=year_from, **options)
 
     async def prepare(self, run_id, harness, *, question, queries, context):
+        from ..literature_discovery import enabled, selection_metadata, order, POLICY
+        if enabled(self.engine.store.get('runs', run_id).get('config', {})):
+            context = {**context, 'literature_discovery_policy': POLICY}
+        discovery = enabled(context)
         from .codex.query_planner import plan, compile_queries
         from .codex.screening import screen
         expanded = await plan(self.engine, harness, run_id, question, queries, context)
@@ -27,7 +31,7 @@ class CodexLiterature:
         neighbors, reports = [], []
         for pid in selection['seed_ids']:
             reusable = False
-            if seeds[pid].get('rag_version_id'):
+            if not discovery and seeds[pid].get('rag_version_id'):
                 try:
                     reusable = self.engine.paper_rag.load(seeds[pid]['rag_version_id']).get('provenance') == 'validated_live_analysis'
                 except (OSError, ValueError, KeyError, TypeError):
@@ -52,6 +56,10 @@ class CodexLiterature:
             planned_queries, mode='recent' if literature_rounds.phase(self.engine.store.get('runs', run_id)) == 'idea' else 'relevance')
         from ..literature_survey import compact_paper
         papers = [compact_paper(p) for p in papers]
+        if discovery:
+            papers = [selection_metadata(p) for p in papers]
+            if literature_rounds.phase(self.engine.store.get('runs', run_id)) == 'idea':
+                papers = order(papers)
         result = {**survey, 'papers': papers, 'query_expansion': {**expanded, 'compiled_queries': planned_queries}, 'screening': selection,
             'citation_expansion': reports, 'coverage': {**survey['coverage'],
                 'broad_distinct_count': survey['coverage']['distinct_count'],
@@ -81,7 +89,11 @@ class CodexLiterature:
         if not isinstance(papers, list) or not 1 <= len(papers) <= 120:
             raise ValueError('Analyze requires 1..120 paper records')
         self.engine.check_active(run_id)
-        instruction = (task + '\n从提供论文中选择5–15篇制定reading_plan，数量不足则只选现有相关论文；优先遵循preferred_deep_read，'
+        from ..literature_discovery import enabled, selection_metadata, GUIDANCE, POLICY
+        if enabled(self.engine.store.get('runs', run_id).get('config', {})):
+            context = {**(context or {}), 'literature_discovery_policy': POLICY}
+        discovery = enabled(context)
+        instruction = (task + GUIDANCE) if discovery else (task + '\n从提供论文中选择5–15篇制定reading_plan，数量不足则只选现有相关论文；优先遵循preferred_deep_read，'
             '仍须满足当前任务核心阅读门禁。先literature.rag_search检索本地共享库，'
             'shared_rag_indexes中的合格历史分析先literature.rag_read查看并评判当前相关性；'
             '可以复用已导入的有效笔记，缺少或存疑的材料才papers.download获取全文，'
@@ -127,10 +139,12 @@ class CodexLiterature:
                 trusted = await self.engine.literature.verify(paper)
             if trusted.get('verified') is not True:
                 raise ValueError('Analyze requires identifier-verified papers')
+            if discovery:
+                trusted = selection_metadata(trusted)
             key = f'{run_id}:{trusted["id"]}'
             self.engine.store.mutate('run_evidence', key, lambda old, p=trusted, k=key:
                 {**(old or {}), 'id': k, 'run_id': run_id, 'paper': p})
-            if trusted.get('rag_version_id'):
+            if not discovery and trusted.get('rag_version_id'):
                 try:
                     imported = self.engine.paper_rag.adopt(self.engine, harness.intelligence, run_id, trusted)
                     if imported:

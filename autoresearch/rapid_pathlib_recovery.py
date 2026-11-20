@@ -92,10 +92,17 @@ def build(engine,run_id,record):
     from .delivery_files import io_path
     from .rapid_experiment_revision import _write_files
     from .experiment_analysis import freeze_sources
-    from .check_instrumentation import split_future_prefix
+    from .check_instrumentation import REQUIRE_ASSERTIONS, split_future_prefix
+    from .saved_validation_configuration import archived_workspace_inputs
+    from .rapid_check_budget import checked as checked_budget, PREFIX as BUDGET_PREFIX
     c=copy.deepcopy(record['candidate'])
     validate(c['check_bundle'],c['check_code']);validate(c['review_bundle'],c['program']['code'])
     future,body=split_future_prefix(c['check_code'])
+    budget = checked_budget(c)
+    budget_line = BUDGET_PREFIX + sha(budget) + '\n' if budget else ''
+    body = body.removeprefix(budget_line)
+    guard = REQUIRE_ASSERTIONS if body.startswith(REQUIRE_ASSERTIONS) else ''
+    body = body.removeprefix(guard)
     support=Path(pathlib_check_runtime.__file__).read_bytes()
     files={f['path']:io_path(Path(c['check_bundle']['root'])/f['path']).read_bytes() for f in c['check_bundle']['files']}
     if 'host_pathlib_compat.py' in files:
@@ -105,17 +112,20 @@ def build(engine,run_id,record):
             body=body[len('# Host check runtime SHA256: '+hashlib.sha256(files['host_pathlib_compat.py']).hexdigest()+'\n'+LEGACY_PREFIX):]
         elif body.startswith(LEGACY_PREFIX):body=body[len(LEGACY_PREFIX):]
         else:raise ValueError('Previous host check launcher binding changed')
-    code=future+prefix(support)+body
+    code=future+budget_line+guard+prefix(support)+body
     identity=sha({'prior':c['checks_sha256'],'compat':hashlib.sha256(support).hexdigest(),'code':hashlib.sha256(code.encode()).hexdigest()})
     root=engine.run_dir(run_id)/'host-check-repairs'/identity
     files.update({'host_pathlib_compat.py':support,'experiment.py':code.encode()})
-    c['check_bundle']=_write_files(root/'check',files)
+    c['check_bundle']=_write_files(root/'check',files,archived_inputs=archived_workspace_inputs(files))
     review={f['path']:io_path(Path(c['review_bundle']['root'])/f['path']).read_bytes() for f in c['review_bundle']['files']}
     review['host_pathlib_compat.py']=support
-    c['review_bundle']=_write_files(root/'review',review)
+    c['review_bundle']=_write_files(root/'review',review,archived_inputs=archived_workspace_inputs(review))
     c['code_sources']=freeze_sources(engine,run_id,c['program'],c['review_bundle'],delivery_support=True)
     c['check_code']=code;c['checks_sha256']=hashlib.sha256(code.encode()).hexdigest()
     c['check_workspace_layout']='rapid-v1'
+    if 'diagnostic_execution' in c:
+        from .scoped_work_order_contract import diagnostic_execution
+        c['diagnostic_execution'] = diagnostic_execution(engine.store.get('runs', run_id), c)
     c['changed_ranges']=[r for r in c['changed_ranges'] if r['path']!='host_pathlib_compat.py']
     c['changed_ranges'].append({'path':'host_pathlib_compat.py','start':0,'end':len(support.decode()),
         'sha256':hashlib.sha256(support).hexdigest(),'scope':'host_check_compatibility'})

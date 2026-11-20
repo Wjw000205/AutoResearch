@@ -11,6 +11,59 @@ import json
 
 from . import code_repair_contract as repair
 from .code_repair_audit_view import view, complete_view, rebase_sources, excerpt
+from .repair_evidence_scope import code_sources, provided_code_paths
+from .async_ownership import to_thread as owned_to_thread
+
+FOLLOWUPS = 'code_repair_read_followups'
+HOST_READ_WINDOW = 4000
+
+
+def host_reading_metadata(reading):
+    fields = ('host_evidence_followup', 'host_evidence_requests', 'followup_id', 'followup_sha256')
+    if (any(key not in reading for key in fields) or not isinstance(reading['host_evidence_requests'], list)
+            or not isinstance(reading['followup_id'], str) or not isinstance(reading['followup_sha256'], str)):
+        repair.fail('宿主正文补读的冻结元数据不完整。')
+    return {key: copy.deepcopy(reading[key]) for key in fields}
+
+
+def citation_reading(engine, run_id, role, packet, context, hid, value, paths):
+    """Freeze host-selected windows once, before any new author request."""
+    binding = {'packet_sha256': repair.sha(packet), 'source_sha256': context['amendment_source_sha256'],
+        'handoff_id': hid, 'role': role, 'output_sha256': repair.sha(value)}
+    identifier = run_id + ':amendment-read:' + repair.sha(binding)
+    def freeze(old):
+        if old is not None:
+            if (not isinstance(old, dict) or not isinstance(old.get('body'), dict)
+                    or old.get('run_id') != run_id or old.get('id') != identifier
+                    or old.get('body', {}).get('binding') != binding or old.get('sha256') != repair.sha(old['body'])):
+                repair.fail('宿主补读的冻结来源发生变化。')
+            return old
+        source = context['amendment_source']
+        queries = [{'kind': 'code', 'identity': path, 'sha256': source['code_files'][path]['sha256'],
+            'offset': 0, 'limit': min(HOST_READ_WINDOW, source['code_files'][path]['total_chars']),
+            'reason': '宿主发现原回复引用了仅有目录的文件；向原作者补充冻结正文后重新确认，不追认之前已读。'}
+            for path in sorted(paths)[:20]]
+        body = {'version': 1, 'binding': binding, 'queries': queries}
+        return {'id': identifier, 'run_id': run_id, 'body': body, 'sha256': repair.sha(body)}
+    record = engine.store.mutate(FOLLOWUPS, identifier, freeze)
+    return {'handoff_id': hid, 'result': copy.deepcopy(value), 'host_evidence_followup': True,
+        'host_evidence_requests': copy.deepcopy(record['body']['queries']),
+        'followup_id': identifier, 'followup_sha256': record['sha256']}
+
+
+def verify_citation_reading(engine, run_id, role, packet, context, reading):
+    host_reading_metadata(reading)
+    record = engine.store.get(FOLLOWUPS, reading.get('followup_id')) or {}
+    binding = {'packet_sha256': repair.sha(packet), 'source_sha256': context['amendment_source_sha256'],
+        'handoff_id': reading['handoff_id'], 'role': role, 'output_sha256': repair.sha(reading['result'])}
+    if not isinstance(record, dict) or not isinstance(record.get('body'), dict):
+        repair.fail('宿主正文补读缺少有效的冻结记录。')
+    body = record['body']
+    if (record.get('id') != run_id + ':amendment-read:' + repair.sha(binding)
+            or record.get('run_id') != run_id or body.get('version') != 1 or body.get('binding') != binding
+            or record.get('sha256') != repair.sha(body) or reading.get('followup_sha256') != record.get('sha256')
+            or reading.get('host_evidence_requests') != body.get('queries')):
+        repair.fail('宿主正文补读缺少同角色同版本的冻结记录。')
 
 TASK = '''独立核对发现当前修改意见中的局部分歧。仅处理 targets 中你本人提出的原 issue_id。
 这是纠正拟修改意见，不是重新验收代码；其他问题、已完成阶段和原始评审结论不重写。
@@ -62,6 +115,27 @@ def request(packet, audit, role, readings=()):
     for reading in readings:
         context = {'amendment_source': source}
         context['amendment_source_sha256'] = repair.sha(source)
+        if reading.get('host_evidence_followup') is True:
+            from .implementation_failures import ImplementationAmendmentReadRequired
+            try:
+                validate(reading['result'], context)
+            except ImplementationAmendmentReadRequired as missing:
+                from .intelligence import parse_json
+                queries = reading.get('host_evidence_requests')
+                parse_json(json.dumps(queries, ensure_ascii=False), READ_SCHEMA)
+                if ([q['identity'] for q in queries] != missing.paths[:20]
+                        or any(q['kind'] != 'code' or q['offset'] != 0 for q in queries)):
+                    repair.fail('宿主补读不能扩展原回复的缺失正文范围。')
+            else:
+                repair.fail('宿主补读必须绑定原回复中真实缺失的代码正文。')
+            added = read_ranges(packet, source, queries)
+            source['requested_evidence'].extend(added)
+            source.setdefault('host_evidence_followups', []).append({
+                'handoff_id': reading['handoff_id'], 'output_sha256': repair.sha(reading['result']),
+                'paths': [row['identity'] for row in added], 'prior_reading_credit': False,
+                'prior_responses': copy.deepcopy(reading['result']['responses']),
+                'requires_original_author_confirmation': True})
+            continue
         validate(reading['result'], context)
         if not reading['result']['evidence_requests']:
             repair.fail('补读链混入最终意见。')
@@ -77,15 +151,14 @@ def request(packet, audit, role, readings=()):
 def read_ranges(packet, source, queries):
     full = complete_view(packet)
     documents = {d['document_id']: d for d in full['documents']}
-    allowed = {p for i in source['targets'] for p in i['allowed_paths']}
     result = []
     existing = source.get('requested_evidence', [])
     for query in queries:
         document = query['kind'] == 'document'
         item = documents.get(query['identity']) if document else full['code_files'].get(query['identity'])
-        if (not item or item['sha256'] != query['sha256'] or (not document and query['identity'] not in allowed)
+        if (not item or item['sha256'] != query['sha256'] or (not document and query['identity'] not in code_sources(packet))
                 or not 0 <= query['offset'] < query['offset'] + query['limit'] <= len(item['text'])):
-            repair.fail('补读必须指向同一冻结来源或本问题允许的代码范围。')
+            repair.fail('补读必须指向同一冻结证据集、版本及有效范围。')
         prior_parts = [r for r in [*existing, *result] if all(query[k] == r[k] for k in ('kind', 'identity', 'sha256'))]
         if document:
             prior_parts += [e for d in source['documents'] if d['document_id'] == query['identity'] for e in d['excerpts']]
@@ -119,7 +192,7 @@ def seal(engine, run_id, role, purpose, task, context, schema, hid):
     return saved['result']
 
 
-def validate(value, context):
+def validate(value, context, *, replaying_sealed_revision=False):
     from .intelligence import parse_json
     parse_json(json.dumps(value, ensure_ascii=False), SCHEMA)
     source = context['amendment_source']
@@ -139,6 +212,8 @@ def validate(value, context):
     for entry in source.get('requested_evidence', []):
         if entry['kind'] == 'document':
             documents.setdefault((entry['identity'], entry['sha256']), set()).add(entry['section_id'])
+    missing_code = set()
+    provided = provided_code_paths(source)
     for row in rows:
         old = known[row['issue_id']]
         if (len(row['fixes']) != len(old['fixes']) or any(
@@ -153,13 +228,24 @@ def validate(value, context):
         if any(ref['section_id'] not in documents.get((ref['document_id'], ref['sha256']), set())
                for ref in row['document_refs']):
             repair.fail('意见纠正必须引用当前冻结来源的真实章节。')
-        provided_paths = set(source.get('code_files', {})) | {
-            r['identity'] for r in source.get('requested_evidence', []) if r['kind'] == 'code'}
-        if any(p not in old['allowed_paths'] or p not in provided_paths for p in row['code_paths']):
-            repair.fail('意见纠正必须引用本问题范围内已提供的真实代码。')
+        for path in row['code_paths']:
+            if path in provided:
+                continue
+            if (replaying_sealed_revision and path in old['allowed_paths']
+                    and path in source.get('code_files', {})):
+                # Historical code_paths were location references. Reconstruct
+                # an authenticated old revision under that frozen contract;
+                # this grants no reading credit and never admits a new reply.
+                continue
+            if path not in source.get('code_files', {}) or not source['code_files'][path].get('total_chars'):
+                repair.fail('意见纠正必须引用同一冻结证据集中实际提供正文的代码。')
+            missing_code.add(path)
+    if missing_code:
+        from .implementation_failures import ImplementationAmendmentReadRequired
+        raise ImplementationAmendmentReadRequired(missing_code)
 
 
-def apply(packet, audit, authors):
+def apply(packet, audit, authors, *, replaying_sealed_revision=False):
     result = copy.deepcopy(packet)
     dissent = {r['issue_id'] for r in audit['result']['checks'] if not r['supported']}
     expected_roles = {i['role'] for i in packet['items'] if i['issue_id'] in dissent}
@@ -168,7 +254,7 @@ def apply(packet, audit, authors):
     responses = {}
     for author in authors:
         _, context = request(packet, audit, author['role'], author.get('readings', []))
-        validate(author['result'], context)
+        validate(author['result'], context, replaying_sealed_revision=replaying_sealed_revision)
         if author['result']['evidence_requests']:
             repair.fail('补读请求不是修改结论。')
         responses.update({r['issue_id']: {**r, 'read_evidence': context['amendment_source']['requested_evidence']}
@@ -186,8 +272,6 @@ def apply(packet, audit, authors):
                 deferred.append(item)
                 continue
         retained.append(item)
-    if not retained:
-        repair.fail('原作者核实后没有可独立执行的修改项，保留全部未决意见。')
     result['items'] = retained
     if deferred:
         result['deferred_items'] = deferred
@@ -198,7 +282,8 @@ def apply(packet, audit, authors):
         'audit_output_sha256': repair.sha(audit['result']),
         'authors': [{k: copy.deepcopy(author[k]) for k in ('role', 'handoff_id')} |
                     {'output_sha256': repair.sha(author['result']), 'readings': [
-                        {'handoff_id': r['handoff_id'], 'output_sha256': repair.sha(r['result'])}
+                        {'handoff_id': r['handoff_id'], 'output_sha256': repair.sha(r['result']),
+                         **(host_reading_metadata(r) if r.get('host_evidence_followup') is True else {})}
                         for r in author.get('readings', [])]} for author in authors]}
     return result
 
@@ -243,13 +328,17 @@ def verify(engine, run_id, packet, seen=None):
             value = seal(engine, run_id, author['role'], purpose, TASK, context, SCHEMA, reading['handoff_id'])
             if repair.sha(value) != reading['output_sha256']:
                 repair.fail('定向补读的原请求发生变化。')
-            readings.append({'handoff_id': reading['handoff_id'], 'result': value})
+            restored = {'handoff_id': reading['handoff_id'], 'result': value,
+                **(host_reading_metadata(reading) if reading.get('host_evidence_followup') is True else {})}
+            if restored.get('host_evidence_followup') is True:
+                verify_citation_reading(engine, run_id, author['role'], base, context, restored)
+            readings.append(restored)
         purpose, context = request(base, full_audit, author['role'], readings)
         response = seal(engine, run_id, author['role'], purpose, TASK, context, SCHEMA, author['handoff_id'])
         if repair.sha(response) != author['output_sha256']:
             repair.fail('原作者纠正结果发生变化。')
         authors.append({**author, 'readings': readings, 'result': response})
-    if apply(base, full_audit, authors) != packet:
+    if apply(base, full_audit, authors, replaying_sealed_revision=True) != packet:
         repair.fail('修改清单超出已保存的原作者定向纠正。')
 
 
@@ -258,39 +347,43 @@ def fingerprint(packet):
         for group in ('items', 'deferred_items') for item in packet.get(group, [])])
 
 
-async def amend(engine, h, run_id, state, attempt, packet, audit, save):
-    from .storage import now
-    # Reject unsealed/synthetic dissent before spending on original-role work.
-    from .code_repair_tool_review import authenticate
-    result = authenticate(engine, run_id, packet, audit)
-    if result != audit['result']:
-        repair.fail('独立复审分歧与冻结记录不一致。')
-    dissent = {r['issue_id'] for r in result['checks'] if not r['supported']}
-    attempt['execution_progress'] = {'step': 'repair_amendment',
-        'label': f'原评审定向纠正 {len(dissent)} 项修改意见，随后独立复审',
-        'started_at': now(), 'updated_at': now()}
-    save()
+def restore(engine, run_id, packet, audit):
+    """Replay only completed author work, without requests or followup writes."""
+    from .engine import Harness
+    from .implementation_failures import ImplementationAmendmentReadRequired
+    dissent = {r['issue_id'] for r in audit['result']['checks'] if not r['supported']}
     authors = []
     for role in repair.ROLES:
         if not any(i['role'] == role and i['issue_id'] in dissent for i in packet['items']):
             continue
-        readings = []
+        readings, seen = [], set()
         while True:
             purpose, context = request(packet, audit, role, readings)
-            value = await h.ask(run_id, role, purpose, TASK, context, SCHEMA)
-            validate(value, context)
-            hid = h.decision_key(run_id, role, purpose, TASK, context, SCHEMA)
-            if value['evidence_requests']:
-                read_ranges(packet, context['amendment_source'], value['evidence_requests'])
-                readings.append({'handoff_id': hid, 'result': value})
-                engine.check_active(run_id)
+            if purpose in seen:
+                repair.fail('已保存的定向补读形成循环。')
+            seen.add(purpose)
+            hid = Harness.decision_key(run_id, role, purpose, TASK, context, SCHEMA)
+            value = seal(engine, run_id, role, purpose, TASK, context, SCHEMA, hid)
+            try:
+                validate(value, context)
+            except ImplementationAmendmentReadRequired:
+                binding = {'packet_sha256':repair.sha(packet), 'source_sha256':context['amendment_source_sha256'],
+                    'handoff_id':hid,'role':role,'output_sha256':repair.sha(value)}
+                identifier = run_id+':amendment-read:'+repair.sha(binding)
+                record = engine.store.get(FOLLOWUPS,identifier) or {}
+                reading = {'handoff_id':hid,'result':value,'host_evidence_followup':True,
+                    'host_evidence_requests':record.get('body',{}).get('queries'),
+                    'followup_id':identifier,'followup_sha256':record.get('sha256')}
+                verify_citation_reading(engine,run_id,role,packet,context,reading)
+                readings.append(reading)
                 continue
-            authors.append({'role': role, 'result': value, 'handoff_id': hid, 'readings': readings})
+            if value['evidence_requests']:
+                readings.append({'handoff_id':hid,'result':value})
+                continue
+            authors.append({'role':role,'handoff_id':hid,'result':value,'readings':readings})
             break
-    amended = apply(packet, audit, authors)
-    await engine._read_consensus_check(run_id, verify, engine, run_id, amended)
-    engine.check_active(run_id)
-    engine.store.event(run_id, 'implementation.repair_amended', '原评审已纠正被质疑的修改意见，提交独立复审。',
-        {'workflow_id': state['id'], 'attempt': attempt['index'], 'issue_ids': sorted(dissent),
-         'base_packet_sha256': repair.sha(packet), 'packet_sha256': repair.sha(amended)})
-    return amended
+    restored = apply(packet,audit,authors)
+    verify(engine,run_id,restored)
+    return restored
+
+

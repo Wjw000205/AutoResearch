@@ -97,7 +97,7 @@ def _overlaps(left, right):
 
 
 def search(intelligence, query, run_id=None, limit=None, *, role=None, scope=None):
-    from .intelligence import _features
+    from .intelligence import _features, MEMORY_INDEX_VERSION
     from .literature_runtime import memory_encoder, cached_vectors, cosine_score
     if not isinstance(query, str):
         raise ValueError('Memory query must be text')
@@ -105,7 +105,9 @@ def search(intelligence, query, run_id=None, limit=None, *, role=None, scope=Non
     limit = config['memory_top_k'] if limit is None else limit
     if type(limit) is not int or limit < 1:
         raise ValueError('Memory limit must be a positive integer')
-    intelligence._ensure_memory_index()
+    passive=getattr(intelligence,'_context_retrieval_readonly',False)
+    if not passive:
+        intelligence._ensure_memory_index()
     visible, args = visibility(intelligence.store, run_id, role, scope)
     features, lexical = _features(query), []
     readonly = getattr(intelligence.store, '_memory_search_scan_visible', False)
@@ -114,8 +116,12 @@ def search(intelligence, query, run_id=None, limit=None, *, role=None, scope=Non
         candidate = visible
         parameters = list(args)
         if features and not readonly:
-            candidate += " AND (key IN (SELECT t.memory_id FROM memory_terms t JOIN json_each(?) q ON t.term=q.value) OR json_extract(data,'$.metadata.source_id')=? OR key=?)"
+            candidate += " AND (key IN (SELECT t.memory_id FROM memory_terms t JOIN json_each(?) q ON t.term=q.value) OR json_extract(data,'$.metadata.source_id')=? OR key=?"
             parameters.extend([terms, query.strip(), query.strip()])
+            if passive:
+                candidate+=" OR coalesce(json_extract(data,'$.index_version'),0)<?"
+                parameters.append(MEMORY_INDEX_VERSION)
+            candidate+=')'
         with intelligence.store._read_db() as db:
             stat = db.execute("SELECT count(*),coalesce(avg(length(json_extract(data,'$.text'))),1) FROM records WHERE collection='memory' AND " + visible, args).fetchone()
             n, avg = stat[0], max(1, stat[1])
@@ -134,7 +140,9 @@ def search(intelligence, query, run_id=None, limit=None, *, role=None, scope=Non
             _retain(lexical, row, score, config['memory_lexical_candidates'], ordinal)
     lexical = [dict(row, lexical_score=order[0]) for order, row in sorted(lexical, key=lambda x: x[0], reverse=True)]
     semantic, diagnostics = [], {'available': False, 'reason': 'disabled', 'fallback': 'lexical'}
-    if config['memory_semantic_enabled'] and query.strip() and not readonly:
+    if passive:
+        diagnostics['reason']='context_readonly_selection'
+    if config['memory_semantic_enabled'] and query.strip() and not readonly and not passive:
         encoder = None
         try:
             encoder = memory_encoder(intelligence)
@@ -180,7 +188,7 @@ def search(intelligence, query, run_id=None, limit=None, *, role=None, scope=Non
         results.append(row)
         if len(results) == limit:
             break
-    if run_id and not readonly:
+    if run_id and not readonly and not passive:
         # Capture this call's local values before exposing the compatibility
         # property: concurrent roles must never log another request's status.
         intelligence.store.event(run_id, 'memory.retrieval', 'Memory retrieval completed', {

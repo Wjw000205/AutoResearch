@@ -5,6 +5,8 @@ Protocol approval does not authorize code execution or alter the research gates.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned
+
 import asyncio
 import copy
 import hashlib
@@ -16,6 +18,7 @@ from .training_adjustment import obj
 
 COLLECTION = 'fixed_state_diagnostics'
 ROLES = ('director', 'engineer', 'scout')
+from . import independent_full_review as full
 PATHS = ('/fixed_state_protocol', '/fixed_state_basis')
 INSTRUCTION = '''用户明确要求分析最终诊断回执，提出新诊断并经三方独立评审；不得重跑或放宽门禁。
 本次独立评审一个具体的新观测协议，不再无约束重复设计。先用 experiments.compare 分页完整读取
@@ -98,7 +101,8 @@ def validate_reads(engine, record, role, assignment, paths=PATHS):
     owner = authenticate(engine, record['run_id'], role, assignment['purpose'], payload, answer)
     refs = set(answer['read_receipts'])
     seen, windows = set(), {p: [] for p in paths}
-    for row in (engine.store.get('handoff_progress', owner) or {}).get('tool_results', []):
+    owners=full.reading_handoffs(engine.store,record['run_id'],assignment['full_review_receipt']) if assignment.get('full_review_receipt') else [owner]
+    for row in [r for hid in owners for r in (engine.store.get('handoff_progress',hid) or {}).get('tool_results',[])]:
         call, result = row.get('call', {}), row.get('result', {})
         receipt = result.get('receipt_sha256')
         if receipt not in refs:
@@ -124,11 +128,27 @@ def validate_reads(engine, record, role, assignment, paths=PATHS):
     return {'role': role, 'handoff_id': owner, 'receipt_sha256s': sorted(refs), 'complete': True}
 
 
+def read_validator(engine,record,role,paths=PATHS):
+    def verify(vote):
+        frozen=full.authenticate(engine.store,record['run_id'],vote)
+        assignment={k:frozen[k] for k in ('instruction','context','schema')}
+        assignment.update(purpose=engine.store.get('handoffs',vote[full.KEY]['handoff_id'])['purpose'],
+            answer=full.answer(vote),full_review_receipt=vote)
+        try:return validate_reads(engine,record,role,assignment,paths)
+        except ValueError as exc:
+            exc.covered_chars=full.read_progress(engine.store,record['run_id'],vote,{'experiments.compare'})
+            ref=frozen['context']['validation_evidence']
+            exc.missing_read_targets=[{'path':p,'evidence_id':ref['id'],'expected_sha256':ref['sha256'],
+                'instruction':'完整分页读取此冻结路径并返回所有真实read_receipts。'} for p in paths]
+            raise
+    return verify
+
+
 def approved(assignments):
     def vote(a):
         clarification = a.get('clarification', {})
         return clarification['answer'] if clarification.get('authenticated') else a.get('answer', {})
-    return set(assignments) == set(ROLES) and all(
+    return full.assignment_members(assignments) and all(
         a.get('read', {}).get('complete') is True
         and vote(a).get('approve_for_implementation') is True
         and not vote(a)['issues'] and not vote(a)['required_changes']
@@ -183,7 +203,7 @@ async def clarify_approvals(engine, harness, record, save):
         c['authenticated'] = True
         c['read_origin'] = a['read']['handoff_id']
         save()
-    results = await asyncio.gather(*(one(role,a) for role,a in record['assignments'].items()), return_exceptions=True)
+    results = await gather_owned(*(one(role,a) for role,a in record['assignments'].items()), return_exceptions=True)
     for result in results:
         if isinstance(result, BaseException):
             raise result
@@ -212,22 +232,27 @@ async def execute(engine, harness, run_id):
                     'evidence_paths': list(PATHS), 'scientific_approval': False}})
         # Persist each exact request before dispatch. Each role gets the same
         # protocol and no other role's answer; resume retains completed votes.
-        for role in ROLES:
+        review_roles, review_binding = full.prepare_assignments(record, 'assignments', full.make_binding({
+            'protocol_sha256': record['protocol_sha256'], 'original_evidence': record['original_evidence']}, 'fixed_state_protocol'))
+        for role in review_roles:
             if role not in record['assignments']:
                 record['assignments'][role] = {
                     'purpose': 'experiment_diagnose:fixed-state-protocol:' + record['protocol_sha256'],
                     'instruction': INSTRUCTION, 'context': copy.deepcopy(record['review_context']),
                     'schema': schema(record['protocol_sha256'])}
+                if review_binding:
+                    record['assignments'][role]['context'] = full.bind(record['assignments'][role]['context'], review_binding)
         save()
         async def one(role):
             a = record['assignments'][role]
             if 'answer' not in a:
-                a['answer'] = await harness.ask(run_id, role, a['purpose'], a['instruction'], a['context'], a['schema'])
+                a['answer'] = await full.ask_assignment(harness, run_id, role, a,
+                    validator=read_validator(engine,record,role))
                 save()
             if not a.get('read'):
                 a['read'] = await engine._read_consensus_check(run_id, validate_reads, engine, record, role, a)
                 save()
-        results = await asyncio.gather(*(one(r) for r in ROLES), return_exceptions=True)
+        results = await gather_owned(*(one(r) for r in review_roles), return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 raise result

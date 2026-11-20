@@ -131,6 +131,13 @@ def _prepared(previous, operation):
     return result
 
 
+def _audited_prepared(engine, run_id, key, previous, operation, audit):
+    from .full_review_contract import AUDIT, replay
+    if AUDIT not in audit:
+        return _prepared(previous, operation)  # Immutable legacy recovery semantics.
+    return replay(engine, run_id, key, previous, operation, audit[AUDIT])
+
+
 def _valid_history(engine, intelligence, run_id, key, progress):
     """Recheck every frozen recovery, including repeated interruptions.
 
@@ -167,7 +174,10 @@ def _valid_history(engine, intelligence, run_id, key, progress):
             return False
         if source['status'] == 'failed' and audit.get('source_disposition') != 'superseded_without_response':
             return False
-        expected = _prepared(previous, operation)
+        try:
+            expected = _audited_prepared(engine, run_id, key, previous, operation, audit)
+        except ValueError:
+            return False
         if audit.get('prepared_sha256') != digest(expected):
             return False
         if number and history[0][number - 1]['turn'] == source_turn:
@@ -227,22 +237,28 @@ def advance(engine, intelligence, run_id, key, progress, *, automatic=False):
     source = _source(engine.store, intelligence, run_id, normal)
     if (source is None or any(previous['operation_id'] == normal['operation_id'] for previous in history[0])
             or any(audit.get('source', {}).get('native_key') == source['native_key'] for audit in history[1])
-            or not _profile_matches(engine.store, intelligence, run_id, normal, source)
-            or (source['status'] != 'failed' if automatic else
-                not _fresh_generation(generation, engine.store.get('codex_reasoning', source['native_key'])))):
+            or not _profile_matches(engine.store, intelligence, run_id, normal, source)):
+        return False
+    from .execution_continuation import after_native_readback
+    generation = after_native_readback(engine, run_id, key, target, source, field='targets')
+    if (source['status'] != 'failed' if automatic else
+            not _fresh_generation(generation, engine.store.get('codex_reasoning', source['native_key']))):
         return False
     engine.check_active(run_id)
     operation = uid()
     if operation in {value for previous, audit in zip(*history)
                      for value in (previous['operation_id'], audit.get('new_operation_id'))} or operation == normal['operation_id']:
         return False
-    prepared = _prepared(normal, operation)
+    from .full_review_contract import AUDIT, successor
+    prepared, material_repair = successor(engine, run_id, key, normal, operation)
     preview = intelligence.preflight_batch(run_id, [prepared])
     if preview['request_count'] != 1 or preview['requests'][0]['max_output_tokens'] != source['effective_output_limit']:
         return False
     audit = {'source': source, 'target': target, 'turn': turn,
              'new_operation_id': operation, 'prepared_sha256': digest(prepared), 'created_at': now(),
              'continuation_number': 1, 'continuation_limit': 1, **_disposition(source)}
+    if material_repair is not None:
+        audit[AUDIT] = material_repair
     if automatic:
         number = 1 + sum(bool(a.get('automatic_recovery')) and a['turn'] == turn for a in history[1])
         audit.update(automatic_recovery=AUTO_POLICY, automatic_retry_number=number,
@@ -286,7 +302,10 @@ def validate(engine, intelligence, run_id, key, progress, preview):
         previous, audit = history[0][-1], history[1][-1]
         source = _source(engine.store, intelligence, run_id, previous)
         operation = normal.get('operation_id')
-        expected = _prepared(previous, operation) if source is not None else None
+        try:
+            expected = _audited_prepared(engine, run_id, key, previous, operation, audit) if source is not None else None
+        except ValueError:
+            expected = None
         target = _target(previous, progress.get('turn'))
         valid = (source is not None and source == audit.get('source') and target is not None
                  and audit.get('target') == target

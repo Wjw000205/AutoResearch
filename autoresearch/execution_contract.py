@@ -15,6 +15,17 @@ RULES = ('The task primary improvement threshold is a hard additional gate; a we
 
 def trial_accounting(config, dataset_budget=None):
     """Describe enforced semantics; this neither grants execution nor raises caps."""
+    if config.get('baseline_mode') == 'paper_reported':
+        limit = dataset_budget.get('attempt_limit',config['max_trials']) if dataset_budget else config['max_trials']
+        return {'version':5,'scope':(dataset_budget or {}).get('scope','per_cycle'),
+                'attempt_limit':limit, 'max_planned_trials_per_cycle':limit,
+                'dataset_budget':dataset_budget, 'total_plan_formula':'N+K+T',
+                'formula_terms':{'N':'one invocation per proposed validation configuration and seed',
+                    'K':'one invocation per approved own ablation configuration and seed',
+                    'T':'one proposed held-out invocation per validation-selected condition group and final seed'},
+                'external_baseline_invocations':0,'internal_validation_grid_search_allowed':False,
+                'grants_experiment_authorization':False,
+                'required_gates':['independent review','code and data checks','current call, resource and per-trial limits']}
     if dataset_budget and dataset_budget.get('status') == 'unlimited':
         return {'version': 4, 'scope': 'all_task_datasets', 'dataset_budget': dataset_budget,
             'attempt_limit': None, 'completion_rule': dataset_budget['completion_rule'],
@@ -76,7 +87,18 @@ def constraints(config, previous=None, dataset_budget=None):
     if dataset_budget and (dataset_budget.get('scope') == 'per_dataset_task' or dataset_budget.get('status') == 'unlimited'):
         result.pop('max_trials_per_cycle', None)
         result['dataset_budget'] = dataset_budget
+    if config.get('baseline_mode') == 'paper_reported':
+        result['rules'] = 'Budget each local validation, own ablation and selected held-out invocation. External paper scores are reported references and consume zero trials.'
+        result['new_experiment_requirements'] = ('同一阶段的自有模型和自有消融使用同一固定种子。validation_seeds 和 final_test_seeds 默认各一个；'
+            '按验证集选参。已发表基线只引用与测试条件对齐的论文结果；资源与调用授权另行核验。')
     return result
+
+
+def current_constraints(store, run_id):
+    from .research_iteration import effective_config
+    from .dataset_configuration_queue import budget
+    config = effective_config(store, run_id, store.get('runs', run_id)['config'])
+    return constraints(config, dataset_budget=budget(store, run_id))
 
 
 def host_budget_snapshot(store, run_id, proposal, proposal_hash, cycle):
@@ -93,9 +115,12 @@ def host_budget_snapshot(store, run_id, proposal, proposal_hash, cycle):
     used, maximum = count(used), count(config.get('max_calls'))
     total_cycles, current_cycle = count(config.get('max_research_cycles')), count(cycle)
     cpu = count(proposal.get('resource_plan', {}).get('cpu_seconds'))
+    from .dataset_configuration_queue import budget as dataset_budget
+    budget_view = dataset_budget(store,run_id)
+    attempt_limit = budget_view.get('attempt_limit',config['max_trials']) if budget_view else config['max_trials']
     return {'version': 1, 'run_id': run_id, 'proposal_hash': proposal_hash,
         'source': 'current run config, budgets.calls and enforced planner/runner contract',
-        'status': 'platform_limits_reported', 'trial_accounting': trial_accounting(config),
+        'status': 'platform_limits_reported', 'trial_accounting': trial_accounting(config,budget_view),
         'call_budget_snapshot': {'source': 'budgets.calls', 'used': used, 'maximum': maximum,
             'remaining': max(0, maximum - used) if used is not None and maximum is not None else None,
             **({'unlimited': True} if 'max_calls' in config and config['max_calls'] is None else {}),
@@ -104,9 +129,9 @@ def host_budget_snapshot(store, run_id, proposal, proposal_hash, cycle):
             'unlimited': total_cycles is None,
             'additional_available': max(0, total_cycles - current_cycle)
                 if total_cycles is not None and current_cycle is not None else None},
-        'planned_cycle_upper_bounds': {'runner_invocations': config['max_trials'],
-            'wall_seconds': config['max_trials'] * config['experiment_timeout'],
-            'requested_cpu_seconds': config['max_trials'] * cpu if cpu is not None else None,
+        'planned_cycle_upper_bounds': {'runner_invocations': attempt_limit,
+            'wall_seconds': attempt_limit * config['experiment_timeout'] if attempt_limit is not None else None,
+            'requested_cpu_seconds': attempt_limit * cpu if cpu is not None and attempt_limit is not None else None,
             'scope': 'Derived bounds for the configured planned invocations; separate repair attempts are described in trial_accounting. '
                 'No independent whole-cycle wall/CPU ceiling or extra quota approval was configured here.'},
         'lifecycle': 'Consensus permits proceeding to design. Commit the complete concrete parameter plan before execution; '

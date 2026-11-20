@@ -7,6 +7,7 @@ import stat
 from pathlib import Path
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from .delivery_files import io_path
 
 
 class DeletionError(ValueError):
@@ -20,28 +21,36 @@ def _plain_path(path: Path, root: Path) -> None:
     for part in (root, *[root.joinpath(*path.relative_to(root).parts[:i])
                         for i in range(1, len(path.relative_to(root).parts) + 1)]):
         try:
-            info = part.lstat()
+            info = io_path(part).lstat()
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
             raise DeletionError('Task cleanup refuses symbolic links or directory junctions')
-        if not part.resolve().is_relative_to(root):
+        if not io_path(part).resolve().is_relative_to(io_path(root).resolve()):
             raise DeletionError('Task cleanup path resolves outside the data directory')
 
 
 def validate_tree(path: Path, root: Path) -> None:
     _plain_path(path, root)
-    if not path.exists():
+    if not io_path(path).exists():
         return
-    if not path.is_dir():
+    if not io_path(path).is_dir():
         raise DeletionError('Task cleanup expected a task directory')
     def failed_scan(error):
         raise error
-    for directory, dirs, files in os.walk(path, followlinks=False, onerror=failed_scan):
+    native = io_path(path)
+    for directory, dirs, files in os.walk(native, followlinks=False, onerror=failed_scan):
         for name in [*dirs, *files]:
             entry = Path(directory) / name
-            _plain_path(entry, root)
-            if not (entry.is_file() or entry.is_dir()):
+            # The root's ancestors were checked above, and every descendant
+            # directory is checked before walk descends. Rechecking every
+            # ancestor per file makes large historical trees quadratic.
+            if not entry.is_relative_to(native):
+                raise DeletionError('Task cleanup path is outside the task directory')
+            info = entry.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise DeletionError('Task cleanup refuses symbolic links or directory junctions')
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
                 raise DeletionError('Task cleanup refuses non-regular filesystem entries')
 
 
@@ -65,9 +74,9 @@ def remove_task_tree(path: Path, data_dir: Path) -> None:
             or not path.name.isascii() or not path.name.isalnum()):
         raise DeletionError('Cleanup requires an exact task directory')
     validate_tree(path, data_dir)
-    if path.exists():
-        shutil.rmtree(path)
-    if path.exists():
+    if io_path(path).exists():
+        shutil.rmtree(io_path(path))
+    if io_path(path).exists():
         raise DeletionError('Task directory remains after cleanup')
 
 

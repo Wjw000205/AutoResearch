@@ -164,6 +164,8 @@ def verify_pages(engine, run_id, hid, context, plan, located, refs, *, voting):
     """Pure coverage check, also used before authorizing a response-only review."""
     wanted = {'/tuning_inventory'} | ({'/tuning_scope_plan'} if voting else set())
     runtime = context.get('experiment_decision', {}).get('tuning_scope_design', {})
+    if voting and runtime.get('batch_script_path'):
+        wanted.add(runtime['batch_script_path'])
     if runtime.get('runtime_audit_path'):
         wanted.add(runtime['runtime_audit_path'])
     files = {p for factor in plan['factors'] for p in factor['source_paths']}
@@ -222,6 +224,8 @@ def retained_index(engine, run_id, role, record, context, plan):
     evidence = _snapshot(engine, run_id, context)
     wanted = {'/tuning_inventory', '/tuning_scope_plan'} | {p for f in plan['factors'] for p in f['source_paths']}
     runtime = context.get('experiment_decision', {}).get('tuning_scope_design', {})
+    if runtime.get('batch_script_path'):
+        wanted.add(runtime['batch_script_path'])
     wanted.update(runtime.get('runtime_route_paths', []))
     if runtime.get('runtime_audit_path'):
         wanted.add(runtime['runtime_audit_path'])

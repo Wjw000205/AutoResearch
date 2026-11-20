@@ -1,4 +1,6 @@
 """SHA-bound candidate review, one observation, then independent result review."""
+
+from .async_ownership import gather as gather_owned
 import asyncio
 import copy
 import hashlib
@@ -154,11 +156,18 @@ async def execute_once(engine,record,save):
     from .training_adjustment import _basis
     from .lab import assess_resources
     from .experiment_views import _safe_file
+    from . import independent_full_review as full
     run_id=record['run_id'];identifier='fixed-state-check-'+record['candidate']['amendment_sha256'][:24]
     params={'phase':'code_check','seed':29,'dataset':'ETTh1','dataset_assets':record['dataset_assets'],
             'fixed_state_protocol_sha256':record['protocol_sha256']}
-    if not _reviewed(record) or not all(x['complete'] for x in record.get('review_reads',[])) or len(record.get('review_reads',[]))!=3:
+    if (not _reviewed(record) or not all(x['complete'] for x in record.get('review_reads',[]))
+            or len(record.get('review_reads',[]))!=len(full.reviewers(record['votes']))):
         raise ResearchBlocked('固定状态候选尚未通过三方代码和实际读取门禁。')
+    if full.reviewers(record['votes'])==full.REVIEWERS:
+        full.authenticate_complete(engine.store,run_id,record['votes'])
+        if {r.get('role') for r in record['review_reads']}!=set(full.REVIEWERS):
+            raise ResearchBlocked('固定状态候选读取回执与实际独立审核角色不符。')
+        for vote in record['votes']:full.validate_delivery(engine.store,run_id,vote,engine=engine)
     result=engine.store.get('experiments',run_id+':'+identifier)
     if not result:
         if record.get('trial_id'):raise ResearchBlocked('固定状态诊断已登记派发但无回执；先查明原进程，不重复执行。')
@@ -197,7 +206,8 @@ async def execute_once(engine,record,save):
 async def review_results(engine,harness,record,save):
     from .engine import ResearchBlocked
     from .experiment_decisions import _archive
-    from .fixed_state_diagnostic import ROLES,validate_reads
+    from .fixed_state_diagnostic import validate_reads,read_validator
+    from . import independent_full_review as full
     if not record.get('result_context'):
         ref=_archive(engine,record['run_id'],{'binding':record['binding'],
             'fixed_state_protocol':record['protocol'],'fixed_state_result':record['outcome']})
@@ -205,37 +215,42 @@ async def review_results(engine,harness,record,save):
             'validation_evidence':ref,'evidence_sha256':ref['sha256'],
             'experiment_decision':{'fixed_state_result_review':True,'scientific_approval':False}})
     context=record['result_context']
-    assignments=record.setdefault('result_assignments',{})
-    for role in ROLES:
+    roles,binding=full.prepare_assignments(record,'result_assignments',full.make_binding({
+        'result_context_sha256':full.sha(context),'outcome_sha256':full.sha(record['outcome'])},'fixed_state_results'))
+    assignments=record['result_assignments']
+    for role in roles:
         assignments.setdefault(role,{'purpose':'experiment_diagnose:fixed-state-result:'+context['evidence_sha256'],
             'instruction':RESULT_INSTRUCTION,'context':copy.deepcopy(context),'schema':result_schema(context['evidence_sha256'])})
+        if binding:assignments[role]['context']=full.bind(assignments[role]['context'],binding)
     save()
     async def one(role):
         a=assignments[role]
         if 'answer' not in a:
-            a['answer']=await harness.ask(record['run_id'],role,a['purpose'],a['instruction'],a['context'],a['schema']);save()
+            a['answer']=await full.ask_assignment(harness,record['run_id'],role,a,
+                validator=read_validator(engine,record,role,RESULT_PATHS));save()
         if len({s['label'] for s in a['answer']['states']})!=3:raise ValueError('Each saved state needs its own finding')
         a['read']=await engine._read_consensus_check(record['run_id'],validate_reads,engine,record,role,a,RESULT_PATHS);save()
-    results=await asyncio.gather(*(one(r) for r in ROLES),return_exceptions=True)
+    results=await gather_owned(*(one(r) for r in roles),return_exceptions=True)
     for value in results:
         if isinstance(value,BaseException):raise value
-    analyses=[{'role':r,**a['answer']} for r,a in assignments.items()]
+    analyses=[copy.deepcopy(a['full_review_receipt']) if a.get('full_review_receipt') else {'role':r,**a['answer']}
+        for r,a in assignments.items()]
     if any(not a['valid_observation'] or a['issues'] for a in analyses):
         save(analyses=analyses)
         raise ResearchBlocked('固定状态结果复核仍有具体异议；保留各方回执，须解决后续解释，禁止重跑。')
     signatures=[sorted((s['label'],s['finding']) for s in a['states']) for a in analyses]
     if any(s!=signatures[0] for s in signatures[1:]):
         save(analyses=analyses)
-        raise ResearchBlocked('三方对局部判据解释不同；保留争议等待同证据共识，不自动扩大实验。')
+        raise ResearchBlocked('独立审核者对局部判据解释不同；保留争议等待同证据共识，不自动扩大实验。')
     save(status='completed',analyses=analyses,completed_at=now(),scientific_approval=False)
-    engine.store.event(record['run_id'],'fixed_state.completed','单次固定状态诊断及三方结果复核完成；保留未知根因和原科学门禁',
+    engine.store.event(record['run_id'],'fixed_state.completed','单次固定状态诊断及完整独立结果复核完成；保留未知根因和原科学门禁',
         {'trial_id':record['trial_id'],'report_sha256':record['outcome']['report_sha256']})
     return {'tuning_pending':True,'next_node':'tuning','activity':'fixed_state_diagnostic',
             'fixed_state_diagnostic_id':record['id'],'scientific_approval':False}
 
 
 async def continue_diagnostic(engine,harness,record,save):
-    from .fixed_state_diagnostic import ROLES
+    from . import independent_full_review as full
     from .controlled_training_checks import unchanged,review_context
     from .controlled_review_completion import complete
     from .rapid_experiment_revision import VOTE,_reviewed
@@ -247,17 +262,14 @@ async def continue_diagnostic(engine,harness,record,save):
     await engine._read_consensus_check(run_id,unchanged,engine,record)
     if record['status'] in ('reviewing_code','code_rejected','code_approved'):
         context=review_context(engine,record)
-        if len(record['votes'])<3:
-            async def one(role):
-                if any(v['role']==role for v in record['votes']):return
-                answer=await harness.ask(run_id,role,record['review_purpose'],REVIEW,context,VOTE)
-                record['votes'].append({'role':role,**answer});save()
-            results=await asyncio.gather(*(one(r) for r in ROLES),return_exceptions=True)
-            for value in results:
-                if isinstance(value,BaseException):raise value
+        if not full.members(record['votes']):
+            if record['votes']:save(legacy_partial_votes=copy.deepcopy(record['votes']))
+            from .training_adjustment import _group
+            votes=await _group(harness,run_id,record['review_purpose'],REVIEW,context,VOTE)
+            save(votes=votes,review_instruction=REVIEW,review_contexts={r:copy.deepcopy(context) for r in full.reviewers(votes)})
         reads=await complete(engine,harness,record,context,save)
         save(review_reads=reads)
-        if not _reviewed(record) or len(reads)!=3 or not all(r['complete'] for r in reads):
+        if not _reviewed(record) or len(reads)!=len(full.reviewers(record['votes'])) or not all(r['complete'] for r in reads):
             save(status='code_rejected')
             raise ResearchBlocked('固定状态候选代码未获三方完整独立批准；不执行。')
         save(status='code_approved')

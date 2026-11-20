@@ -14,10 +14,28 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
+def text_slice(value, active):
+    """Resolve only a valid compiler text slice, with no archive lookup."""
+    if not isinstance(value, dict) or set(value) != {'$text_slice'}:
+        return None
+    parts = value['$text_slice']
+    if not isinstance(parts, list) or len(parts) != 3:
+        return None
+    key, start, end = parts
+    table = active.get('shared_context_text', {})
+    text = table.get(key) if isinstance(table, dict) and isinstance(key, str) else None
+    if (not isinstance(text, str) or type(start) is not int or type(end) is not int
+            or not 0 <= start <= end <= len(text)):
+        return None
+    return text[start:end]
+
+
 def pack(active):
     value = {key: copy.deepcopy(item) for key, item in active.items() if key != 'context_compilation'}
     counts, originals = Counter(), {}
     def count(item):
+        if text_slice(item, active) is not None:
+            return  # A slice is an atomic reference; never intern its operands.
         if isinstance(item, dict):
             if '$record' in item or 'shared_context_records' in item:
                 raise ValueError('Reserved record reference already present')
@@ -43,6 +61,8 @@ def pack(active):
     if not references:
         return active
     def share(item, *, root=False):
+        if text_slice(item, active) is not None:
+            return copy.deepcopy(item)
         if isinstance(item, (dict, list)):
             text = encoded(item)
             if not root and text in references:
@@ -80,6 +100,9 @@ def _inline_single_use(packed):
         counts = Counter()
         def count(value):
             if isinstance(value, dict):
+                if text_slice(value, {names[r]: t for r,t in tables.items()}) is not None:
+                    counts['$text', value['$text_slice'][0]] += 1
+                    return
                 if len(value) == 1:
                     ref = next(iter(value))
                     if ref in tables and isinstance(value[ref], str) and value[ref] in tables[ref]:
@@ -106,6 +129,9 @@ def _inline_single_use(packed):
             break
         def inline(value):
             if isinstance(value, dict):
+                sliced = text_slice(value, {names[r]: t for r,t in tables.items()})
+                if sliced is not None and ('$text', value['$text_slice'][0]) in singles:
+                    return sliced
                 if len(value) == 1:
                     ref = next(iter(value))
                     if isinstance(value[ref], str) and (ref, value[ref]) in singles:

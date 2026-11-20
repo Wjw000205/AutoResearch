@@ -22,6 +22,9 @@ cwd 为复制后的候选根目录，src 在 sys.path，sys.argv[1] 是宿主 co
 def new_instruction(engine, run_id, record):
     """New repair work only; retained native turns keep their exact text."""
     text = INSTRUCTION
+    if record.get('decision', {}).get('implementation_correction'):
+        text = text.replace('保留默认控制等价、深度宽度实际变化、优化器行为及全部非法输入检查。',
+            '验证已审 implementation_correction 的偏差复现与修后行为，同时核对未修模块的控制等价性。')
     if record.get('decision', {}).get('architecture_review'):
         text = text.replace('保留默认控制等价、深度宽度实际变化、优化器行为及全部非法输入检查。',
             '按 work_order 中获批结构变更保留目标机制行为断言、未改控制公平性、配置与全部非法输入检查；'
@@ -60,7 +63,7 @@ def issues(source):
     return sorted(set(found))
 
 
-async def repair(engine, harness, run_id, record, files):
+async def repair(engine, harness, run_id, record, files, *, archived_inputs=()):
     from .rapid_experiment_revision import COLLECTION, _write_files, _base_unchanged
     from .engine import ResearchBlocked
     history = record.setdefault('codex_check_repairs', [])
@@ -80,7 +83,7 @@ async def repair(engine, harness, run_id, record, files):
                 content['_delivery/checks.py'] = io_path(Path(previous['workspace'])/'_delivery/checks.py').read_bytes()
                 content['_delivery/rationale.txt'] = io_path(Path(previous['workspace'])/'_delivery/rationale.txt').read_bytes()
             errors = issues(content['_delivery/checks.py'].decode('utf-8'))
-            _write_files(workspace, content)
+            _write_files(workspace, content, archived_inputs=archived_inputs)
             work = {'operation_id':uid(), 'workspace':str(workspace), 'source_sha256':binding,
                 'source_thread_id':original.get('checkpoint',{}).get('thread_id'),
                 'issues':errors, 'instruction':new_instruction(engine,run_id,record)+'\n本次入口问题：'+'；'.join(errors),

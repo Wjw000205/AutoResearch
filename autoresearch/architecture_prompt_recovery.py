@@ -8,7 +8,8 @@ COLLECTION = 'architecture_prompt_successors'
 
 
 def register(engine, run_id, parent_id, instruction):
-    from .experiment_evidence_handoff import KEY, require_reads
+    from .experiment_evidence_handoff import KEY
+    from . import artifact_review_pages as pages
     from .architecture_experiment_contract import enabled
     from .record_archive import fingerprint, save
     from .proposal_request_contract import VERSION
@@ -30,12 +31,12 @@ def register(engine, run_id, parent_id, instruction):
     if active:
         raise ValueError('Settle current paid work before upgrading the architecture prompt')
     from .diagnostic_planning_recovery import authenticate
-    assignment = review['assignment']
     for answer in review['results']:
+        assignment = pages.assignment(review, answer['role'])
         authenticate(engine, run_id, answer['role'], assignment['purpose'],
             {k: assignment[k] for k in ('instruction', 'context', 'schema')},
             {k: v for k, v in answer.items() if k != 'role'})
-        require_reads(engine, run_id, answer['role'], **assignment)
+        pages.verified_reads(engine, run_id, answer['role'], review)
     source = fingerprint(engine.store, 'experiment_decisions', parent_id)
     archive = save(engine.store, run_id, source)
     child_id = parent_id + ':architecture-contract-3:' + sha([source['sha256'], instruction])

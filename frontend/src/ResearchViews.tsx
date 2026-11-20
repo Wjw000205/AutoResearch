@@ -25,16 +25,33 @@ const stages: Record<string, string> = { related_work: 'idea相关论文分析',
 const roleName = (role: unknown) => roles[String(role)] ?? humanizeMessage(textOf(role));
 const stringList = (value: unknown) => Array.isArray(value) ? value.map(textOf).filter(Boolean) : typeof value === 'string' && value ? [value] : [];
 
+function hardwareAdmissionDiagnostic(error: string) {
+  const prefix = 'Hardware availability changed; trial admission rejected: ';
+  if (!error.startsWith(prefix)) return null;
+  try {
+    const assessment = JSON.parse(error.slice(prefix.length));
+    const reasons = assessment?.reasons;
+    if (Array.isArray(reasons) && reasons.length === 1 && String(reasons[0]).startsWith('PyTorch CUDA execution')) {
+      const python = assessment.user_preferences?.python_executable;
+      return { title: 'PyTorch CUDA 检查未通过', description: (python ? `实验解释器 ${python} 的 CUDA 检查未通过。` : '实验解释器的 CUDA 检查未通过。')
+        + '请核对该环境能否使用所选显卡，恢复任务时系统会重新检查。' };
+    }
+  } catch { /* Older or truncated receipts still identify the hardware gate. */ }
+  return { title: '实验硬件准入未通过', description: '请查看原始停止记录中的资源检查结果，再恢复当前实验。' };
+}
+
 export function RecoveryNotice({ run, handoffs, literature, contextReferenceCheck, innovationPending = false, openLimits, openConsensus, openEvidence, openArchitecture, openImplementation, openValidation }: { run: Run; contextReferenceCheck?: Json | null; innovationPending?: boolean; handoffs?: Json[]; literature?: LiteratureDetail | null; openLimits: () => void; openConsensus: () => void; openEvidence?: () => void; openArchitecture?: () => void; openImplementation?: () => void; openValidation?: () => void }) {
   if (!['blocked', 'paused', 'failed'].includes(run.status)) return null;
   const message = (run.error ?? '').toLowerCase();
   const contractDiagnostic = jsonContractDiagnostic(run.error ?? '');
+  const hardwareDiagnostic = hardwareAdmissionDiagnostic(run.error ?? '');
   let title = run.status === 'paused' ? '任务已暂停，检查点已保留' : run.status === 'failed' ? '执行失败' : '研究被执行门禁阻塞';
   let description = run.status === 'failed' ? '查看下方具体错误和执行记录，修复失败原因后再恢复。已保存记录会保留。' : '检查下方执行记录，处理阻塞原因后恢复。已完成阶段和已有实验会保留。';
   let action: 'limits' | 'consensus' | 'providers' | 'evidence' | 'architecture' | 'implementation' | 'validation' | null = null;
   if (run.error === PROCESS_RESTARTED_REASON) {
     title = '后端已重启，任务等待恢复'; description = PROCESS_RESTARTED_DESCRIPTION;
   }
+  else if (hardwareDiagnostic) { ({ title, description } = hardwareDiagnostic); }
   else if (validationResumeReason(run) || /^验证结果与停止规则待核对：/.test(message)
     || message.includes('the frozen stop policy forbids automatically revising a reported negative validation')) {
     title = '验证结果待核对，自动修订已停止';
@@ -106,7 +123,7 @@ export function RecoveryNotice({ run, handoffs, literature, contextReferenceChec
   else if (/permission|allow_local|authoriz|local execution|consent/.test(message)) { title = '实验执行需要本地授权'; description = '在执行配置中选择运行环境并明确允许执行生成代码，然后再恢复任务。'; action = 'limits'; }
   else if (/memory|vram|hardware|resource|disk|experiment.*timeout|trial.*timeout|experiment_timeout/.test(message) || (message === 'timeout' && ['experiments', 'tuning', 'final_tests'].includes(run.stage))) { title = '实验触及资源或时间限制'; description = '查看资源检查结果与实验日志。超时限制可在执行配置中调整；硬件不满足的方案仍会被门禁阻止。'; action = 'limits'; }
   if (run.status === 'failed' && title !== '执行失败') title = `执行失败 · ${title}`;
-  return <div className={`recovery-notice${run.validation_hold ? " has-validation-hold" : ""}`}><CircleAlert size={20} /><div><h3><ReferenceText value={title} /></h3>{isLiteratureReadingGate(run.error ?? '') && <LiteratureReadingProgress readingPlan={literature?.reading_plan} readingGate={literature?.reading_gate} />}<p id={validationResumeReason(run) ? "validation-resume-reason" : undefined}><ReferenceText value={description} /></p><ValidationHoldFacts hold={run.validation_hold} />{run.error && <details className="recovery-original"><summary>查看原始停止记录<ChevronDown size={12} /></summary><pre tabIndex={0}><ReferenceText value={run.error} /></pre></details>}</div>{action === 'providers' ? <a className="btn small" href="#/settings">模型连接与超时<ArrowRight size={14} /></a> : action && <button className="btn small" onClick={action === 'limits' ? openLimits : action === 'evidence' ? openEvidence : action === 'architecture' ? openArchitecture : action === 'implementation' ? openImplementation : action === 'validation' ? openValidation : openConsensus}>{action === 'limits' ? '调整执行边界' : action === 'evidence' ? '查看阅读记录与缺项' : action === 'architecture' ? '查看架构文档与评议' : action === 'implementation' ? '查看代码与修改意见' : action === 'validation' ? '查看验证评审' : '查看异议'}<ArrowRight size={14} /></button>}</div>;
+  return <div className={`recovery-notice${run.validation_hold ? " has-validation-hold" : ""}`}><CircleAlert size={20} /><div><h3><ReferenceText value={title} /></h3>{isLiteratureReadingGate(run.error ?? '') && <LiteratureReadingProgress readingPlan={literature?.reading_plan} readingGate={literature?.reading_gate} />}<p id={validationResumeReason(run) ? "validation-resume-reason" : undefined}><ReferenceText value={description} /></p><ValidationHoldFacts hold={run.validation_hold} />{run.error && <details className="recovery-original"><summary>查看原始停止记录<ChevronDown size={12} /></summary><pre tabIndex={0}>{run.error}</pre></details>}</div>{action === 'providers' ? <a className="btn small" href="#/settings">模型连接与超时<ArrowRight size={14} /></a> : action && <button className="btn small" onClick={action === 'limits' ? openLimits : action === 'evidence' ? openEvidence : action === 'architecture' ? openArchitecture : action === 'implementation' ? openImplementation : action === 'validation' ? openValidation : openConsensus}>{action === 'limits' ? '调整执行边界' : action === 'evidence' ? '查看阅读记录与缺项' : action === 'architecture' ? '查看架构文档与评议' : action === 'implementation' ? '查看代码与修改意见' : action === 'validation' ? '查看验证评审' : '查看异议'}<ArrowRight size={14} /></button>}</div>;
 }
 
 function Proposal({ proposal, proposalHash, ...sources }: { proposal: Json | string | null; proposalHash?: string } & ProposalSourceProps) {

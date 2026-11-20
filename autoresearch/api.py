@@ -20,11 +20,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Bo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ConfigDict, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, Field, ConfigDict, StrictBool, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import CONTEXT_TOKEN_MAX, DATA_DIR, ROOT, RETIRED_IMPLEMENTATION_REVIEW_FIELDS, get_settings, public_settings, save_secrets
 from .engine import Engine, ROLES, STAGES, digest
+from .async_ownership import to_thread as owned_to_thread
 from .idea_materials import render_idea_materials
 from .codex_delivery import codex_status, validate_project_dir, local_codex_view
 from .exporting import build_export
@@ -104,20 +105,11 @@ class RunCreate(BaseModel):
     codex_reasoning_effort: str = Field(default='', pattern='^(|none|minimal|low|medium|high|xhigh|max|ultra)$')
     codex_timeout_seconds: int = Field(default=1800, ge=60, le=7200)
     codex_max_revisions: int | None = Field(default=3, ge=1, le=6)
-    implementation_review_strategy: str = Field(default='acceptance_contract', pattern='^(whole_alignment|acceptance_contract)$')
-    implementation_indexed_review_protocol: int = Field(default=1, ge=1, le=1, strict=True)
+    implementation_review_strategy: str = Field(default='document_code', pattern='^document_code$')
     implementation_review_max_revisions: int | None = Field(default=2, ge=0, le=20, strict=True)
     implementation_review_max_seconds: int | None = Field(default=14400, ge=1, le=604800, strict=True)
     implementation_review_time_basis: str = Field(default='policy_active_time', pattern='^(per_revision_review|policy_wall_time|policy_active_time)$')
     implementation_review_max_calls: int | None = Field(default=240, ge=1, le=10000, strict=True)
-
-    @model_validator(mode='after')
-    def finite_acceptance_budget(self):
-        if self.implementation_review_strategy == 'acceptance_contract' and (
-                self.implementation_review_max_revisions is None
-                or self.implementation_review_time_basis not in {'policy_wall_time', 'policy_active_time'}):
-            raise ValueError('验收合同协议需要有限修订轮次及项目级累计时间。')
-        return self
 
     @field_validator('codex_project_dir')
     @classmethod
@@ -285,7 +277,7 @@ async def _implementation_control_thread(function, *args, **kwargs):
 
 
 def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
-    from .task_runtime import TaskRuntime
+    from .task_runtime import TaskRuntime, TaskRuntimeUnavailable
     store = Store(Path(data_dir) / 'research.sqlite3')
     engine = Engine(store, Path(data_dir), intelligence_factory=intelligence_factory)
     task_runtime = TaskRuntime()
@@ -294,6 +286,7 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
 
     @asynccontextmanager
     async def research_lifespan():
+        from .maintenance import Maintenance
         engine.recover()
         run_controls.recover()
         # One local backfill also retries interrupted indexing; never calls a model/network.
@@ -304,37 +297,42 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
                     AND json_extract(data,'$.id') NOT IN
                     (SELECT json_extract(data,'$.origin_note_id') FROM records WHERE collection='paper_rag_jobs'
                      AND json_extract(data,'$.status')='completed' AND json_extract(data,'$.origin_note_id') IS NOT NULL)""")]
+            failure = None
             for run_id in pending_runs:
-                if store.get('runs', run_id):
+                if store.get('runs', run_id) and not store.get('run_deletions', run_id):
                     try:
                         engine.paper_rag.publish(engine, run_id)
                     except RunDeletedError:
                         continue
-        await asyncio.to_thread(backfill)
-        async def maintain_rag():
-            while True:
-                await asyncio.sleep(60)
-                await asyncio.to_thread(backfill)
-        maintenance = asyncio.create_task(maintain_rag())
-        async def maintain_codex_chats():
+                    except Exception as exc:
+                        failure = exc  # Finish other runs before deferring this sweep.
+            if failure is not None:
+                raise failure
+        async def backfill_rag():
+            await owned_to_thread(backfill)
+        rag = Maintenance('paper-rag', backfill_rag)
+        await rag.sweep()
+        maintenance = asyncio.create_task(rag.maintain(60, initial_delay=True), name='paper-rag-maintenance')
+        async def cleanup_codex_chats():
             from .codex_cleanup import cleanup_completed
-            while True:
-                await cleanup_completed(store, limit=6)
-                await asyncio.sleep(60)
-        chat_cleanup = asyncio.create_task(maintain_codex_chats())
-        async def maintain_architecture_diagrams():
+            await cleanup_completed(store, limit=6)
+        chat_cleanup = asyncio.create_task(Maintenance('codex-chats', cleanup_codex_chats).maintain(60),
+                                          name='codex-chat-maintenance')
+        async def start_architecture_diagrams():
             from .architecture_diagrams import start_pending
-            while True:
-                start_pending(engine)
-                await asyncio.sleep(5)
-        diagram_maintenance = asyncio.create_task(maintain_architecture_diagrams())
+            start_pending(engine)
+        diagram_maintenance = asyncio.create_task(Maintenance('architecture-diagrams', start_architecture_diagrams).maintain(5),
+                                                 name='architecture-diagram-maintenance')
+        from .execution_continuation import Continuations
+        continuations = asyncio.create_task(Continuations(engine).maintain(), name='checkpoint-continuations')
         try:
             yield
         finally:
             maintenance.cancel()
             chat_cleanup.cancel()
             diagram_maintenance.cancel()
-            await asyncio.gather(maintenance, chat_cleanup, diagram_maintenance, return_exceptions=True)
+            continuations.cancel()
+            await asyncio.gather(maintenance, chat_cleanup, diagram_maintenance, continuations, return_exceptions=True)
             await run_controls.close()
             await engine.shutdown()
 
@@ -357,6 +355,11 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
     app.state.store, app.state.engine = store, engine
     app.state.task_runtime = task_runtime
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
+
+    @app.exception_handler(TaskRuntimeUnavailable)
+    async def unavailable_research_runtime(request: Request, exc: TaskRuntimeUnavailable):
+        return JSONResponse({'detail': '研究执行通道不可用；请核对任务和原操作回执，原请求不会自动重发。',
+                             'operation_outcome': 'unconfirmed'}, status_code=503)
     allowed_origins = ['http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:8000', 'http://127.0.0.1:8000']
     app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=['GET', 'POST', 'PUT', 'DELETE'], allow_headers=['Content-Type'])
 
@@ -390,6 +393,12 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         return intelligence_factory(store, get_settings(store))
 
     register_run_controls(app, run_controls, task_runtime, require_run)
+    from .document_efficiency_recovery import register as register_document_efficiency
+    register_document_efficiency(app, engine, require_run)
+    from .task_restart import register as register_failed_task_restarts
+    register_failed_task_restarts(app, engine, task_runtime, require_run)
+    from .architecture_review_budget import register as register_architecture_review_budget
+    register_architecture_review_budget(app, engine, task_runtime, require_run)
 
     def diagnostic_secrets():
         providers = get_settings(store).get('providers', [])
@@ -410,7 +419,8 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         from .innovation_policy import VERSION as novelty_scope_policy
         return {'status': 'ok', 'version': '0.1.0', 'time': now(), 'context_compiler': 3, 'layered_literature_memory': 1,
                 'request_execution': {'data_loop': 'http', 'control_loop': 'research-control',
-                    'control_loop_running': task_runtime.loop is not None,
+                    'control_loop_running': bool(task_runtime.loop and task_runtime.loop.is_running()
+                                                 and not task_runtime._closed),
                     'reading_projection': 'isolated_process', 'research_workers': 1},
                 'novelty_evidence_recovery': 2, 'novelty_scope_policy': novelty_scope_policy,
                 'context_navigation': 1,
@@ -706,13 +716,26 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         return run_summary(run_id)
 
     @app.get('/api/runs/{run_id}/summary')
-    def run_summary(run_id: str):
+    def run_summary(run_id: str, include_billing: bool = True):
         from . import run_views
         require_run(run_id)
-        value = run_views.summary(engine, run_id)
+        value = run_views.summary(engine, run_id, include_billing=include_billing)
         value['moderation_reviews'] = moderation_reviews_view(store, run_id,
             run_views.legacy_moderation_receipts(store, run_id), secrets=diagnostic_secrets())
         return value
+
+    @app.get('/api/runs/{run_id}/billing-summary')
+    def run_billing_summary(run_id: str):
+        from .billing_projection import summary
+        require_run(run_id)
+        return summary(store, run_id)
+
+    @app.get('/api/runs/{run_id}/optimization-progress')
+    def optimization_progress(run_id: str):
+        from .optimization_loop import view
+        require_run(run_id)
+        with store.read_snapshot() as snapshot:
+            return view(snapshot, snapshot.get('runs', run_id))
 
     @app.get('/api/runs/{run_id}/views/{section}')
     def run_view(run_id: str, section: str):
@@ -832,12 +855,12 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
             raise HTTPException(409, str(exc)) from exc
 
     @app.get('/api/runs/{run_id}/stages/{stage}')
-    def run_stage(run_id: str, stage: str):
+    def run_stage(run_id: str, stage: str, include_progress: bool = True):
         from . import run_views
         require_run(run_id)
         if stage not in STAGES:
             raise HTTPException(404, 'Unknown research stage')
-        return run_views.stage(engine, run_id, stage, intelligence=intelligence,
+        return run_views.stage(engine, run_id, stage, intelligence=intelligence, include_progress=include_progress,
             local_codex=lambda: _diagnostic_redaction(local_codex_view(engine, run_id), diagnostic_secrets()))
 
     @app.get('/api/runs/{run_id}/architecture-adjustments/{revision_id}')
@@ -917,32 +940,6 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         return {key: record[key] for key in ('id', 'sha256', 'status', 'active_role', 'votes', 'issues',
             'created_at', 'completed_at', 'adopted', 'scientific_approval', 'execution_authorized') if key in record}
 
-    @app.post('/api/runs/{run_id}/implementation-source-supplement')
-    @task_runtime.control
-    async def implementation_source_supplement(run_id: str, payload: dict = Body(...)):
-        require_run(run_id)
-        from .implementation_source_supplement import prepare
-        if set(payload) != {'source_handoff_id', 'document_refs', 'supplement_id'}:
-            raise HTTPException(422, 'Expected source_handoff_id, document_refs and supplement_id')
-        try:
-            async with engine._lifecycle_lock:
-                return await _implementation_control_thread(prepare, engine, run_id, **payload)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post('/api/runs/{run_id}/implementation-source-supplement/repair')
-    @task_runtime.control
-    async def implementation_source_supplement_repair(run_id: str, payload: dict = Body(...)):
-        require_run(run_id)
-        from .implementation_supplement_repair import prepare
-        if set(payload) != {'record_id', 'expected_sha256', 'replacements'}:
-            raise HTTPException(422, 'Expected original review identity and exact unit replacements')
-        try:
-            async with engine._lifecycle_lock:
-                return await _implementation_control_thread(prepare, engine, run_id, **payload)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
     @app.post('/api/runs/{run_id}/implementation-verification')
     @task_runtime.control
     async def implementation_verification_prepare(run_id: str, payload: dict):
@@ -966,30 +963,6 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
                 'receipts': engine.store.list(RECEIPTS, run_id),
                 'definition_requests': engine.store.list('implementation_definition_requests', run_id)}
 
-    @app.get('/api/runs/{run_id}/implementation-code-recovery-preview')
-    @task_runtime.control
-    async def implementation_code_recovery_preview(run_id: str, workflow_id: str):
-        require_run(run_id)
-        from .implementation_code_recovery import preview
-        try:
-            async with engine._lifecycle_lock:
-                return await _implementation_control_thread(preview, engine, run_id, workflow_id)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
-    @app.post('/api/runs/{run_id}/implementation-code-recovery')
-    @task_runtime.control
-    async def implementation_code_recovery(run_id: str, payload: dict):
-        require_run(run_id)
-        if set(payload) != {'expect_sha', 'workflow_id'}:
-            raise HTTPException(422, 'Recovery requires workflow identity and preview SHA')
-        from .implementation_code_recovery import restore
-        try:
-            async with engine._lifecycle_lock:
-                return await _implementation_control_thread(restore, engine, run_id, **payload)
-        except (ValueError, RuntimeError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-
     @app.get('/api/runs/{run_id}/dataset-transition')
     @task_runtime.control
     async def dataset_transition_preview(run_id: str, targets: str):
@@ -1005,7 +978,7 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
     @task_runtime.control
     async def dataset_transition_prepare(run_id: str, payload: dict):
         require_run(run_id)
-        if set(payload) != {'snapshot_id', 'targets', 'instruction'}:
+        if set(payload) not in ({'snapshot_id', 'targets', 'instruction'}, {'snapshot_id', 'targets', 'instruction', 'paper_reference'}):
             raise HTTPException(422, 'Expected snapshot_id, targets and operator instruction')
         from .dataset_transition import prepare
         try:
@@ -1042,6 +1015,21 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
                 await _implementation_control_thread(prepare, engine, run_id, payload['instruction'])
             return view(engine.store, run_id)
         except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/diagnostic-resource-review')
+    @task_runtime.control
+    async def diagnostic_resource_review(run_id: str, payload: dict):
+        require_run(run_id)
+        if set(payload) != {'instruction', 'required_disk_control', 'expected_checks_sha256'}:
+            raise HTTPException(422, 'Expected the reviewed candidate digest, original disk requirement and operator instruction')
+        from .diagnostic_resources import register
+        from .engine import ResearchBlocked
+        try:
+            async with engine._lifecycle_lock:
+                record = await _implementation_control_thread(register, engine, run_id, **payload)
+            return {'id': record['id'], 'sha256': record['sha256'], 'execution_authorized': False}
+        except (ValueError, ResearchBlocked) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @app.post('/api/runs/{run_id}/experiment-attempt-policy')
@@ -1098,14 +1086,149 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post('/api/runs/{run_id}/validation-row-identity-authorization')
+    @task_runtime.control
+    async def validation_row_identity_authorization(run_id: str,payload: dict):
+        require_run(run_id)
+        from . import dataset_row_identity as rows
+        files = payload.get('files')
+        proposal = payload.get('proposal_sha256')
+        if (set(payload)-{'format','files','proposal_sha256'} or payload.get('format')!=rows.FORMAT
+                or not isinstance(files,list) or not 1<=len(files)<=64
+                or any(not isinstance(f,dict) or set(f)!={'asset_id','manifest_sha256','trial_path','sha256'}
+                       or not all(isinstance(v,str) and v for v in f.values()) for f in files)
+                or proposal is not None and (not isinstance(proposal,str) or not re.fullmatch('[0-9a-f]{64}',proposal))):
+            raise HTTPException(422,'Expected the selected CSV format and exact registered file identities')
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(rows.authorize,engine,run_id,proposal,files)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/implementation-fixture-verification')
+    @task_runtime.control
+    async def implementation_fixture_verification(run_id: str,payload: dict):
+        require_run(run_id)
+        from .implementation_fixture import authorize
+        if (set(payload)!={'document_sha256','requirement_ids','instruction','catalog_path','catalog_scope','catalog_prefixes'}
+                or not isinstance(payload['catalog_prefixes'],list) or not 1<=len(payload['catalog_prefixes'])<=64
+                or not all(isinstance(v,str) and 0<len(v)<=512 for v in payload['catalog_prefixes'])
+                or not all(isinstance(payload[k],str) and 0<len(payload[k])<=1024 for k in ('catalog_path','catalog_scope'))
+                or not isinstance(payload['document_sha256'],str) or not re.fullmatch('[0-9a-f]{64}',payload['document_sha256'])
+                or not isinstance(payload['requirement_ids'],list) or not all(isinstance(i,str) for i in payload['requirement_ids'])
+                or not isinstance(payload['instruction'],str) or not 1<=len(payload['instruction'].strip())<=4000):
+            raise HTTPException(422,'Expected approved document, exact requirement IDs and bounded CPU fixture scope')
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(authorize,engine,run_id,**payload)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/validation-code-repair')
+    @task_runtime.control
+    async def validation_code_repair(run_id: str, payload: dict):
+        from .validation_repair import register
+        require_run(run_id)
+        instruction = payload.get('instruction')
+        if set(payload) != {'instruction'} or not isinstance(instruction,str) or not 1 <= len(instruction.strip()) <= 4000:
+            raise HTTPException(422,'请提供本次验证失败的修改要求。')
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(register, engine, run_id, instruction.strip())
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/implementation-document-revision')
+    @task_runtime.control
+    async def implementation_document_revision(run_id: str,payload: dict):
+        require_run(run_id)
+        from .implementation_document_revision import admit
+        if (set(payload)!={'spec_hash','delivery_hash','instruction'}
+                or not all(isinstance(payload[k],str) and re.fullmatch('[0-9a-f]{64}',payload[k])
+                           for k in ('spec_hash','delivery_hash'))
+                or not isinstance(payload['instruction'],str) or not 1<=len(payload['instruction'].strip())<=4000):
+            raise HTTPException(422,'Expected the reviewed document, rejected delivery and operator scope')
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(admit,engine,run_id,**payload)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/implementation-document-code-cycle')
+    @task_runtime.control
+    async def implementation_document_code_cycle(run_id: str):
+        require_run(run_id)
+        from .implementation_cycle_transition import switch
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(switch,engine,run_id)
+        except (ValueError,RuntimeError) as exc:
+            raise HTTPException(409,str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/definition-asset-interface-proposal')
+    @task_runtime.control
+    async def definition_asset_interface_proposal(run_id: str, payload: dict):
+        require_run(run_id)
+        if (set(payload) != {'definition_id', 'proposal'} or not isinstance(payload['definition_id'], str)
+                or not re.fullmatch('[0-9a-f]{64}', payload['definition_id'])
+                or not isinstance(payload['proposal'], str) or not 1 <= len(payload['proposal'].strip()) <= 2000
+                or len(payload['proposal']) > 2000):
+            raise HTTPException(422, 'Expected the current definition ID and a bounded review proposal')
+        from .host_asset_definition_recovery import submit_proposal
+        try:
+            async with engine._lifecycle_lock:
+                return await _implementation_control_thread(submit_proposal, engine, run_id,
+                    payload['definition_id'], payload['proposal'])
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get('/api/runs/{run_id}/code-model-migration-preview')
+    @task_runtime.control
+    async def code_model_migration_preview(run_id: str,
+            target_model: str = Query(min_length=1, max_length=160, pattern=r'^[A-Za-z0-9._:/-]+$')):
+        require_run(run_id)
+        from .code_model_migration import preview
+        try:
+            async with engine._lifecycle_lock:
+                result = await _implementation_control_thread(preview, engine, run_id, target_model)
+                await check_worker_model_available(target_model, result['reasoning_effort'])
+                return result
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post('/api/runs/{run_id}/code-model-migration')
+    @task_runtime.control
+    async def code_model_migration(run_id: str, payload: dict):
+        require_run(run_id)
+        fields = {'target_model', 'expect_sha', 'idempotency_key', 'reason'}
+        if (set(payload) != fields or any(not isinstance(payload[k], str) or not payload[k].strip() for k in fields)
+                or len(payload['target_model']) > 160 or len(payload['idempotency_key']) > 128
+                or len(payload['reason']) > 2000 or not re.fullmatch('[0-9a-f]{64}', payload['expect_sha'])):
+            raise HTTPException(422, '模型迁移需要目标模型、原预览 SHA、幂等键和明确要求。')
+        from .code_model_migration import preview, apply, replay
+        try:
+            async with engine._lifecycle_lock:
+                previous = await _implementation_control_thread(replay, engine, run_id, **payload)
+                if previous is not None:
+                    return previous
+                proposed = await _implementation_control_thread(preview, engine, run_id, payload['target_model'])
+                await check_worker_model_available(payload['target_model'], proposed['reasoning_effort'])
+                return await _implementation_control_thread(apply, engine, run_id, **payload)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.get('/api/runs/{run_id}/implementation-restart-preview')
     @task_runtime.control
-    async def implementation_restart_preview(run_id: str):
+    async def implementation_restart_preview(run_id: str, full_stage_cleanup: bool = False,
+                                             before_codex: bool = False, before_document: bool = False):
         require_run(run_id)
+        if sum((full_stage_cleanup, before_codex, before_document)) > 1:
+            raise HTTPException(422, 'Select one restart point')
         from .implementation_restart import preview
         try:
             async with engine._lifecycle_lock:
-                return await _implementation_control_thread(preview, engine, run_id)
+                return await _implementation_control_thread(preview, engine, run_id,
+                    full_stage_cleanup=full_stage_cleanup, before_codex=before_codex, before_document=before_document)
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
@@ -1113,17 +1236,28 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
     @task_runtime.control
     async def implementation_restart(run_id: str, payload: dict):
         require_run(run_id)
-        if set(payload) != {'expect_sha', 'idempotency_key'}:
+        modes = {'full_stage_cleanup', 'before_codex', 'before_document'}
+        if (not {'expect_sha', 'idempotency_key'} <= set(payload)
+                or set(payload) - {'expect_sha', 'idempotency_key'} - modes
+                or any(type(payload.get(flag, False)) is not bool for flag in modes)
+                or sum(payload.get(flag, False) for flag in modes) > 1):
             raise HTTPException(422, 'Restart requires the bound preview SHA and idempotency key')
-        from .implementation_restart import restart
+        from .implementation_restart import COLLECTION, _sha, pending_cleanup, restart
         try:
             async with engine._lifecycle_lock:
+                if (payload.get('before_codex') or payload.get('before_document')) and isinstance(payload['idempotency_key'], str):
+                    from .pre_codex_restart import observe, MODE, AUTHOR_MODE
+                    identity = f"{run_id}:implementation-restart:{_sha(payload['idempotency_key'])}"
+                    if not store.get(COLLECTION, identity) and not await _implementation_control_thread(
+                            pending_cleanup, engine, run_id):
+                        payload['native_observations'] = await observe(engine, run_id,
+                            mode=AUTHOR_MODE if payload.get('before_document') else MODE)
                 receipt = await _implementation_control_thread(restart, engine, run_id, **payload)
             return {key: receipt[key] for key in ('id', 'run_id', 'cycle', 'generation',
                 'graph_thread_id', 'archive_path', 'archive_sha256', 'archived_workflow_ids',
                 'paid_evidence_retained', 'target_config', 'removed_config_fields',
-                'archived_implementation_handoff_ids', 'archived_implementation_artifact_ids',
-                'scientific_approval', 'execution_authorized')
+                'archived_implementation_handoff_ids', 'archived_implementation_artifact_ids', 'stage_cleanup',
+                'mode', 'source_workflow_id', 'specification_sha256', 'scientific_approval', 'execution_authorized')
                 if key in receipt}
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1317,7 +1451,7 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         if run['status'] == 'running':
             raise HTTPException(409, 'Pause before changing task limits')
         if RETIRED_IMPLEMENTATION_REVIEW_FIELDS.intersection(payload):
-            raise HTTPException(422, '实现文档分章节与批量派发配置已退役；仅支持三方整篇审查。')
+            raise HTTPException(422, '旧实现审查配置已退役，请使用文档与代码审核流程。')
         if run.get('state', {}).get('implementation_restart'):
             from .implementation_restart import TARGET_CONFIG
             clock_fields = {'implementation_review_max_seconds', 'implementation_review_max_calls',
@@ -1326,15 +1460,14 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
                    and not (key in clock_fields and type(payload[key]) is type(run['config'].get(key))
                             and payload[key] == run['config'].get(key))
                    for key, value in TARGET_CONFIG.items()):
-                raise HTTPException(409, '本次实现重开已绑定新的全文审核配置；不能重新启用旧阶段限制。')
+                raise HTTPException(409, '本次实现重开已绑定审核配置；不能重新启用旧阶段限制。')
         codex_fields = {'implementation_backend', 'codex_project_dir', 'codex_model', 'codex_reasoning_effort'}
         if 'ccf_ab_only' in payload and payload['ccf_ab_only'] != run['config'].get('ccf_ab_only', False):
             if engine.outputs(run_id).get('literature'):
                 raise HTTPException(409, '文献分析已完成，请新建研究使用不同文献范围，避免沿用不符合新范围的共识。')
         review_fields = {'implementation_review_max_revisions',
                          'implementation_review_max_seconds', 'implementation_review_max_calls',
-                         'implementation_review_time_basis', 'implementation_review_strategy',
-                         'implementation_indexed_review_protocol'}
+                         'implementation_review_time_basis', 'implementation_review_strategy'}
         if any(k not in {'budget_usd', 'max_calls', 'max_rounds', 'discussion_mode', 'stagnation_rounds', 'max_trials', 'max_research_cycles', 'architecture_max_revisions', 'architecture_stagnation_rounds', 'min_relative_improvement', 'experiment_timeout', 'context_tokens', 'skip_unavailable_papers', 'ccf_ab_only', 'allow_local_execution', 'execution_mode', 'python_executable', 'gpu_index', 'vram_limit_gb', 'cpu_limit_cores', 'ram_limit_gb', 'disk_limit_gb', 'codex_timeout_seconds', 'codex_max_revisions', *codex_fields, *review_fields} for k in payload):
             raise HTTPException(422, 'Only execution limits can be changed after task creation')
         generation = run.get('state', {}).get('implementation_generation')
@@ -1345,9 +1478,6 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
                 parameters=(generation,) if generation else (), limit=1))
         if frozen and any(key in payload and payload[key] != run['config'].get(key) for key in review_fields):
             raise HTTPException(409, '验收协议与预算已冻结；不能在审核中更改标准或重置预算。')
-        if (frozen and 'implementation_indexed_review_protocol' in payload
-                and payload['implementation_indexed_review_protocol'] != run['config'].get('implementation_indexed_review_protocol')):
-            raise HTTPException(409, '旧实现输入已冻结；须通过实现重开入口启用索引式全文审核。')
         compute_defaults = {'python_executable': '', 'gpu_index': None, 'vram_limit_gb': None, 'execution_mode': 'local',
                             'cpu_limit_cores': None, 'ram_limit_gb': None, 'disk_limit_gb': None}
         if (frozen or store.count('experiments', run_id)) and any(
@@ -1360,12 +1490,18 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         try:
             validation = {k: v for k, v in updated.items() if k in RunCreate.model_fields and k != 'objective'}
             historical_strategy = ('implementation_review_strategy' not in payload
-                and updated.get('implementation_review_strategy') in {'chapter_issue', 'consolidated', 'segmented'})
+                and updated.get('implementation_review_strategy') in {'whole_alignment','acceptance_contract','chapter_issue','consolidated','segmented'})
             if historical_strategy:
-                validation['implementation_review_strategy'] = 'whole_alignment'
+                validation['implementation_review_strategy'] = 'document_code'
             validated = RunCreate(objective=run['objective'], **validation).model_dump()
-            updated.update({k: validated[k] for k in updated if k in validated
+            # Validate the complete configuration, but apply only requested
+            # changes. Normalizing an untouched 0 to 0.0 changes frozen hashes.
+            updated.update({k: validated[k] for k in payload if k in validated
+                and validated[k] != run['config'].get(k)
                 and not (historical_strategy and k == 'implementation_review_strategy')})
+            for k in payload:
+                if k in run['config'] and k in validated and validated[k] == run['config'][k]:
+                    updated[k] = run['config'][k]
         except Exception:
             raise HTTPException(422, 'Invalid task limits')
         if 'architecture_max_revisions' in payload or 'architecture_stagnation_rounds' in payload:
@@ -1432,12 +1568,28 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         except (ValueError, ProviderError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
+    @app.post('/api/runs/{run_id}/bayesian-search')
+    @task_runtime.control
+    async def start_bayesian_search(run_id: str, payload: dict):
+        from .bayesian_batch import cli_request
+        from .engine import ResearchBlocked
+        require_run(run_id)
+        try:
+            result = await asyncio.to_thread(cli_request, engine, run_id, payload)
+            if result['run_status'] == 'paused' and result['status'] != 'completed':
+                await engine.start(run_id)
+            return result
+        except (ValueError, ResearchBlocked) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post('/api/runs/{run_id}/{action}')
     @task_runtime.control
     async def action(run_id: str, action: str):
         require_run(run_id)
         try:
             if action in {'start', 'resume'}:
+                from .implementation_restart import require_no_pending_cleanup
+                await _implementation_control_thread(require_no_pending_cleanup, engine, run_id)
                 return await engine.start(run_id)
             if action in {'pause', 'cancel'}:
                 return await engine.stop(run_id, cancel=action == 'cancel')
@@ -1823,6 +1975,13 @@ def create_app(data_dir=DATA_DIR, intelligence_factory=Intelligence):
         from .billing_projection import page
         return _diagnostic_redaction(page(store, run_id or None, offset=offset, limit=limit,
             native_offset=native_offset, native_limit=native_limit), diagnostic_secrets())
+
+    # Unknown API paths must not enter filesystem lookup. Besides returning
+    # HTML for API errors, Windows rejects URL identifiers containing colons.
+    @app.api_route('/api/{unmatched_path:path}',
+        methods=['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], include_in_schema=False)
+    def unknown_api_path(unmatched_path: str):
+        raise HTTPException(404, 'API route not found')
 
     dist = ROOT / 'frontend' / 'dist'
     if dist.exists():

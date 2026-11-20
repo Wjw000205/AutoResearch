@@ -39,6 +39,9 @@ def select(directory):
     if not manifest_path.is_file():
         return regular_files(root), None
     manifest = json.loads(io_path(manifest_path).read_text(encoding='utf-8'))
+    if isinstance(manifest, dict):
+        from .delivery_manifest_contract import validate
+        validate(manifest)
     declared = manifest.get('delivery_files') if isinstance(manifest, dict) else None
     if declared is None:
         if isinstance(manifest, dict) and manifest.get('code_layout') == 'modular':

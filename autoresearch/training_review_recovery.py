@@ -122,7 +122,7 @@ async def start(engine, run_id, snapshot_id):
         return await start_locked(engine, run_id, snapshot_id)
 
 
-async def start_locked(engine, run_id, snapshot_id):
+async def start_locked(engine, run_id, snapshot_id, *, automatic=False):
     from .config import get_settings
     run = engine.store.get('runs', run_id)
     existing = current(engine, run_id)
@@ -158,6 +158,10 @@ async def start_locked(engine, run_id, snapshot_id):
     old = engine.store.get(COLLECTION, identifier)
     if old and old.get('status') == 'completed':
         return view(engine, run_id)  # No new model calls on repeated confirmation.
+    from .execution_continuation import COLLECTION as INTENTS, running_intent, authorize_generation
+    prior_intent = engine.store.get(INTENTS, run_id)
+    if automatic:
+        authorize_generation(engine.store, run_id, generation)
     owner = {'owner_pid': os.getpid(), 'owner_started': psutil.Process().create_time(),
              'owner_instance': engine.instance_id}
     def acquire(lease):
@@ -175,6 +179,7 @@ async def start_locked(engine, run_id, snapshot_id):
     engine.cancellations[run_id] = asyncio.Event()
     try:
         engine.store.batch([
+            (INTENTS, run_id, running_intent(engine.store, run_id, source='training_review_start')),
             (COLLECTION, identifier, record), ('operator_resumes', generation['id'], generation),
             ('runs', run_id, {**run, 'status': 'running', 'error': None, **owner, 'updated_at': now(),
                 'state': {**run.get('state', {}), 'training_review_recovery': identifier,
@@ -186,8 +191,10 @@ async def start_locked(engine, run_id, snapshot_id):
             work.close()
             raise
     except BaseException:
-        engine.store.batch([('runs', run_id, run)] + ([(COLLECTION, identifier, old)] if old else []),
-            [('operator_resumes', generation['id'])] + ([] if old else [(COLLECTION, identifier)]))
+        engine.store.batch([('runs', run_id, run)] + ([(COLLECTION, identifier, old)] if old else [])
+            + ([(INTENTS, run_id, prior_intent)] if prior_intent else []),
+            [('operator_resumes', generation['id'])] + ([] if old else [(COLLECTION, identifier)])
+            + ([] if prior_intent else [(INTENTS, run_id)]))
         _release(engine, run_id)
         engine.cancellations.pop(run_id, None)
         raise
@@ -198,6 +205,9 @@ async def start_locked(engine, run_id, snapshot_id):
 
 
 def _release(engine, run_id):
+    from .run_interruption import draining
+    if draining(engine.store, run_id):
+        return
     engine.store.mutate('runtime', 'worker', lambda lease:
         {**lease, 'held': False} if lease and lease.get('run_id') == run_id
         and lease.get('owner_instance') == engine.instance_id else lease or {'id': 'worker', 'held': False})
@@ -241,5 +251,15 @@ async def _work(engine, run_id, identifier, intelligence):
         engine.store.put(COLLECTION, identifier, record)
         engine.update_run(run_id, status='blocked', error=error)
         engine.store.event(run_id, 'training.review_recovery_blocked', error, {'recovery_id': identifier})
+        from .intelligence import ProviderError, BudgetExceeded, PolicyReviewRequired
+        if isinstance(exc, ProviderError) and not isinstance(exc, (BudgetExceeded, PolicyReviewRequired)):
+            from .async_ownership import to_thread as owned_to_thread
+            from .execution_continuation import wait_for_native_receipt
+            try:
+                await owned_to_thread(wait_for_native_receipt, engine, intelligence, run_id)
+            except Exception as continuation_error:
+                engine.store.event(run_id, 'run.auto_continuation_unavailable',
+                    '未能保存复核任务的自动回读安排；原错误与回执保留。',
+                    {'error_type': type(continuation_error).__name__})
     finally:
         _release(engine, run_id)

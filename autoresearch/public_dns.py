@@ -5,7 +5,11 @@ import ipaddress
 
 import httpx
 
-TUN_RANGES = (ipaddress.ip_network('198.18.0.0/15'), ipaddress.ip_network('fdfe:dcba:9876::/48'))
+# Proxies can pair IPv4 benchmarking addresses with IPv6 benchmarking or
+# private synthetic addresses. Recognition only enables verified public DNS;
+# none of these addresses is ever admitted as a paper connection target.
+TUN_RANGES = (ipaddress.ip_network('198.18.0.0/15'), ipaddress.ip_network('2001:2::/48'),
+              ipaddress.ip_network('fdfe:dcba:9876::/48'))
 
 
 def synthetic_answers(host, addresses):

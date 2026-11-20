@@ -97,9 +97,13 @@ def write_arguments_schema(spec_schema):
          'required': ['patch', 'base_spec_hash']}]}
 
 
-def edit_arguments_schema(context=None):
+def edit_arguments_schema(context=None, *, definition_append=False):
     """Exact-base patch only; reuse the existing bounded JSON Pointer schema."""
     patch = write_arguments_schema({})['oneOf'][1]['properties']['patch']
+    if definition_append:
+        change = patch['items']['oneOf'][0]
+        change['properties'].update(path={'const':'/algorithm'}, value={'type':'string'})
+        patch['items'] = change
     sha = {'type': 'string', 'pattern': '^[0-9a-f]{64}$'}
     result = {'type': 'object', 'additionalProperties': False, 'properties': {
         'document_id': {'type': 'string', 'minLength': 1},
@@ -121,6 +125,9 @@ def edit_arguments_schema(context=None):
                         'required': ['before', 'after']}}},
             'required': ['index_id'], 'oneOf': [{'required': ['value']}, {'required': ['text_replacements']}]}}
     from .implementation_acceptance_author import enabled as batch_enabled, plan_schema
+    if definition_append:
+        fields = indexed['properties']['revisions']['items']['properties']
+        fields.update(index_id={'const':'algorithm'}, value={'type':'string'})
     if batch_enabled(context or {}):
         indexed['properties']['revisions']['minItems'] = 0
         indexed['properties']['revision_plan'] = plan_schema()
@@ -144,9 +151,12 @@ def edit_context(context):
         return context
     from .implementation_authoring_preservation import EDIT_EXPECTED_SHA256_CONTRACT
     from .implementation_document_locator import PROTOCOL
+    from .implementation_protocol_contracts import author_task
     return {**context, EDIT_PROTOCOL: EDIT_VERSION, PROTOCOL: 1,
-        'implementation_document_preservation': EDIT_TASK,
+        'implementation_document_preservation': author_task({**context, EDIT_PROTOCOL: EDIT_VERSION}),
         'implementation_document_base': {**context['implementation_document_base'],
+            **({'patch_contract':'仅编辑 /algorithm；保留批准版本的逐字前缀，在末尾补充工程定义。'}
+               if context.get('implementation_definition_repair_protocol') == 1 else {}),
             'locate_tool': 'implementation.locate_document',
             'expected_sha256_contract': EDIT_EXPECTED_SHA256_CONTRACT}}
 
@@ -541,6 +551,10 @@ def scoped_context(engine, run_id, role, handoff_id, context):
         context = {**context, 'implementation_document_base_error': {'code': exc.code, 'error': str(exc)}}
     context = {**context, 'implementation_document_base': base,
                'implementation_document_preservation': EDIT_TASK if editing_enabled(context) else PRESERVATION_TASK}
+    from .implementation_acceptance import enabled as acceptance_enabled
+    if acceptance_enabled(context):
+        from .implementation_protocol_contracts import author_task
+        context['implementation_document_preservation'] = author_task(context)
     if base_row:
         from .implementation_self_check import project as self_check_project, KEY as SELF_CHECK
         checks = self_check_project(engine, run_id, handoff_id, frozen_context, base_row)
@@ -572,8 +586,8 @@ def scoped_context(engine, run_id, role, handoff_id, context):
     if not record:
         return {**context, 'indexed_documents': list(directories.values())}
     if frozen_context.get('implementation_definition_repair_protocol') == 1:
-        from .implementation_definition_repair import addition_ref
-        context['definition_addition'] = addition_ref(engine, run_id, state, record['row'])
+        from .implementation_definition_repair import addition_context
+        context.update(addition_context(engine, run_id, state, record['row']))
     for version in record['versions']:
         doc = documents.document_index.directory(engine, run_id, version['document_id'], version['document_sha256'])
         directories[doc['document_id']] = doc
@@ -582,7 +596,7 @@ def scoped_context(engine, run_id, role, handoff_id, context):
 
 
 @operation
-def _prepare_submission(engine, run_id, state, handoff_id, result):
+def _prepare_submission(engine, run_id, state, handoff_id, result, *, _selection_checked=False):
     """A final pointer cannot fabricate a saved document or an audit approval."""
     from .engine import ResearchBlocked
     assignment, frozen_context, bound_state, _ = _assignment(engine, run_id, 'engineer', handoff_id)
@@ -635,21 +649,67 @@ def _prepare_submission(engine, run_id, state, handoff_id, result):
         if record.get('acceptance_patch_submission') not in (None, result):
             raise ResearchBlocked('工程师已提交的验收问题回应发生变化。')
         record['acceptance_patch_submission'] = copy.deepcopy(result)
+    selection_guards = []
+    if acceptance.enabled(frozen_context) and not _selection_checked:
+        from .implementation_acceptance_author import submission_selection
+        selection, selection_guards = submission_selection(engine, run_id, state, handoff_id, result, record)
+        if selection:
+            record['acceptance_parent_selection'] = selection
     return {'record': record, 'row': row, 'guards': guards, 'configuration': configuration,
+        'selection_guards':selection_guards,
         'workflow_guard': workflow_guard}
 
 
 def _commit_submission(engine, run_id, handoff_id, prepared):
     from .engine import ResearchBlocked
-    workflow = engine.store.get('codex_workflows', prepared['workflow_guard']['id'], {})
-    if (any(engine.store.get(collection, handoff_id) != value for collection, value in prepared['guards'].items())
-            or engine.store.get('runs', run_id, {}).get('config') != prepared['configuration']
-            or any(workflow.get(key) != value for key, value in prepared['workflow_guard'].items())):
-        raise ResearchBlocked('工程师提交核验期间原冻结输入、读取、交付或配置已改变，未提交新版本。')
-    record = prepared['record']
-    if record['status'] != 'submitted':
-        record.update(status='submitted', updated_at=now())
-        engine.store.put(COLLECTION, handoff_id, record)
+    from .implementation_review_clock import _get, _put
+    selection = prepared['record'].get('acceptance_parent_selection')
+    if selection:
+        engine.check_active(run_id)
+    # Check and publish in one transaction. In particular, a new child edge or
+    # tool invocation after read-only preparation must not race parent selection.
+    with engine.store._db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        run = _get(db, 'runs', run_id, {})
+        workflow = _get(db, 'codex_workflows', prepared['workflow_guard']['id'], {})
+        if selection:
+            from .implementation_acceptance_author import _canonical_source, digest
+            cid = selection['child_id']
+            # CAS records can be sampled after semantic validation. Bind this
+            # transaction to the sealed selection too, so a later raw snapshot
+            # cannot admit unvalidated child work. Keep the same canonical
+            # projection used by selection/replay; raw CAS still guards all
+            # observational fields separately below.
+            if any(digest(_canonical_source(col, _get(db, col, cid))) != checksum
+                   for col, checksum in selection['child_records_sha256'].items()):
+                raise ResearchBlocked('原父提交选择核验期间续接记录已改变，未提交新版本。')
+            work = db.execute("SELECT 1 FROM records INDEXED BY records_run WHERE "
+                "collection='tool_invocations' AND json_extract(data,'$.run_id')=? "
+                "AND json_extract(data,'$.handoff_id')=? LIMIT 1", (run_id, cid)).fetchone()
+            work = work or db.execute("SELECT 1 FROM records INDEXED BY records_run WHERE "
+                "collection='stage_contexts' AND json_extract(data,'$.run_id')=? AND "
+                "(key=? OR json_extract(data,'$.payload.source.handoffs.id')=? OR "
+                "json_extract(data,'$.source_handoff_id')=?) LIMIT 1",
+                (run_id, cid + ':acceptance-author-continuation', cid, cid)).fetchone()
+            commit_ids = {r[0] for r in db.execute(
+                "SELECT key FROM records INDEXED BY records_run WHERE collection='context_commits' "
+                "AND json_extract(data,'$.run_id')=? AND json_extract(data,'$.handoff_id')=?",
+                (run_id, cid))}
+            expected_commits = {r['id'] for r in selection.get('context_records_sha256', [])
+                                if r['collection'] == 'context_commits'}
+            work = work or commit_ids != expected_commits
+            if run.get('status') != 'running' or work:
+                raise ResearchBlocked('原父提交选择核验期间运行状态改变或续接出现新工作，未提交新版本。')
+        if (any(_get(db, collection, handoff_id) != value for collection, value in prepared['guards'].items())
+                or any(_get(db, collection, key) != value
+                       for collection, key, value in prepared.get('selection_guards', []))
+                or run.get('config') != prepared['configuration']
+                or any(workflow.get(key) != value for key, value in prepared['workflow_guard'].items())):
+            raise ResearchBlocked('工程师提交核验期间原冻结输入、读取、交付或配置已改变，未提交新版本。')
+        record = prepared['record']
+        if record['status'] != 'submitted':
+            record = {**record, 'status':'submitted', 'updated_at':now()}
+            _put(engine.store, db, COLLECTION, handoff_id, record, record['updated_at'])
     return prepared['row']
 
 

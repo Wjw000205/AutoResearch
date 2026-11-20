@@ -13,7 +13,7 @@ from jsonschema import ValidationError
 
 from .prose_schema import validate
 
-from .experiment_workflow import sha, encoded, validation_records, ledger
+from .experiment_workflow import sha, encoded, validation_records, ledger, ledger_and_searches
 from .performance_policy import assessment_context
 from .storage import now
 from .research_iteration import limit as research_cycle_limit
@@ -76,6 +76,10 @@ base_unit_id 必须是 /units 中 complete 且 /comparisons 中 comparable 的�
 rapid_revision.status=diagnostic_checked 仅说明候选补修通过 CPU 检查，activation_scope=candidate_only；旧训练日志没有因此增加观测，不能声称修复已在真实训练中生效。'''
 
 
+from .experiment_configuration import TUNING_GUIDANCE as YAML_CONFIGURATION_GUIDANCE
+GUIDANCE += '\n' + YAML_CONFIGURATION_GUIDANCE
+
+
 def enabled(engine, run_id):
     return (engine.store.get('runs', run_id) or {}).get('mode') == 'live'
 
@@ -95,7 +99,9 @@ def _binding(engine, run_id):
         bundle = validate_program(engine, run_id, basis['program'])
     elif basis['program'].get('implementation_backend') == 'local_codex':
         from .codex_workflow import validate_program
-        bundle = validate_program(engine, run_id, basis['program'])
+        # Bind the effective code for both batch planning and architecture assessment.
+        # Admission to launch a validation job belongs to Engine._trial.
+        bundle = validate_program(engine, run_id, basis['program'], source_only=True)
     basis['bundle'] = bundle
     from .performance_policy import current as performance_policy
     policy = performance_policy(engine.store, run_id)
@@ -125,7 +131,7 @@ def units(plan, transport=None):
             key = sha({v: {k: x for k, x in pair[v].items() if k not in {'seed', 'phase'}}
                        for v in ('baseline', 'proposed')})
             bucket = pairs.setdefault(key, [])
-            for variant in ('baseline', 'proposed'):
+            for variant in (('proposed',) if child.get('baseline_mode') == 'paper_reported' else ('baseline', 'proposed')):
                 p = {**pair[variant], 'phase': 'validation', 'seed': pair.get('seed', child['selection_seed'])}
                 bucket.append((by_params[sha(p)], p))
         for index, group in enumerate(pairs.values()):
@@ -171,10 +177,9 @@ def snapshot(engine, run_id, transport=None):
     metric, direction = effective(engine.store, run_id, basis['design'])
     rows = [r for r in validation_records(engine.store, run_id)
             if (r.get('research_cycle') or 1) == binding['cycle'] and not r.get('superseded')]
-    state = ledger(engine, run_id, plan=basis['plan'], rows=rows)
+    state, searches = ledger_and_searches(engine, run_id, plan=basis['plan'], rows=rows)
     by_name = {j['name']: j for j in state['jobs']}
-    from .parameter_search import catalog as search_catalog
-    catalog = units(basis['plan'], transport) + search_catalog(engine, run_id, basis['plan'])
+    catalog = units(basis['plan'], transport) + searches
     comparisons, diagnostics, manifests = {}, {}, []
     for row in rows:
         diagnostic = read_evidence(engine, run_id, row, metric=metric, direction=direction)
@@ -195,10 +200,16 @@ def snapshot(engine, run_id, transport=None):
             'baseline_score', 'proposed_score', 'relative_improvement', 'issues')}
         comparisons[unit['id']].update(comparable=comparable, task_id=unit['task_id'],
             full_seed_group=done, scope='Descriptive same-configuration paired validation; not final acceptance.')
+        if basis['plan'].get('baseline_mode') == 'paper_reported' and done and unit['kind'] in {'pilot','grid'}:
+            from .paper_baselines import own_validation
+            seeds = [p['seed'] for _,p in unit['jobs'] if p['variant']=='proposed']
+            comparisons[unit['id']].update(own_validation(summary,records,seeds),
+                scope='Local validation of our own model; external paper scores are excluded from selection.')
         manifests.append({k: unit[k] for k in ('id', 'kind', 'task_id')} | {
             'available': available, 'complete': done, 'jobs': [n for n, _ in unit['jobs']],
             **({'parameter_search': True} if unit['id'].startswith('search-') else {}),
             **({'parameter_grid': unit['parameter_grid']} if unit.get('parameter_grid') else {}),
+            **({k: unit[k] for k in ('bayesian_plan_sha256', 'admitted_trials')} if unit.get('bayesian_plan_sha256') else {}),
             'states': [h['state'] for h in heads], 'params_sha256': [sha(p) for _, p in unit['jobs']]})
     with engine.store._read_db() as db:
         attempts = db.execute("SELECT coalesce(sum(coalesce(json_extract(data,'$.attempt'),1)),0) FROM records "
@@ -207,8 +218,13 @@ def snapshot(engine, run_id, transport=None):
     run = engine.store.get('runs', run_id)
     from .experiment_analysis import freeze_sources
     sources = freeze_sources(engine, run_id, basis['program'], basis.get('bundle'))
-    from .rapid_experiment_revision import latest
+    from .rapid_experiment_revision import latest, _check_passed
     recent = latest(engine, run_id)
+    from .diagnostic_resources import request_for as diagnostic_resource_request
+    resource_request = diagnostic_resource_request(engine.store, recent) if recent else None
+    if (recent and recent['status'] == 'diagnostic_checked' and recent.get('check_measurement_protocol') == 1
+            and not _check_passed(engine, run_id, recent)):
+        raise ValueError('CPU observations no longer match the completed diagnostic receipt')
     from .rapid_continuation import effective_policy, trial_limit
     from .dataset_configuration_queue import context_view as configuration_queue
     from .experiment_attempt_policy import current as attempt_policy
@@ -217,14 +233,22 @@ def snapshot(engine, run_id, transport=None):
     investigation = collect(engine, run_id, _safe_rows(rows), diagnostics, basis['program'], metric, direction)
     from .dataset_optimization import context as optimization_context
     optimization = optimization_context(engine, run_id, binding)
+    from .architecture_validation_comparison import comparison as revision_comparison
     evidence = {'binding': binding, 'ledger': state, 'units': manifests,
+        **({'revision_comparison': revision_comparison(engine.store, run_id, basis['program'], binding, rows)}
+           if basis['program'].get('revision_comparison_protocol') == 1 else {}),
+        **({'revision_documents': basis['program']['revision_documents']} if basis['program'].get('revision_documents') else {}),
+        **({'baseline_mode':'paper_reported','paper_reference':basis['plan']['paper_reference']}
+           if basis['plan'].get('baseline_mode') == 'paper_reported' else {}),
         **({'dataset_optimization': optimization} if optimization else {}),
         'training_investigation': investigation,
         'configuration_queue': configuration_queue(engine.store, run_id),
         'rapid_revision': ({k: recent.get(k) for k in ('id', 'status', 'decision_id', 'patch', 'votes', 'check', 'error', 'activation_scope', 'training_authorized')}
             | {'code_sources': (recent.get('candidate') or {}).get('code_sources')}
+            | ({'resource_revision_request': resource_request} if resource_request else {})
+            | ({'resource_admission': recent['resource_admission']} if recent.get('resource_admission') else {})
             | ({'review_reads': recent['review_reads'], 'review_outcome': recent['review_outcome']}
-               if recent.get('review_outcome') == 'authenticated_veto' else {}) if recent else None),
+               if recent.get('review_outcome') in {'authenticated_veto', 'resource_admission_blocked'} else {}) if recent else None),
         'code_sources': sources,
         'comparisons': comparisons, 'diagnostics': diagnostics, 'records': _safe_rows(rows),
         'definitions': {k: basis['design'].get(k) for k in ('architecture', 'dataset', 'evaluation',
@@ -241,6 +265,9 @@ def snapshot(engine, run_id, transport=None):
         'failure_categories': {r['id']: (r.get('failure_diagnostic') or {}).get('category', r['status'])
                                for r in rows if r['status'] != 'completed'}}
     from .parameter_grid import PROTOCOL, summaries
+    dataset_catalog = basis['design'].get('dataset_catalog') or basis['program'].get('dataset_catalog')
+    if dataset_catalog:
+        evidence['dataset_catalog'] = copy.deepcopy(dataset_catalog)
     evidence['parameter_search_protocol'] = PROTOCOL
     evidence['parameter_grids'] = summaries(evidence)
     from .parameter_resolution import apply as apply_resolution
@@ -258,6 +285,8 @@ def snapshot(engine, run_id, transport=None):
     attach_runtime_audit(engine, run_id, evidence)
     from .tuning_progress_recovery import attach as attach_progress_recovery
     attach_progress_recovery(engine, run_id, evidence)
+    from .combination_validation import attach as attach_combinations
+    attach_combinations(engine, run_id, evidence)
     return evidence
 
 
@@ -284,15 +313,22 @@ def packet(evidence, ref, previous=None):
     from .parameter_resolution import compact as resolution_scope
     from .tuning_scope import compact as compact_tuning_scope
     return {'training_context_protocol': 1, 'experiment_workflow_protocol': 1,
+        **({'dataset_catalog': evidence['dataset_catalog'], 'dataset_request_protocol': 2} if evidence.get('dataset_catalog') else {}),
         **assessment_context(evidence),
         'research_cycle': evidence['binding']['cycle'], 'evidence_sha256': ref['sha256'],
         'validation_evidence': ref, 'experiment_decision': {
+            **({'revision_comparison_path': '/revision_comparison'} if evidence.get('revision_comparison') else {}),
+            **({'revision_documents': evidence['revision_documents']} if evidence.get('revision_documents') else {}),
+            **({'baseline_mode':'paper_reported','own_validation_controls':[k for k,v in evidence['comparisons'].items()
+                if v.get('own_control_eligible')], 'comparison_rule':'Only use proposed model validation to select parameters. The cited paper result is reserved for a matching final comparison.'}
+               if evidence.get('baseline_mode') == 'paper_reported' else {}),
             'binding': evidence['binding'], 'counts': evidence['ledger']['counts'],
             'coverage_complete': evidence['ledger']['complete'], 'budget': evidence['budget'],
             **({'training_investigation': training_scope(evidence['training_investigation'])}
                 if evidence.get('training_investigation') else {}),
             'configuration_queue': evidence.get('configuration_queue'),
             'parameter_search_protocol': evidence.get('parameter_search_protocol', 1),
+            **({'combination_validation': evidence['combination_validation']} if evidence.get('combination_validation') else {}),
             **({'bounded_diagnostic_capabilities': evidence['diagnostic_host_capabilities']}
                if evidence.get('diagnostic_host_capabilities') else {}),
             **({'tuning_progress_recovery': evidence['tuning_progress_recovery']}
@@ -317,6 +353,10 @@ def packet(evidence, ref, previous=None):
             'failure_count': len(evidence['failure_categories']),
             'previous_decision': previous,
             'recent_revision': ({k: evidence['rapid_revision'].get(k) for k in ('id', 'status', 'decision_id')}
+                | {k: evidence['rapid_revision'][k] for k in ('resource_revision_request', 'resource_admission')
+                   if k in evidence['rapid_revision']}
+                | ({'code_review_findings': [{k: v[k] for k in ('role', 'approve', 'issues')} for v in evidence['rapid_revision']['votes']]}
+                   if evidence['rapid_revision'].get('resource_revision_request') else {})
                 if evidence.get('rapid_revision') else None),
             'paths': ['/units', '/comparisons', '/diagnostics', '/failure_categories', '/definitions',
                       '/acceptance', '/records', '/job_parameters', '/rapid_revision', '/parameter_grids',
@@ -334,13 +374,22 @@ def _pointer(value, path):
     return value
 
 
-def validate_proposal(proposal, evidence, digest, *, artifact_evidence=None, reference_context=None):
+def validate_proposal(proposal, evidence, digest, *, artifact_evidence=None, reference_context=None, contract_version=0, run_id=None):
+    from .proposal_request_contract import architecture_iteration
+    if architecture_iteration(evidence, contract_version) and proposal['action'] == 'diagnose':
+        if proposal['changes']:
+            raise ValueError('Architecture assessment requires a runtime revision followed by real validation')
+        if proposal['unit_id'] is None and not proposal.get('artifact_trial_ids'):
+            raise ValueError('Read-only architecture evidence must identify the completed validation trials')
     from .training_investigation import proposal_schema, validate_response, validate_reference_contract
     validate_reference_contract(proposal, evidence, _pointer)
     schema = proposal_schema(PROPOSAL, evidence)
-    if proposal.get('architecture_review'):
+    from .diagnostic_resources import FIELD as disk_control, bind_schema as diagnostic_schema
+    if disk_control in proposal:
+        diagnostic_schema(schema, measured='required_cpu_observations' in proposal or 'diagnostic_write_control' in proposal)
+    if proposal.get('architecture_review') or 'implementation_correction' in proposal:
         from .architecture_experiment_contract import schema as architecture_schema
-        schema = architecture_schema(schema, evidence)
+        schema = architecture_schema(schema, evidence, implementation_correction='implementation_correction' in proposal)
     if 'artifact_trial_ids' in proposal:
         from .experiment_evidence_handoff import SCOPE_SCHEMA, validate_scope
         schema['properties']['artifact_trial_ids'] = SCOPE_SCHEMA
@@ -371,7 +420,13 @@ def validate_proposal(proposal, evidence, digest, *, artifact_evidence=None, ref
             supplemental = path.split('/')[1] in {
                 'trials', 'parameter_search_audit', 'checkpoint_identity',
                 'host_checkpoint_audit', 'fact_review_scope', 'pair_scope', 'pair_comparisons', 'yaml_candidate_audit'} if path.startswith('/') else False
-            _pointer(artifact_evidence if supplemental else evidence, resolved_paths.get(path, path))
+            canonical = resolved_paths.get(path, path)
+            if not supplemental and artifact_evidence is not None and canonical.startswith('/'):
+                root = canonical[1:].split('/', 1)[0].replace('~1', '/').replace('~0', '~')
+                from .experiment_evidence_handoff import READ_ONLY_SCOPE
+                supplemental = (root not in evidence and root in READ_ONLY_SCOPE
+                                and artifact_evidence.get(root) is READ_ONLY_SCOPE[root])
+            _pointer(artifact_evidence if supplemental else evidence, canonical)
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise ValueError(f'Decision cites missing evidence: {path} in '
                              f'{"supplemental" if supplemental else "original"} snapshot') from exc
@@ -425,13 +480,20 @@ def validate_proposal(proposal, evidence, digest, *, artifact_evidence=None, ref
         unit = next((u for u in evidence['units'] if u['id'] == unit_id and u['available']), None)
         if not unit:
             raise ValueError('Choose one available frozen batch; completed/failed/dependent batches cannot be replayed')
+        if (contract_version >= 15 and architecture_iteration(evidence, contract_version)
+                and action == 'diagnose' and unit['kind'] == 'ablation'
+                and not evidence.get('training_investigation', {}).get('required')):
+            from .architecture_validation_batch import pairs
+            if not pairs(evidence, unit, run_id):
+                raise ValueError('An architecture ablation requires a measured control for every missing job')
         if action == 'grid_search':
             paired = any(v['comparable'] and v['task_id'] == unit['task_id'] for v in evidence['comparisons'].values())
             if unit['kind'] not in {'pilot', 'grid'} or not paired or proposal['diagnosis'] != 'no_architecture_evidence':
                 raise ValueError('Grid search needs a valid baseline comparison and no supported architecture concern')
             if evidence['failure_categories']:
                 raise ValueError('Resolve execution failures before continuing grid search')
-    validate_response(proposal, evidence, _pointer)
+    validate_response(proposal, evidence, _pointer, architecture_batch_run=(
+        run_id if contract_version >= 15 and architecture_iteration(evidence, contract_version) else None))
 
 
 async def decide(engine, harness, run_id, transport=None):
@@ -447,11 +509,13 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
         evidence = await engine._read_consensus_check(run_id, snapshot, engine, run_id, transport)
     ref = _archive(engine, run_id, evidence)
     key = record_key or ref['id']
+    from .experiment_review_reuse import unexecuted_review
     record = engine.store.get(DECISIONS, key) or {'id': key, 'run_id': run_id,
         'cycle': engine.cycle(run_id), 'evidence': ref, 'status': 'analyzing', 'analyses': [],
         'votes': [], 'created_at': now(), 'scientific_approval': False, 'provenance': 'live',
         'parameter_path_contract_version': 1, 'proposal_request_contract_version': request_contract.VERSION,
-        'proposal_reference_contract_version': 2}
+        'proposal_reference_contract_version': 2, 'tuning_read_protocol': 1, 'cpu_check_work_order_identity': 3,
+        **({'reassessment_read_protocol': 1} if unexecuted_review(evidence.get('rapid_revision')) else {})}
     from .parameter_resolution import track_successor
     track_successor(engine, run_id, evidence, record)
     from .yaml_migration import track as track_yaml_migration
@@ -464,17 +528,34 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
         from .architecture_experiment_contract import PROTOCOL, enabled
         if enabled(evidence):
             context['experiment_decision'][PROTOCOL] = 1
+            if record['proposal_request_contract_version'] >= 7:
+                from .paper_baselines import assessment_results
+                context['experiment_decision']['measured_results'] = assessment_results(engine.store, run_id, evidence)
+            if record['proposal_request_contract_version'] >= 6 and evidence.get('baseline_mode') == 'paper_reported':
+                context['experiment_decision']['comparison_rule'] = (
+                    '在架构诊断中描述本地实测与已发表结果的差距，并标明任务、划分、指标尺度和聚合。'
+                    '正式性能比较要求协议匹配；验证选参只使用本地验证测量。')
     from .experiment_memory import recall, remember
     context['experiment_memory'] = recall(engine, run_id)
     if record.get('consensus_resolution'):
         context['experiment_decision']['consensus_resolution'] = copy.deepcopy(record['consensus_resolution'])
+    if record.get('reviewed_revision_material'):
+        context['experiment_decision'].update(copy.deepcopy(record['reviewed_revision_material']))
+    if record.get('proposal_request_contract_version', 0) >= 10 or record.get('reviewed_revision_material'):
+        request_contract.scope_diagnostic_routes(context, evidence)
     if record.get('yaml_review_recovery'):
         from .yaml_review_recovery import review_packet
         context['yaml_candidate_review'] = await engine._read_consensus_check(run_id, review_packet, engine, run_id, record)
     from .training_investigation import guidance, proposal_schema as historical_schema, validate_reads, RESPONSE_CONTRACT_VERSION
+    scripted_candidate = None
+    from .diagnostic_resources import ordinary_cpu
     def proposal_schema(base, evidence):
-        return request_contract.schema(historical_schema(base, evidence), evidence,
-                                       record.get('proposal_request_contract_version', 0))
+        schema = request_contract.schema(historical_schema(base, evidence), evidence,
+            record.get('author_contract_version', record.get('proposal_request_contract_version', 0)),
+            ordinary_cpu=ordinary_cpu(context, evidence), run_id=run_id)
+        if scripted_candidate is not None:
+            schema['properties']['parameter_search'] = {'const': scripted_candidate}
+        return schema
     base_guidance = GUIDANCE
     if record.get('yaml_review_recovery'):
         from .yaml_review_recovery import GUIDANCE as yaml_review_guidance
@@ -490,6 +571,9 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
     if record.get('consensus_resolution'):
         base_guidance += ('\n本轮必须逐项落实 consensus_resolution：修订具体分歧或补齐可区分证据，不能仅重复上一提案。'
             '原异议保留，director 协调不是批准；你的新提案必须重新由三方独立投票。不得降低门禁以求表面一致。')
+        if record.get('reviewed_revision_material'):
+            base_guidance += ('\n基于 previous_proposal、原始复核事实和当前协调意见修订。'
+                '若有 prior_revision_draft，结合补充来源核对这份草稿。用原快照引用支持判断并保留事实复核的未决问题。')
     if evidence.get('parameter_resolution', {}).get('next_task'):
         base_guidance += ('\nparameter_resolution.next_task 是已独立审核的具体待办，本轮应将它落实为正常提案；'
             '复用其逐项事件处置，不重复交付同一阻塞登记。协议规划未授权执行，仍需完整提案、读取、三方投票及执行门禁。'
@@ -499,7 +583,7 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
             '先核对tuning_scope.acceptance的生效三方票与CPU原回执，再独立提出一个实际下一批或具体代码修订。'
             '旧strategy里的待认证文字不覆盖后续批准；保留真实训练告警，但不能因未知根因自动要求重复同一诊断。'
             '不得重跑已完成训练、放宽门禁或把维修当成选参成功。新方案仍经原三方、资源和科学条件审核。')
-    if evidence.get('diagnostic_host_capabilities'):
+    if context['experiment_decision'].get('bounded_diagnostic_capabilities'):
         from .bounded_diagnostic_contract import GUIDANCE as capability_guidance
         base_guidance += '\n' + capability_guidance
     if evidence.get('parameter_search_protocol', 1) >= 2:
@@ -519,14 +603,24 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
             base_guidance += '\n' + acceptance_guidance
     if evidence.get('hyperparameter_yaml', {}).get('migration_required'):
         from .yaml_migration import INSTRUCTION as yaml_contract
+        yaml_contract = evidence['hyperparameter_yaml'].get('contract') or yaml_contract
         base_guidance += ('\n用户要求优先插入 YAML 超参数迁移任务。本轮 action=revise_architecture、diagnosis=implementation，'
             'unit_id=null，给出最多三项可直接交给 Codex 的具体修改单。保留未知训练根因，training_response 可用 repair_code。'
             '这是已授权的配置接口/参数化迁移，不是要求证明旧架构错误；不要再次交付泛化调参清单。'
             '代码由独立本机 Codex 工作项落盘，交付后仍经三方代码审核和 CPU 检查。\n' + yaml_contract)
+    if evidence.get('combination_validation'):
+        from .combination_validation import GUIDANCE as combination_guidance
+        from .combination_settings import SCRIPT_GUIDANCE, scripted
+        base_guidance += '\n' + (SCRIPT_GUIDANCE if scripted(evidence) else combination_guidance)
     instruction = guidance(base_guidance, context)
+    if (evidence.get('rapid_revision') or {}).get('resource_revision_request'):
+        instruction += ('\nrecent_revision.resource_revision_request 绑定原修改单和操作者对后续送审的要求。'
+                        '逐项核对原代码票的具体异议。仅当资源控制方式是唯一障碍时，按操作者范围另提独立审核的方案，'
+                        '说明实际监测、超限停止和剩余局限，保留其他获批上限。有其他问题时先处理具体问题。'
+                        '原候选不执行；新方案由工程师提出并独立投票，代码还须复审。')
     if context['experiment_decision'].get('architecture_review_protocol') == 1:
         from .architecture_experiment_contract import instruction as architecture_instruction
-        instruction = architecture_instruction(instruction)
+        instruction = architecture_instruction(instruction, proposal_version=record['proposal_request_contract_version'])
     if record.get('proposal_request_contract_version') and evidence.get('dataset_optimization'):
         instruction += request_contract.guidance(record['proposal_request_contract_version'])
     elif record.get('proposal_request_contract_version', 0) >= 2:
@@ -541,6 +635,10 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
             from .decision_reference_resolution import WORKFLOW_GUIDANCE
             instruction += WORKFLOW_GUIDANCE
     from . import experiment_evidence_handoff as artifact_handoff
+    if request_contract.architecture_iteration(evidence, record.get('proposal_request_contract_version', 0)):
+        request_contract.focus_architecture_context(context)
+    instruction = request_contract.focus_stage(instruction, evidence, record.get('proposal_request_contract_version', 0))
+    instruction = request_contract.decision_roles(instruction, record.get('proposal_request_contract_version', 0))
     instruction = artifact_handoff.retained_analysis_instruction(engine, run_id, context, instruction, analysis_schema(context))
     async def checkpoint(**changes):
         current = await engine._read_consensus_check(run_id, snapshot, engine, run_id, transport)
@@ -552,18 +650,101 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
         track_yaml_migration(engine, run_id, record)
     from .research_anchor import for_phase as anchor_for_phase
     context, instruction = await anchor_for_phase(engine, run_id, record, context, instruction, checkpoint, 'analysis')
+    from . import tuning_point_reads as point_reads
+    if (record.get('tuning_read_protocol') and point_reads.KEY not in record
+            and not record['analyses'] and (evidence.get('dataset_optimization') or {}).get('phase') == 'parameters'
+            and (evidence.get('tuning_scope') or {}).get('status') == 'accepted'
+            and previous.get('proposal', {}).get('action') == 'search_parameters'
+            and previous.get('status') == 'approved' and previous.get('evidence') != ref):
+        proof = await engine._read_consensus_check(run_id, point_reads.build, engine, run_id, ref,
+            previous, (state.get('last_batch') or {}).get('unit_id'))
+        await checkpoint(**{point_reads.KEY: proof})
+    if point_reads.KEY in record:
+        context[point_reads.KEY] = point_reads.packet(record)
+        instruction += '\n' + point_reads.GUIDANCE
     if not record['analyses']:
-        analyses = await _group(harness, run_id, 'experiment_diagnose:' + ref['sha256'], instruction, context, analysis_schema(context))
+        from .training_investigation import independent_analyses
+        analysis_context = context
+        if record.get('reassessment_read_protocol') == 1:
+            from .experiment_review_reuse import KEY as PRIOR_READING, prepare_analysis, prior_diagnostic_review
+            from .scoped_work_order_contract import describe_cpu_check
+            analysis_context = copy.deepcopy(context)
+            if 'reassessment_reading' not in record:
+                proof = await engine._read_consensus_check(run_id, prepare_analysis, engine, run_id, analysis_context)
+                facts = await engine._read_consensus_check(run_id, prior_diagnostic_review, engine, run_id, evidence, ref)
+                await checkpoint(reassessment_reading=proof, prior_diagnostic_review=facts)
+            if record['reassessment_reading']:
+                analysis_context[PRIOR_READING] = record['reassessment_reading']
+            if record.get('prior_diagnostic_review') and not analysis_context['experiment_decision'].get('architecture_revision_workflow'):
+                analysis_context['experiment_decision']['prior_diagnostic_review'] = record['prior_diagnostic_review']
+            describe_cpu_check(engine, run_id, analysis_context, work_order_identity=record['cpu_check_work_order_identity'])
+        analyses = await independent_analyses(engine, harness, run_id, 'experiment_diagnose:' + ref['sha256'], instruction, analysis_context, analysis_schema(analysis_context))
         if any(a['evidence_sha256'] != ref['sha256'] for a in analyses):
             raise ResearchBlocked('Experiment analyses refer to different evidence')
         from .training_investigation import analysis_reads
-        analyses, reads = await analysis_reads(engine, harness, run_id, analyses, context, instruction, checkpoint, record)
-        await checkpoint(analyses=analyses, analysis_reads=reads, status='proposing')
+        analyses, reads = await analysis_reads(engine, harness, run_id, analyses, analysis_context, instruction, checkpoint, record)
+        await checkpoint(analyses=analyses, analysis_reads=reads, status='proposing',
+            **({'author_contract_version': request_contract.VERSION} if context['experiment_decision'].get(
+                'architecture_review_protocol') == 1 else {}),
+            **({'initial_point_reads': point_reads.this_point(reads, context)} if point_reads.KEY in record else {}))
+    if ('prior_diagnostic_review' not in record and not record.get('proposal') and not record.get('consensus_parent')
+            and unexecuted_review(evidence.get('rapid_revision'))):
+        # A legacy analysis can finish on its original input. Enrich only the first as-yet unissued author request.
+        owners = engine.store.record_keys('handoffs', run_id, predicate="json_extract(data,'$.purpose') LIKE ?",
+                                          parameters=('experiment_decide:' + ref['sha256'] + '%',), limit=1)
+        if not owners:
+            from .experiment_review_reuse import prior_diagnostic_review
+            facts = await engine._read_consensus_check(run_id, prior_diagnostic_review, engine, run_id, evidence, ref)
+            await checkpoint(prior_diagnostic_review=facts)
+    if record.get('prior_diagnostic_review'):
+        context['experiment_decision']['prior_diagnostic_review'] = record['prior_diagnostic_review']
+    if 'initial_point_reads' in record:
+        context[point_reads.KEY]['this_point'] = record['initial_point_reads']
     context['decision_analyses'] = record['analyses']
+    author_version = record.get('author_contract_version', record.get('proposal_request_contract_version', 0))
+    if author_version > record.get('proposal_request_contract_version', 0):
+        from .architecture_experiment_contract import upgrade_instruction
+        instruction = request_contract.decision_roles(upgrade_instruction(
+            instruction, record['proposal_request_contract_version'], author_version), author_version)
+        if author_version >= 7:
+            from .paper_baselines import assessment_results
+            context['experiment_decision']['measured_results'] = assessment_results(engine.store, run_id, evidence)
+        if evidence.get('baseline_mode') == 'paper_reported':
+            context['experiment_decision']['comparison_rule'] = (
+                '论文参照用于描述同任务的数值差距，标明划分、尺度及聚合；正式比较须匹配协议。验证选参只使用本地验证结果。')
+    instruction = request_contract.focus_stage(instruction, evidence, author_version)
+    mainline = request_contract.architecture_iteration(evidence, author_version)
+    if mainline:
+        request_contract.focus_architecture_context(context)
+    if author_version >= 8 and not mainline:
+        instruction += '\n' + request_contract.DIAGNOSTIC_ROUTING
+    if author_version >= 9:
+        from .scoped_work_order_contract import describe_cpu_check
+        describe_cpu_check(engine, run_id, context, work_order_identity=record.get('cpu_check_work_order_identity', False))
+    if author_version >= 11 and ordinary_cpu(context, evidence):
+        from .diagnostic_resources import GUIDANCE as resource_guidance
+        instruction += '\n' + resource_guidance
+        if author_version >= 12:
+            from .scoped_work_order_contract import staged_contract
+            context['experiment_decision']['cpu_behavior_check']['staged_observations'] = staged_contract()
+    if not mainline and author_version >= 10 and record.get('proposal_request_contract_version', 0) < 10:
+        request_contract.scope_diagnostic_routes(context, evidence)
+        if 'bounded_diagnostic_route' in context['experiment_decision']:
+            from .bounded_diagnostic_contract import GUIDANCE as capability_guidance
+            instruction = instruction.replace('\n' + capability_guidance, '')
+    if evidence.get('combination_validation', {}).get('version') == 2 and evidence['combination_validation'].get('next_step'):
+        from .scripted_tuning import draft
+        scripted_candidate = await engine._read_consensus_check(run_id, draft, engine, run_id, evidence, ref)
+        context['experiment_decision']['scripted_candidate'] = scripted_candidate
+        instruction += ('\n脚本已生成本轮唯一候选及适用的 YAML 草案。若建议执行，在 parameter_search 原样引用 '
+                        'scripted_candidate 并独立说明证据。仍须完整审核；有异议可阻止训练。')
     context, instruction = await anchor_for_phase(engine, run_id, record, context, instruction, checkpoint, 'proposal')
     from .experiment_progression import decision_context
     context, instruction, continuation_suffix = decision_context(engine, run_id, evidence, context, instruction)
+    from . import consensus_reading
+    await consensus_reading.prepare(engine, harness, run_id, record, context, checkpoint)
     if not record.get('proposal'):
+        from . import architecture_validation_batch as validation_batch
         from . import experiment_artifact_review as artifact_review
         from . import optimization_read_recovery as optimization_reads
         from . import training_proposal_reads as proposal_reads
@@ -623,7 +804,8 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                 'instruction': '按本次明确的引用与复验字段约束纠正最后被拒的提案。保留证据哈希、原始答复和训练告警；不替换实测结果，不继承批准。'}
             recovery = {'version': RESPONSE_CONTRACT_VERSION, 'rejected_proposal_sha256': sha(rejected),
                 'purpose': 'experiment_decide:' + ref['sha256'] + ':reference-contract-2:' + sha(rejected),
-                'instruction': instruction + '\n只纠正最后被拒提案的证据引用与复验字段；仍须独立三方评审。',
+                'instruction': instruction + ('\n只纠正最后被拒提案的证据引用与复验字段；仍须独立评审。'
+                    if record.get('proposal_request_contract_version', 0) >= 5 else '\n只纠正最后被拒提案的证据引用与复验字段；仍须独立三方评审。'),
                 'context': recovery_context, 'schema': proposal_schema(PROPOSAL, evidence)}
             # This recovery can repair references/outcome labels only, never the intervention.
             for field, value in rejected.items():
@@ -634,6 +816,9 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                     recovery['schema']['properties']['training_response']['properties'][field] = {'const': value}
             await checkpoint(proposal_contract_recovery=recovery)
         attempts = list(record.get('proposal_corrections', []))
+        action_repair = record.get('diagnostic_action_correction')
+        if action_repair and recovery and sha(recovery) == action_repair['parent_sha256']:
+            recovery = action_repair['assignment']
         while True:
             correction = {'rejected_proposal': attempts[-1]['proposal'], 'validation_error': attempts[-1]['error'],
                 'instruction': '只纠正本次诊断提案的具体问题；不能删除训练告警、改变证据或伪造已读回执。先核对既有运行产物；未读取不等于缺日志，只有确认具体缺项才能提出最小补测。'} if attempts else None
@@ -650,6 +835,8 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                         '无需重做诊断、重复读取参数或补日志；纠正后仍由三方独立评审。')
             request = copy.deepcopy(context)
             if correction:
+                correction['instruction'] = request_contract.decision_roles(
+                    correction['instruction'], record.get('proposal_request_contract_version', 0))
                 request['experiment_decision']['proposal_correction'] = correction
             purpose = 'experiment_decide:' + ref['sha256'] + continuation_suffix + (f':training-correction-{len(attempts)}' if attempts else '')
             from .artifact_fact_review import KEY as FACT_REVIEW
@@ -664,18 +851,35 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                 delivered = record.get('recovery_answer') or {}
                 cached_answer = (copy.deepcopy(delivered['proposal'])
                     if assignment_sha and delivered.get('assignment_sha256') == assignment_sha else None)
+                author_instruction = instruction + ('\n核对当前验证证据及 decision_analyses 中已提交的分析，选择唯一下一步。'
+                    if author_version >= 5 else '\n综合三方分析选择唯一下一步；不要把“未找到问题”写成“已证明没有问题”。')
+                author_instruction += '\n本次为字段纠正：' + correction['instruction'] if correction else ''
+                author = recovery or {'purpose': purpose, 'instruction': author_instruction,
+                    'context': request, 'schema': proposal_schema(PROPOSAL, evidence)}
                 proposal = retained_read_proposal or cached_answer or await harness.ask(run_id, 'engineer',
-                recovery['purpose'] if recovery else purpose,
-                recovery['instruction'] if recovery else instruction + '\n综合三方分析选择唯一下一步；不要把“未找到问题”写成“已证明没有问题”。'
-                    + ('\n本次为字段纠正：' + correction['instruction'] if correction else ''),
-                recovery['context'] if recovery else request,
-                recovery['schema'] if recovery else proposal_schema(PROPOSAL, evidence))
+                    author['purpose'], author['instruction'], author['context'], author['schema'])
+                if (record.get('consensus_parent') and not record.get(artifact_handoff.KEY)
+                        and not recovery and not retained_read_proposal):
+                    # Finish the frozen legacy assignment before restoring its missing sources.
+                    from .experiment_consensus import reviewed_material, ConsensusPending
+                    parent = engine.store.get(DECISIONS, record['consensus_parent'])
+                    inherited = await engine._read_consensus_check(run_id, reviewed_material, engine, run_id, parent)
+                    if inherited:
+                        owner = await engine._read_consensus_check(run_id, diagnostic_planning.authenticate,
+                            engine, run_id, 'engineer', author['purpose'],
+                            {k: author[k] for k in ('instruction', 'context', 'schema')}, proposal)
+                        inherited['reviewed_revision_material']['prior_revision_draft'] = {
+                            'handoff_id': owner, 'proposal': proposal, 'execution_authorized': False}
+                        await checkpoint(**inherited, status='proposing')
+                        raise ConsensusPending('已保存工程师原答复，补齐上轮已复核的产物来源后继续修订。')
                 if recovery and not retained_read_proposal and not cached_answer:
                     # Retain delivery before validation. Resume revalidates the
                     # same answer; it must not redispatch a failed correction.
                     await checkpoint(recovery_answer={'assignment_sha256': assignment_sha,
                                                       'proposal': copy.deepcopy(proposal)})
             try:
+                proposal_version = (15 if recovery and validation_batch.CORRECTION in
+                    recovery['context']['experiment_decision'] else author_version)
                 if recovery:
                     validate(proposal, recovery['schema'])
                 if pending_facts:
@@ -693,10 +897,10 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                 if reference_proof and sha(proposal) not in record.get(reference_resolution.KEY, {}):
                     await checkpoint(**{reference_resolution.KEY: {
                         **record.get(reference_resolution.KEY, {}), sha(proposal): reference_proof}})
-                validate_proposal(proposal, evidence, ref['sha256'],
+                validate_proposal(proposal, evidence, ref['sha256'], contract_version=proposal_version, run_id=run_id,
                     artifact_evidence=artifact_handoff.bound_evidence(engine, run_id, record, proposal),
                     reference_context=reference_context)
-                if proposal.get('architecture_review'):
+                if proposal.get('architecture_review') or proposal.get('implementation_correction'):
                     from .architecture_experiment_contract import validate as validate_architecture
                     from .source_read_identity import source_files
                     validate_architecture(proposal, evidence, _pointer,
@@ -710,15 +914,56 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                         await artifact_handoff.prepare(engine, run_id, record, proposal, evidence, ref, checkpoint)
                         recovery = artifact_handoff.request(record, context, instruction, proposal_schema(PROPOSAL, evidence))
                     elif not record[artifact_handoff.KEY].get('independent_review'):
+                        from .scoped_parameter_author import successor as scoped_author
+                        updated_request = await engine._read_consensus_check(
+                            run_id, scoped_author, engine, run_id, record, evidence, recovery, proposal)
+                        if updated_request:
+                            recovery = updated_request
+                            continue
                         recovery = await artifact_review.advance(engine, harness, run_id, record, context,
                             instruction, proposal_schema(PROPOSAL, evidence), checkpoint,
                             proposal=proposal, assignment=recovery)
                     else:
+                        read_proof = context['experiment_decision'].get(consensus_reading.KEY)
+                        if read_proof and not recovery['context']['experiment_decision'].get(consensus_reading.KEY):
+                            review = record[artifact_handoff.KEY]['independent_review']
+                            from .diagnostic_planning_recovery import authenticate
+                            owner = await engine._read_consensus_check(run_id, authenticate, engine, run_id,
+                                'engineer', recovery['purpose'], {k: recovery[k] for k in ('instruction','context','schema')}, proposal)
+                            updated = copy.deepcopy(recovery)
+                            updated['purpose'] += ':reviewer-reads:' + sha(read_proof)
+                            updated['context']['experiment_decision'][consensus_reading.KEY] = {
+                                **read_proof, 'prior_author_handoff': owner, 'prior_assessment': proposal}
+                            updated['instruction'] += '\n已取得原评审亲自补读的回执和核对意见。核对尚存缺项，沿用或修订原提案，交两人独立复投。'
+                            await checkpoint(**{artifact_handoff.KEY: {**record[artifact_handoff.KEY],
+                                'independent_review': {**review, 'reviewer_read_followup': updated}}})
+                            recovery = updated
+                            continue
                         if record.get(gate_followup.KEY) and recovery == record[gate_followup.KEY].get('synthesis'):
                             await gate_followup.finish_hold(engine, harness, run_id, record,
                                 proposal, recovery, checkpoint)
                         followup = await gate_followup.advance(engine, harness, run_id, record,
                             evidence, context, instruction, checkpoint, proposal=proposal, assignment=recovery)
+                        if followup:
+                            recovery = followup
+                            continue
+                        followup = await artifact_review.weight_followup(
+                            engine, run_id, record, evidence, proposal, recovery, checkpoint)
+                        if followup:
+                            recovery = followup
+                            continue
+                        followup = await artifact_review.configuration_followup(
+                            engine, run_id, record, evidence, proposal, recovery, checkpoint)
+                        if followup:
+                            recovery = followup
+                            continue
+                        followup = await artifact_review.host_revision_followup(
+                            engine, run_id, record, proposal, recovery, checkpoint)
+                        if followup:
+                            recovery = followup
+                            continue
+                        from .experiment_source_followup import prepare as source_followup
+                        followup = await source_followup(engine, run_id, record, proposal, recovery, checkpoint)
                         if followup:
                             recovery = followup
                             continue
@@ -745,6 +990,34 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                         'status': 'reviewing', 'author_read': read}}, analysis_reads=effective_reads)
                 break
             except (ValueError, KeyError, IndexError, TypeError, ValidationError) as exc:
+                response = proposal.get('training_response') or {}
+                if mainline and author_version == 14:
+                    replacement = validation_batch.correction(engine, run_id, recovery, proposal, evidence, str(exc))
+                    if replacement:
+                        recovery = replacement
+                        continue
+                if (not mainline and recovery and not record.get('diagnostic_action_correction')
+                        and proposal.get('action') == 'diagnose' and proposal.get('unit_id') is None
+                        and proposal.get('changes') and response.get('disposition') in {'controlled_diagnostic', 'adjust_parameters'}):
+                    from .diagnostic_planning_recovery import authenticate
+                    parent = {k: recovery[k] for k in ('instruction', 'context', 'schema')}
+                    owner = authenticate(engine, run_id, 'engineer', recovery['purpose'], parent, proposal)
+                    replacement = copy.deepcopy(recovery)
+                    replacement['purpose'] += ':diagnostic-action:' + sha(proposal)
+                    replacement['instruction'] += '\n' + request_contract.DIAGNOSTIC_ROUTING
+                    replacement['context']['experiment_decision']['diagnostic_action_correction'] = {
+                        'source_handoff_id': owner, 'rejected_proposal': proposal, 'diagnostic': str(exc),
+                        'execution_authorized': False}
+                    request_contract.routed_diagnostics(replacement['schema'])
+                    await checkpoint(diagnostic_action_correction={
+                        'parent_sha256': sha(recovery), 'assignment': replacement}, status='correcting')
+                    recovery = replacement
+                    continue
+                from .scoped_parameter_author import trial_reference_request
+                corrected = trial_reference_request(engine, run_id, recovery, proposal, evidence, str(exc))
+                if corrected:
+                    recovery = corrected
+                    continue
                 if not recovery and evidence.get('training_investigation', {}).get('required') and len(attempts) < 2:
                     attempts.append({'proposal': proposal, 'error': str(exc)[:1200]})
                     await checkpoint(status='correcting', proposal_corrections=attempts)
@@ -752,7 +1025,27 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                 await checkpoint(status='invalid', rejected_proposal=proposal, rejection=str(exc),
                                  proposal_contract_version=RESPONSE_CONTRACT_VERSION)
                 raise ResearchBlocked(str(exc)) from exc
-        await checkpoint(proposal=proposal, proposal_sha256=sha(proposal), status='reviewing')
+        review_inputs = {'experiment_vote_notes_protocol': 1, 'experiment_vote_focus_protocol': 2}
+        if context['experiment_decision'].get(consensus_reading.KEY):
+            review_inputs['bind_review_notes_to_vote'] = True
+        if context['experiment_decision'].get('architecture_review_protocol') == 1:
+            from .training_investigation import fit_histories
+            review_inputs.update(vote_results_protocol=1, fit_histories=await engine._read_consensus_check(
+                run_id, fit_histories, engine, run_id, evidence))
+        if record.get(artifact_handoff.KEY, {}).get('independent_review'):
+            review_inputs['reuse_fact_review_pages'] = True
+        if record.get('consensus_parent'):
+            review_inputs['consensus_reading_protocol'] = 1
+        else:
+            review_inputs['consensus_reading_protocol'] = 2
+        if proposal_version != author_version:
+            review_inputs['validated_author_version'] = proposal_version
+        await checkpoint(proposal=proposal, proposal_sha256=sha(proposal), status='reviewing', **review_inputs)
+    if record.get('vote_results_protocol') == 1:
+        from .paper_baselines import assessment_results
+        context['experiment_decision']['measured_results'] = assessment_results(engine.store, run_id, evidence)
+        if 'fit_histories' in record:
+            context['experiment_decision']['fit_histories'] = record['fit_histories']
     if record.get(artifact_handoff.KEY):
         from .experiment_artifact_review import require_binding
         if not require_binding(record):
@@ -764,10 +1057,52 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
         context['experiment_decision'][artifact_handoff.KEY] = artifact_handoff.packet(saved, for_review=True)
         if saved.get('independent_review'):
             results = saved['independent_review']['results']
+            from .saved_validation_configuration import frozen_selection
+            selection = frozen_selection(record)
+            if selection:
+                context['experiment_decision']['selected_validation_runs'] = copy.deepcopy(selection)
+            host_assignment = saved['independent_review'].get('host_revision_followup')
+            synthesis = (host_assignment or saved['independent_review'].get('synthesis_assignment', {})).get('context', {})
+            synthesis_packet = synthesis.get('experiment_decision', {})
+            if host_assignment:
+                for field in ('diagnostic_host_source_locations', 'previous_diagnostic_host'):
+                    context['experiment_decision'][field] = copy.deepcopy(synthesis_packet[field])
+            if synthesis_packet.get('diagnostic_host_checks'):
+                context['experiment_decision']['diagnostic_host_checks'] = copy.deepcopy(synthesis_packet['diagnostic_host_checks'])
+                context['experiment_decision']['cpu_behavior_check']['staged_observations'] = copy.deepcopy(
+                    synthesis_packet['cpu_behavior_check']['staged_observations'])
+            historical = synthesis.get('experiment_decision', {}).get('prior_diagnostic_review')
+            if historical:
+                context['experiment_decision']['prior_diagnostic_review'] = copy.deepcopy(historical)
+            followup = saved['independent_review'].get('weight_followup')
+            if followup:
+                context['experiment_decision']['saved_weight_audit'] = copy.deepcopy(
+                    followup['context']['experiment_decision']['saved_weight_audit'])
+            settings = (saved['independent_review'].get('configuration_originals')
+                        or saved['independent_review'].get('configuration_followup'))
+            if settings:
+                context['experiment_decision']['saved_validation_configuration'] = copy.deepcopy(
+                    settings['context']['experiment_decision']['saved_validation_configuration'])
+            from .experiment_source_followup import KEY as SOURCE_CALLS
+            source_assignment = saved['independent_review'].get(SOURCE_CALLS)
+            if source_assignment:
+                material = source_assignment['context']['experiment_decision'][SOURCE_CALLS]['source']
+                context['experiment_decision'][SOURCE_CALLS] = {'evidence': material['evidence'], 'symbols': material['symbols'],
+                    'source_sha256': sha(material), 'locations': [
+                        {'path': p['path'], 'source_sha256': p['source_sha256'], 'first_line': p['first_line'],
+                         'last_line': p['last_line'], 'read_with': {'name': 'experiments.inspect_module',
+                            'arguments': {**p['read_with']['arguments'], 'offset': p['offset'], 'limit': p['end']-p['offset']}}}
+                        for p in material['source_pages']]}
             context['artifact_review_results'] = {'sha256': sha(results), 'results': results,
                 'execution_authorized': False, 'scientific_approval': False}
     context, instruction = await anchor_for_phase(engine, run_id, record, context, instruction, checkpoint, 'vote')
     context.update(decision_proposal=record['proposal'], proposal_sha256=record['proposal_sha256'])
+    if record.get('bind_review_notes_to_vote'):
+        reading = context['experiment_decision'][consensus_reading.KEY]
+        reading['current_vote'] = {'decision_id': record['id'], 'proposal_sha256': record['proposal_sha256'],
+            'role_reports_sha256': sha(reading['roles']), 'approval_inherited': False}
+    if point_reads.KEY in record:
+        context[point_reads.KEY]['this_point'] = point_reads.this_point(record['analysis_reads'], context)
     from .optimization_read_recovery import vote_context
     context = vote_context(record, context)
     from .training_proposal_reads import vote_context as proposal_read_context
@@ -780,29 +1115,56 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
         context['experiment_decision']['parameter_control_recovery'] = copy.deepcopy(record['parameter_control_recovery'])
     if not record['votes']:
         vote_purpose = 'experiment_vote:' + record['proposal_sha256']
+        if record.get('experiment_vote_focus_protocol') in (1, 2):
+            context['experiment_vote_focus_protocol'] = record['experiment_vote_focus_protocol']
+        if record.get('experiment_vote_notes_protocol') == 1:
+            context['experiment_vote_notes_protocol'] = 1
+            if 'prior_inspections' not in record:
+                from .experiment_review_reads import inspections
+                from .experiment_input_sources import cited_pages
+                links = await engine._read_consensus_check(run_id, inspections, engine, run_id, record)
+                pages = await engine._read_consensus_check(run_id, cited_pages, engine, run_id, record)
+                await checkpoint(prior_inspections=links, **({'cited_proposal_reads': pages} if pages else {}))
+            if record['prior_inspections']:
+                context['experiment_decision']['prior_inspections'] = record['prior_inspections']
+            if record.get('cited_proposal_reads'):
+                context['experiment_decision']['cited_proposal_reads'] = record['cited_proposal_reads']
+        if record.get('consensus_reading_protocol') in (1, 2):
+            from . import experiment_review_reuse
+            if experiment_review_reuse.KEY not in record:
+                if record['consensus_reading_protocol'] == 1:
+                    prior = await engine._read_consensus_check(run_id, experiment_review_reuse.prepare, engine, run_id, record, context)
+                else:
+                    prior = await engine._read_consensus_check(run_id, experiment_review_reuse.prepare_after_analysis,
+                                                              engine, run_id, record, context, 4)
+                await checkpoint(**{experiment_review_reuse.KEY: prior})
+            if record[experiment_review_reuse.KEY]:
+                context[experiment_review_reuse.KEY] = record[experiment_review_reuse.KEY]
         vote_instruction = (instruction + '\n独立核对本批次必要性、假设、预算、停止条件和证据。只有无阻塞异议才批准。'
             'issues 仅填写阻止当前 action 的具体问题；批准时 issues=[]。已知局限与后续门禁保留在 rationale。')
         if record.get(artifact_handoff.KEY):
             from .experiment_artifact_review import vote_instruction as artifact_vote_instruction
             try:
-                vote_instruction = artifact_vote_instruction(
-                    engine, run_id, vote_purpose, vote_instruction, context, VOTE)
+                vote_instruction = await engine._read_consensus_check(
+                    run_id, artifact_vote_instruction, engine, run_id, vote_purpose, vote_instruction, context, VOTE)
             except (ValueError, KeyError, TypeError) as exc:
                 await checkpoint(status='blocked_evidence', rejection=str(exc))
                 raise ResearchBlocked(str(exc)) from exc
         votes = await _group(harness, run_id, vote_purpose, vote_instruction, context, VOTE)
+        verified_artifacts = {}
         if record.get(artifact_handoff.KEY):
-            from .experiment_artifact_review import vote_reads
+            from .experiment_artifact_review import finish_votes
             try:
-                reads = [vote_reads(engine, run_id, record, v['role'], vote_purpose,
-                    vote_instruction, context, VOTE) for v in votes]
+                votes, reads = await finish_votes(engine, harness, run_id, record, votes,
+                    {'purpose': vote_purpose, 'instruction': vote_instruction, 'context': context, 'schema': VOTE},
+                    checkpoint)
             except (ValueError, KeyError, TypeError, StopIteration) as exc:
                 await checkpoint(status='blocked_evidence', rejection=str(exc))
                 raise ResearchBlocked(str(exc)) from exc
-            await checkpoint(**{artifact_handoff.KEY: {**record[artifact_handoff.KEY], 'review_reads': reads}})
+            verified_artifacts[artifact_handoff.KEY] = {**record[artifact_handoff.KEY], 'review_reads': reads}
         accepted = all(v['approve'] is True and not v['issues'] and v['evidence_sha256'] == ref['sha256']
                        and v['proposal_sha256'] == record['proposal_sha256'] for v in votes)
-        await checkpoint(votes=votes, status='approved' if accepted else 'disputed')
+        await checkpoint(votes=votes, status='approved' if accepted else 'disputed', **verified_artifacts)
         engine.store.event(run_id, 'experiment.decision', record['proposal']['action'],
             {'decision_id': key, 'evidence_sha256': ref['sha256'], 'status': record['status']})
     if record.get('vote_clarifications') or any(v.get('approve') is True and v.get('issues') for v in record['votes']):
@@ -820,7 +1182,8 @@ async def _decide(engine, harness, run_id, transport=None, *, evidence=None, rec
                        and v['proposal_sha256'] == record['proposal_sha256'] for v in votes)
         await checkpoint(votes=votes, status='approved' if accepted else 'disputed')
     await checkpoint()
-    validate_proposal(record['proposal'], evidence, ref['sha256'],
+    validate_proposal(record['proposal'], evidence, ref['sha256'], run_id=run_id,
+        contract_version=record.get('validated_author_version', author_version),
         artifact_evidence=artifact_handoff.bound_evidence(engine, run_id, record, record['proposal']))
     if record['proposal']['action'] == 'search_parameters' and evidence.get('hyperparameter_yaml', {}).get('ready'):
         from .hyperparameter_yaml import validate_candidate as validate_yaml_candidate
@@ -848,18 +1211,42 @@ def analysis_receipts(engine, run_id, analysis, context, *, purpose=None, instru
     from .engine import Harness, ResearchBlocked
     purpose = purpose or 'experiment_diagnose:' + context['evidence_sha256']
     from .training_investigation import guidance
-    key = Harness.decision_key(run_id, analysis['role'], purpose, instruction or guidance(GUIDANCE, context),
-                               context, analysis_schema(context))
+    from .independent_full_review import decision_key
+    key = decision_key(engine, run_id, analysis, purpose, instruction or guidance(GUIDANCE, context),
+                       context, analysis_schema(context))
     handoff = engine.store.get('handoffs', key) or {}
     frozen_input = engine.store.get('handoff_inputs', key) or {}
     if (handoff.get('run_id') != run_id or handoff.get('to_role') != analysis['role']
             or frozen_input.get('context', {}).get('validation_evidence') != context['validation_evidence']):
         raise ResearchBlocked('Analysis receipts are not owned by this exact role and handoff')
     progress = engine.store.get('handoff_progress', key) or {}
+    from . import independent_full_review as full_review
+    if full_review.KEY in analysis:
+        progress = {**progress, 'tool_results': [row for hid in full_review.reading_handoffs(engine.store, run_id, analysis)
+            for row in (engine.store.get('handoff_progress', hid) or {}).get('tool_results', [])]}
     valid, kinds, source = set(), set(), False
     training_trials, source_paths = set(), set()
     coverage = {}
     strict = context.get('experiment_decision', {}).get('training_investigation', {}).get('version', 1) >= 2
+    from .tuning_point_reads import items_for
+    from .training_read_dispatch import _gaps
+    carried = items_for(engine, run_id, context, analysis['role'])
+    source_ranges = {}
+    comparison_ranges = {}
+    carried_ids = set()
+    for item in carried:
+        kind, locator = item['kind'], item['key']
+        carried_ids.update(pair[1] for pair in item['receipts'])
+        if kind == 'training':
+            coverage[locator] = {'analysis_sha256': item['sha256'], 'total_chars': item['total_chars'],
+                                 'ranges': copy.deepcopy(item['ranges'])}
+            if not _gaps(item['total_chars'], item['ranges']):
+                kinds.add('training')
+        if kind == 'source':
+            source_ranges[locator] = {'sha256': item['sha256'], 'total_chars': item['total_chars'],
+                                      'ranges': copy.deepcopy(item['ranges'])}
+        if kind == 'comparison' and locator == context['tuning_point_reads']['latest_unit'] and not _gaps(item['total_chars'], item['ranges']):
+            kinds.add(kind)
     from .training_read_continuation import retained_rows, retained_handoff
     prior_reads = retained_rows(engine, run_id, analysis['role'], context)
     for receipt in prior_reads + progress.get('tool_results', []):
@@ -877,6 +1264,9 @@ def analysis_receipts(engine, run_id, analysis, context, *, purpose=None, instru
         valid.add(identity)
         if call['name'] == 'experiments.analyze':
             kinds.add(result['kind'])
+            if context.get('tuning_point_reads') and result['kind'] == 'comparison':
+                unit = call['arguments']['unit_id']
+                comparison_ranges.setdefault((unit, result['total_chars']), []).append([result['offset'], result['end']])
             if result['kind'] == 'training':
                 trial = call['arguments']['trial_id']
                 if not strict:
@@ -896,14 +1286,33 @@ def analysis_receipts(engine, run_id, analysis, context, *, purpose=None, instru
                         item = coverage.setdefault(trial, {'analysis_sha256': sha(report), 'total_chars': len(text), 'ranges': []})
                         if item['analysis_sha256'] == sha(report):
                             item['ranges'].append([start,end])
-        if result.get('source_read') is True:
+        if context.get('tuning_point_reads') and result.get('source_read') is True:
+            if call['arguments'].get('snapshot', 'current') != 'current':
+                continue
+            item = source_ranges.setdefault(result['path'], {'sha256': result['source_sha256'],
+                'total_chars': result['total_chars'], 'ranges': []})
+            if item['sha256'] == result['source_sha256'] and item['total_chars'] == result['total_chars']:
+                item['ranges'].append([result['offset'], result['end']])
+        elif result.get('source_read') is True:
             source = True
             source_paths.add(result['path'])
+    for path, item in source_ranges.items():
+        if not _gaps(item['total_chars'], item['ranges']):
+            source_paths.add(path)
+            source = True
+    valid.update(set(analysis['read_receipts']) & carried_ids)
+    missing = set(analysis['read_receipts']) - valid
+    if missing and full_review.KEY in analysis:
+        from .experiment_review_reads import material_reads
+        extra, files = material_reads(engine, run_id, analysis['role'], key, context, missing)
+        valid.update(extra)
+        source_paths.update(files)
+        source = source or bool(files)
     if set(analysis['read_receipts']) != valid or not kinds:
         raise ResearchBlocked('Agent analysis lacks actual same-role, same-evidence tool read receipts')
     from .saved_runtime_audit import require_reads as require_runtime_audit_reads
     try:
-        require_runtime_audit_reads(engine, run_id, context, prior_reads + progress.get('tool_results', []))
+        require_runtime_audit_reads(engine, run_id, context, prior_reads + progress.get('tool_results', []), carried)
     except ValueError as exc:
         raise ResearchBlocked(str(exc)) from exc
     for trial, item in coverage.items():
@@ -919,6 +1328,9 @@ def analysis_receipts(engine, run_id, analysis, context, *, purpose=None, instru
             'module_source_read': source, 'receipt_sha256s': sorted(valid),
             'training_trials_read': sorted(training_trials), 'source_paths': sorted(source_paths),
             'critical_training_reads': coverage,
+            **({'tuning_point_reads_sha256': context['tuning_point_reads']['sha256'],
+                'comparisons_read': [unit for (unit,total), ranges in comparison_ranges.items() if not _gaps(total, ranges)],
+                'source_page_ranges': source_ranges} if context.get('tuning_point_reads') else {}),
             **({'retained_read_origin': {
                 'handoff_id': retained_handoff(context),
                 'receipt_sha256s': sorted({r['result']['receipt_sha256'] for r in prior_reads} & valid)}}
@@ -931,6 +1343,9 @@ def _supplementary_analysis_read(engine, run_id, context, call, result):
     args = call.get('arguments') or {}
     body = {k:v for k,v in result.items() if k != 'receipt_sha256'}
     try:
+        if call.get('name') == 'experiments.files':
+            from .experiment_files import replay_page
+            return bool(args.get('path') and result.get('text') and replay_page(engine, run_id, context, args, body))
         if call.get('name') == 'hyperparameters.read':
             from .hyperparameter_yaml import replay_read
             return replay_read(engine, run_id, context, args) == body
@@ -964,6 +1379,7 @@ def _assert_binding(engine, run_id, state):
 
 
 def _approved(record):
+    from .independent_full_review import members, reviewers
     votes = record.get('votes', [])
     reads = record.get('analysis_reads', [])
     from .experiment_evidence_handoff import KEY, requested
@@ -973,15 +1389,15 @@ def _approved(record):
     from .artifact_fact_review import reference as artifact_reference
     handoff = record.get(KEY)
     if (requested(record.get('proposal') or {}) or not require_binding(record)
-            or not complete(reads, record.get('proposal') or {}) or not training_reads_complete(record)):
+            or not complete(reads, record.get('proposal') or {}, reviewers(votes)) or not training_reads_complete(record)):
         return False  # A request for evidence is never execution authorization.
     if handoff and (record.get('proposal', {}).get('artifact_evidence_sha256') != artifact_reference(handoff)['sha256']
             or not handoff.get('author_read')
-            or {r.get('role') for r in handoff.get('review_reads', [])} != {'director', 'engineer', 'scout'}):
+            or {r.get('role') for r in handoff.get('review_reads', [])} != set(reviewers(votes))):
         return False
     return (record.get('status') == 'approved' and record.get('proposal_sha256') == sha(record.get('proposal'))
-        and len(reads) == 3 and {r.get('role') for r in reads} == {'director', 'engineer', 'scout'}
-        and len(votes) == 3 and {v.get('role') for v in votes} == {'director', 'engineer', 'scout'}
+        and len(reads) == len(reviewers(votes)) and {r.get('role') for r in reads} == set(reviewers(votes))
+        and members(votes)
         and all(v.get('approve') is True and v.get('issues') == []
             and v.get('proposal_sha256') == record['proposal_sha256']
             and v.get('evidence_sha256') == record.get('evidence', {}).get('sha256') for v in votes))
@@ -997,6 +1413,9 @@ def authorize_job(engine, run_id, name, params):
     pending = state.get('pending') or {}
     if pending.get('status') != 'executing' or dict(pending.get('jobs', [])).get(name) != params:
         raise ResearchBlocked('This validation job has no current one-batch decision authorization')
+    if pending.get('authorization') == 'approved_bayesian_script':
+        from .bayesian_batch import invocation
+        return invocation(engine, run_id, state, name, params)
     if pending.get('decision_id'):
         decision = engine.store.get(DECISIONS, pending['decision_id']) or {}
         if (not _approved(decision) or decision.get('run_id') != run_id
@@ -1044,7 +1463,10 @@ async def _execute(engine, harness, run_id, state, transport=None):
             break
         authorize_job(engine, run_id, name, params)
         try:
-            await train(engine, harness, run_id, name, copy.deepcopy(params))
+            if pending.get('authorization') == 'approved_bayesian_script':
+                await engine._trial(run_id, harness, name, copy.deepcopy(params))
+            else:
+                await train(engine, harness, run_id, name, copy.deepcopy(params))
         except ResearchBlocked:
             engine.check_active(run_id)
             current = await engine._read_consensus_check(run_id, ledger, engine, run_id)
@@ -1073,19 +1495,23 @@ async def _execute(engine, harness, run_id, state, transport=None):
         decision=engine.store.get(DECISIONS, pending.get('decision_id', '')))
 
 
-def _commit_batch(engine, run_id, state, unit, decision=None):
+def _pending_batch(engine, run_id, unit, decision):
     own = {sha(p) for _, p in unit['jobs']}
     rows = _safe_rows([r for r in validation_records(engine.store, run_id)
         if (r.get('research_cycle') or 1) == engine.cycle(run_id) and not r.get('superseded')])
-    from .rapid_experiment_revision import _budget
-    view = ledger(engine, run_id)
-    remaining = sum(j['state'] == 'missing' and j['name'] in dict(unit['jobs']) for j in view['jobs'])
-    _budget(engine, run_id, remaining)
-    state['pending'] = {'unit_id': unit['id'], 'jobs': unit['jobs'], 'status': 'executing',
+    return {'unit_id': unit['id'], 'jobs': unit['jobs'], 'status': 'executing',
         'outside_records': {r['id']: sha(r) for r in rows if sha(r['params']) not in own},
         'decision_id': decision['id'] if decision else None,
         'proposal_sha256': decision['proposal_sha256'] if decision else None,
         'authorization': 'three_agent_decision' if decision else 'approved_plan_initial_baseline_comparison'}
+
+
+def _commit_batch(engine, run_id, state, unit, decision=None):
+    from .rapid_experiment_revision import _budget
+    view = ledger(engine, run_id)
+    remaining = sum(j['state'] == 'missing' and j['name'] in dict(unit['jobs']) for j in view['jobs'])
+    _budget(engine, run_id, remaining)
+    state['pending'] = _pending_batch(engine, run_id, unit, decision)
     if decision:
         state['last_decision'] = decision['id']
     engine.store.put(SESSIONS, state['id'], state)
@@ -1096,6 +1522,11 @@ async def run_stage(engine, harness, run_id, stage, plan, transport=None):
     from .engine import ResearchBlocked, ResearchRevisionRequired, ResearchExperimentStopped
     from .experiment_evidence_handoff import requested as artifact_handoff_requested
     scope_checked = False
+    if stage == 'architecture_tuning':
+        from .tuning_diagnostics import execute_scoped
+        diagnostic = await execute_scoped(engine, harness, run_id, stage)
+        if diagnostic:
+            return diagnostic
     if stage == 'tuning':
         from .yaml_migration import required as yaml_migration_required
         migration_due = yaml_migration_required(engine, run_id)
@@ -1121,12 +1552,28 @@ async def run_stage(engine, harness, run_id, stage, plan, transport=None):
         if not evidence['records']:
             initial = next(u for u in units(plan, transport) if u['kind'] == 'pilot')
             _commit_batch(engine, run_id, state, initial)
+    if stage == 'experiments' and state.get('repair_request'):
+        from .validation_repair import execute as repair_validation
+        state = await repair_validation(engine, harness, run_id, state)
     _assert_binding(engine, run_id, state)
     if state.get('pending'):
         if stage == 'architecture_tuning':
             return _dispatch_architecture_validation(engine, run_id)
         await _execute(engine, harness, run_id, state, transport)
     if stage == 'experiments':
+        if plan.get('baseline_mode') == 'paper_reported':
+            # Each declared paper condition has its own initial pilot. This does
+            # not admit a search point or a final test before its decision.
+            for pilot in (u for u in units(plan, transport) if u['kind'] == 'pilot'):
+                view = await engine._read_consensus_check(run_id, ledger, engine, run_id)
+                states = {j['name']:j['state'] for j in view['jobs']}
+                remaining = [states[name] for name,_ in pilot['jobs'] if states[name] != 'completed']
+                if not remaining:
+                    continue
+                if any(v != 'missing' for v in remaining):
+                    raise ResearchBlocked('论文条件首批自有模型验证有未解决的执行回执：'+pilot['id'])
+                _commit_batch(engine,run_id,state,pilot)
+                await _execute(engine,harness,run_id,state,transport)
         return {'adaptive_decisions': True, 'session_id': state['id'], 'plan_hash': sha(plan)}
     from .dataset_optimization import route
     redirect = route(engine, run_id, stage)
@@ -1140,6 +1587,28 @@ async def run_stage(engine, harness, run_id, stage, plan, transport=None):
     # The finite frozen pool bounds the number of execution decisions; a decision
     # with no executable batch must terminate or enter a newly reviewed cycle.
     for _ in range(len(units(plan, transport)) + 1):
+        requested = engine.store.get('runs', run_id)
+        batch_from = requested['state'].get('agent_bayesian_batch_from_cycle')
+        if stage == 'tuning' and (requested['config'].get('combination_validation_protocol') == 3
+                                  or type(batch_from) is int and engine.cycle(run_id) >= batch_from):
+            from . import bayesian_batch
+            from .combination_validation import prepare as prepare_plan
+            from .combination_settings import ensure as ensure_settings
+            candidate = await engine._read_consensus_check(run_id, snapshot, engine, run_id, transport)
+            if candidate.get('combination_validation', {}).get('version') == 3:
+                if await ensure_settings(engine, harness, run_id, candidate):
+                    return {'next_node': 'tuning', 'tuning_pending': True, 'activity': 'batch_script_review'}
+                await engine._read_consensus_check(run_id, prepare_plan, engine, run_id, candidate)
+                progress = candidate['combination_validation']
+                if progress['status'] == 'complete' and progress.get('plan_id') and not engine.store.get('bayesian_search_results', progress['plan_id']):
+                    reviewed, script = await engine._read_consensus_check(run_id, bayesian_batch.approved, engine, run_id, candidate)
+                    bayesian_batch.finish(engine, run_id, candidate, reviewed, script)
+                if bayesian_batch.ready(engine, run_id, candidate):
+                    reviewed, script = await engine._read_consensus_check(run_id, bayesian_batch.approved, engine, run_id, candidate)
+                    await harness.execute_controller_tool(run_id, 'engineer', 'bayes.start_search',
+                        {'script_id': script['id'], 'plan_id': reviewed['id']},
+                        purpose='execute_reviewed_bayesian_script:' + sha(candidate))
+                    return {'next_node': 'tuning', 'tuning_pending': True, 'activity': 'batch_search_finished'}
         from .experiment_consensus import ConsensusPending
         try:
             decision, evidence = await decide(engine, harness, run_id, transport)
@@ -1163,6 +1632,12 @@ async def run_stage(engine, harness, run_id, stage, plan, transport=None):
             return refine_tuning_scope(engine, run_id, decision, evidence)
         if artifact_handoff_requested(proposal):
             raise ResearchBlocked('Read-only evidence requests must finish their engineer handoff before dispatch')
+        if proposal['action'] == 'search_parameters':
+            from .parameter_search import register
+            register(engine, run_id, decision, evidence, session=state)
+            await _execute(engine, harness, run_id, state, transport)
+            return {'adaptive_decisions': True, 'tuning_pending': True, 'next_node': 'tuning',
+                    'decision_id': decision['id'], 'activity': 'parameter_search'}
         state['last_decision'] = decision['id']
         engine.store.put(SESSIONS, state['id'], state)
         if proposal['action'] in {'accept_architecture', 'complete_optimization'}:
@@ -1172,13 +1647,6 @@ async def run_stage(engine, harness, run_id, stage, plan, transport=None):
             return {'adaptive_decisions': True, 'decision_id': decision['id']}
         if proposal['action'] == 'stop':
             raise ResearchExperimentStopped(decision['id'], proposal['rationale'])
-        if proposal['action'] == 'search_parameters':
-            from .parameter_search import register
-            unit = register(engine, run_id, decision, evidence)
-            _commit_batch(engine, run_id, state, unit, decision)
-            await _execute(engine, harness, run_id, state, transport)
-            return {'adaptive_decisions': True, 'tuning_pending': True, 'next_node': 'tuning',
-                    'decision_id': decision['id'], 'activity': 'parameter_search'}
         if proposal['action'] == 'revise_architecture' or proposal['unit_id'] is None:
             raise ResearchRevisionRequired(proposal['rationale'], kind='experiment_decision_revision',
                 details={'decision_id': decision['id'], 'proposal_sha256': decision['proposal_sha256'],
@@ -1262,8 +1730,8 @@ def record_revision(engine, run_id, stage, step, failure):
     from .training_investigation import scoped_repair
     if stage in {'tuning', 'architecture_tuning'} and scoped_repair(reviewed['proposal']):
         from .tuning_diagnostics import begin
-        begin(engine, run_id, {'failure': failure}, step)
-        return {'cycle': engine.cycle(run_id), 'next_node': 'tuning'}
+        diagnostic = begin(engine, run_id, {'failure': failure}, step, stage=stage)
+        return {'cycle': engine.cycle(run_id), 'next_node': diagnostic.get('stage', 'tuning')}
     cycle = engine.cycle(run_id)
     run = engine.store.get('runs', run_id)
     from .rapid_experiment_revision import count

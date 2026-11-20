@@ -75,8 +75,24 @@ def rapid_code_length_paths(purpose, schema, value):
     return paths
 
 
+def refill_schema(schema, value):
+    """Keep valid siblings and existing array entries while the owner supplies missing data."""
+    def preserve(node, old):
+        if Draft202012Validator(node).is_valid(old):
+            return {'const':old}
+        if isinstance(old, dict) and 'properties' in node:
+            fields = {k:preserve(node['properties'][k],v) for k,v in old.items() if k in node['properties']}
+            return {'properties':fields,'required':list(fields)}
+        if isinstance(old,list) and old and isinstance(node.get('items'),dict) and not node.get('uniqueItems'):
+            return {'prefixItems':[preserve(node['items'],v) for v in old], 'minItems':len(old)}
+        return {}
+    result = copy.deepcopy(schema)
+    result.setdefault('allOf',[]).append(preserve(schema,value))
+    return result
+
+
 def derive_source(store, intelligence, run_id, key, original, *, syntax=False, experiment_notes=False,
-                  rapid_code_limits=False):
+                  rapid_code_limits=False, request_refill=True, tool_hashes=False, fixture_archives=None):
     from .engine import Harness, digest
     from .intelligence import Intelligence, ProviderError, parse_json, parse_provider_json
     if not isinstance(intelligence, Intelligence):
@@ -85,6 +101,12 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
     handoff = store.get('handoffs', key, {})
     run = store.get('runs', run_id, {})
     prepared = original.get('prepared', {})
+    from .code_review_catalog import CATALOG
+    from .review_evidence_supplement import FIELD as SUPPLEMENT
+    projected = bool(prepared.get('context',{}).get(CATALOG))
+    revision_directory = (bool(inputs.get('context',{}).get('code_revision_review'))
+        and bool(prepared.get('context',{}).get('revision_answer_sources')))
+    revision_v2 = inputs.get('context',{}).get('code_revision_review',{}).get('answer_schema_version') == 2
     role = prepared.get('role')
     if (run.get('mode') != 'live' or run.get('status') not in {'running', 'paused', 'blocked'}
             or store.get('run_deletions', run_id) or store.get('decisions', key)
@@ -95,7 +117,8 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
                                             inputs.get('context'), inputs.get('schema'))
             or not all(field in prepared for field in ('task', 'context', 'schema'))):
         return None
-    provider = intelligence.provider_for(role)
+    from .task_reasoning import request_provider
+    provider = request_provider(intelligence, prepared)
     if (provider['id'], provider['model']) != (original.get('provider_id'), original.get('model')):
         return None
     operation = intelligence._operation_identity(role, prepared['task'], prepared['context'], prepared['schema'])
@@ -139,7 +162,7 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
     if (any(output.get(field) != row.get(field) for field in
             ('run_id', 'role', 'provider', 'model', 'operation_id', 'response_metadata'))
             or not isinstance(text, str) or not text
-            or (not rapid_code_limits and len(text) > (128_000 if syntax else 24_000))):
+            or (not rapid_code_limits and len(text) > (128_000 if syntax or projected or revision_directory or revision_v2 else 24_000))):
         return None
     if provider.get('protocol') == 'local_codex':
         from .codex_reasoning import TRANSPORT_SCHEMA, profile
@@ -166,6 +189,12 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
         if native_text != text:
             return None
     hash_omission = None
+    location_correction = None
+    section_read = None
+    packet_confirmation = None
+    refill = None
+    revision_fields = None
+    revision_sources = None
     try:
         parse_provider_json(text, prepared['schema'], metadata)
         return None  # Locally recoverable or already valid: no paid correction.
@@ -186,7 +215,25 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
         except json.JSONDecodeError:
             pass
     else:
-        if rapid_code_limits:
+        if fixture_archives is not None:
+            work=inputs['context'].get('implementation_work',{})
+            calls=value.get('tool_calls') if isinstance(value,dict) else None
+            if (work.get('action')!='implementation_code_review' or 'fixture_receipt' not in work.get('materials',{})
+                    or not isinstance(value,dict) or set(value)!={'tool_calls'} or not isinstance(calls,list) or not calls):
+                return None
+            for call in calls:
+                if not isinstance(call,dict) or call.get('name')!='artifacts.read': return None
+                args=call.get('arguments')
+                if (not isinstance(args,dict) or not isinstance(args.get('artifact_id'),str)
+                        or not isinstance(args.get('expected_sha256'),str)
+                        or (args['artifact_id'],args['expected_sha256']) not in fixture_archives):
+                    return None
+            return {'request_id':row['id'],'transcript_id':output['id'],'receipt_sha256':digest([row,output])}
+        if tool_hashes:
+            from .request_hash_reset import corrected_calls
+            if syntax or experiment_notes or rapid_code_limits or corrected_calls(store, run_id, prepared, value) is None:
+                return None
+        elif rapid_code_limits:
             from .rapid_output_length import schema_without_code_limits
             if (syntax or experiment_notes or not handoff.get('purpose', '').startswith('rapid_implement:')
                     or not isinstance(value, dict) or 'tool_calls' in value
@@ -203,19 +250,100 @@ def derive_source(store, intelligence, run_id, key, original, *, syntax=False, e
         # but only with authenticated original source reads and frozen files.
         # Different valid hashes and quantitative gates remain substantive.
         if not experiment_notes and not rapid_code_limits:
+            branches = [b for b in prepared['schema'].get('anyOf',[prepared['schema']])
+                        if b.get('properties') and 'tool_calls' not in b['properties']]
             from .rapid_review_hash_recovery import omission
             hash_omission = omission(store, run_id, key, value) if not syntax else None
+            from .host_location_correction import analyze as location_errors
+            location_correction = location_errors(handoff.get('purpose'), inputs['context'], inputs['schema'], value)
+            if location_correction and (
+                    inputs['context']['bounded_evidence_review'].get('role') != role
+                    or len(branches) != 1
+                    or location_errors(handoff.get('purpose'), inputs['context'], branches[0], value) != location_correction):
+                return None
+            from . import host_section_recovery as sections
+            from . import host_packet_correction as packets
+            purpose = handoff.get('purpose')
+            if packets.applies(purpose, role, inputs['context']):
+                packet_id = inputs['context'][sections.packets.KEY]['packet_sha256']
+                must_echo = 'packet_sha256' in inputs['schema'].get('required', [])
+                if ('packet_sha256' in value or must_echo) and value.get('packet_sha256') != packet_id:
+                    packet_confirmation = packets.analyze(purpose, role, inputs, prepared, value)
+                    if not packet_confirmation:
+                        return None
+                    if provider.get('protocol') == 'local_codex':
+                        try:
+                            if not sections.delivery_matches(store, native, inputs):
+                                return None
+                        except (KeyError, TypeError, ValueError):
+                            return None
+            if sections.is_read(handoff.get('purpose'), role, inputs['context']):
+                packet = inputs['context'][sections.packets.KEY]
+                if prepared['context'].get(sections.packets.KEY) != packet:
+                    return None
+                section_read = sections.analyze(handoff['purpose'], role, inputs['context'], inputs['schema'], value)
+                if section_read:
+                    if (len(branches) != 1 or sections.analyze(handoff['purpose'], role, inputs['context'], branches[0], value) != section_read
+                            or not section_read['unresolved_indices'] and provider.get('protocol') == 'local_codex'):
+                        return None
             errors = list(Draft202012Validator(inputs['schema']).iter_errors(value))
+            if request_refill and len(branches) == 1 and not any((hash_omission,location_correction,section_read,packet_confirmation)):
+                wire_errors = list(Draft202012Validator(branches[0]).iter_errors(value))
+                keywords = {e.validator for e in wire_errors}
+                if (revision_directory or revision_v2) and wire_errors:
+                    from .code_revision_review import answer_sources, constrain_answer_schema
+                    from .independent_full_review import KEY as review_key
+                    from .prose_schema import relax
+                    expected_schema = relax(inputs['schema'])
+                    directory = prepared['context'].get('revision_answer_sources', {})
+                    schema_role = role if directory.get('version') == 2 else None
+                    constrain_answer_schema(expected_schema, inputs['context'], role=schema_role)
+                    fields = {e.absolute_path[0] if e.absolute_path else None for e in wire_errors}
+                    revision_sources = answer_sources(inputs['context'], role=schema_role)
+                    if (prepared['context'].get(review_key) != inputs['context'].get(review_key)
+                            or revision_directory and prepared['context']['revision_answer_sources'] != revision_sources
+                            or expected_schema != branches[0]):
+                        return None
+                    if provider.get('protocol') == 'local_codex':
+                        from .native_retained_response import captured_delivery
+                        if not captured_delivery(store,native,inputs):
+                            return None
+                    if (fields <= {'previous_issues','code_evidence','repair_findings'}
+                            and keywords <= {'enum','minItems','maxItems','contains','uniqueItems','required'}
+                            and all(e.absolute_path[0] != 'repair_findings' or
+                                e.validator == 'enum' and e.absolute_path[-1] in {'requirement_id','origin_id'}
+                                for e in wire_errors)):
+                        revision_fields = sorted(fields)
+                        refill = branches[0]
+                    elif keywords <= {'required','type','additionalProperties'}:
+                        refill = branches[0]  # Ordinary structural refill, still bound to the effective schema.
+                    else:
+                        # Do not pin invalid references or downgrade to the broad frozen schema.
+                        return None
+                if refill is None and ((projected and keywords and (SUPPLEMENT in prepared['context'] or
+                        keywords <= {'additionalProperties','required','type','minItems','anyOf','contains','enum'}))
+                        or keywords and keywords <= {'required','type','minItems','enum'} and
+                        keywords.intersection({'minItems','enum'}) and not narrative_length_paths(
+                            handoff.get('purpose'),inputs['schema'],value)):
+                    refill = branches[0]
             prose_paths = narrative_length_paths(handoff.get('purpose'), inputs['schema'], value)
             if prose_paths and not narrative_length_paths(handoff.get('purpose'), prepared['schema'], value):
                 return None  # A later prose edit cannot change previously frozen fields.
-            if not errors or (any(error.validator not in {'required', 'type', 'additionalProperties'} for error in errors)
+            if refill is None and (not errors or (any(error.validator not in {'required', 'type', 'additionalProperties'} for error in errors)
                     and not rapid_code_length_paths(handoff.get('purpose'), inputs['schema'], value)
                     and not hash_omission
-                    and not narrative_length_paths(handoff.get('purpose'), inputs['schema'], value)):
+                    and not location_correction
+                    and not section_read
+                    and not packet_confirmation
+                    and not narrative_length_paths(handoff.get('purpose'), inputs['schema'], value))):
                 return None
     return {'request_id': row['id'], 'transcript_id': output['id'], 'diagnostic': diagnostic,
+            **({'revision_answer_fields':revision_fields,'revision_answer_sources':revision_sources} if revision_fields else {}),
+            **({'refill_schema':refill} if refill is not None else {}),
             **({'rapid_review_hash_omission': hash_omission} if hash_omission else {}),
+            **({'host_location_correction': location_correction} if location_correction else {}),
+            **({'host_section_read': section_read} if section_read else {}),
+            **({'host_packet_confirmation': packet_confirmation} if packet_confirmation else {}),
             'original_text': text, 'original_sha256': hashlib.sha256(text.encode()).hexdigest(),
             'receipt_sha256': digest([row, output]), 'effective_output_limit': cap,
             'provider_identity': {field: provider.get(field) for field in ('id', 'model', 'protocol', 'base_url')}}
@@ -232,6 +360,18 @@ def correction_request(original, schema, operation, source):
         'Do not invent a reading plan, citations, results or approval just to pass validation. '
         'Do not call tools or repeat completed work. This is the only schema correction for this assignment.')
     value = json.loads(source['original_text'])
+    if source.get('refill_schema'):
+        schema = source['refill_schema']
+        # Pinning existing array entries would make e.g. a duplicated old ID
+        # impossible to remove. The author must independently correct mappings
+        # between issues, findings and evidence in this one bounded response.
+        if source.get('revision_answer_fields'):
+            from .code_revision_review import refill_answer_schema
+            prepared['schema'] = refill_answer_schema(schema,value)
+            prepared['context']['revision_answer_sources'] = copy.deepcopy(source['revision_answer_sources'])
+        else:
+            prepared['schema'] = refill_schema(schema,value)
+        prepared['task'] += '\n按本次实际交付 Schema 重新填写诊断列出的字段。保留已合规的字段、原判断和原有证据。'
     prose = narrative_length_paths(prepared['context'].get('_purpose'), schema, value)
     if prose:
         prepared['schema'] = constrain_prose(schema, value, prose)
@@ -288,6 +428,15 @@ def correction_request(original, schema, operation, source):
     context = prepared['context']
     context['output_schema_repair'] = {key: source[key] for key in
         ('request_id', 'transcript_id', 'diagnostic', 'original_text', 'original_sha256')}
+    if source.get('host_location_correction'):
+        from .host_location_correction import constrain
+        constrain(prepared, value, source['host_location_correction'])
+    if source.get('host_section_read'):
+        from .host_section_recovery import constrain
+        constrain(prepared, value, source['host_section_read'])
+    if source.get('host_packet_confirmation'):
+        from .host_packet_correction import constrain
+        constrain(prepared, value, source['host_packet_confirmation'])
     context['_output_token_limit'] = source['effective_output_limit']
     context['_harness_control'] = {**context.get('_harness_control', {}),
                                    'mode': 'final_only', 'operation_id': operation,

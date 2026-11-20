@@ -4,9 +4,10 @@ Exact contexts, votes, amendments and paid responses use the existing journal.
 Historical reviews are reconstructed without altering their original inputs.
 """
 import asyncio
+import json
 
 from .communication_graph import communicate
-from . import discussion_actions, idea_provenance
+from . import discussion_actions, discussion_rewind, idea_provenance
 from .storage import now
 
 
@@ -16,9 +17,19 @@ async def run(engine, h, run_id, common, execution_constraints, proposal, commit
     self = engine
     run = self.store.get('runs', run_id)
     until_stalled = run['config'].get('discussion_mode', 'bounded') == 'until_stalled'
+    initial = discussion_rewind.resume_payload(self, run, proposal, committed_at_resume) or {
+        'round_number': 1, 'proposal': proposal, 'prior_hashes': [], 'history': [],
+        'proposal_evidence_snapshot': None}
+    expected_generation = initial.get('discussion_generation')
+
+    def turn_payload(state):
+        payload = dict(state['payload'])
+        if expected_generation and payload.get('discussion_generation') != expected_generation:
+            raise ResearchBlocked('Discussion graph restored a superseded rewind generation')
+        return payload
 
     async def review_turn(state):
-        payload = dict(state['payload'])
+        payload = turn_payload(state)
         round_number, proposal = payload['round_number'], payload['proposal']
         prior_hashes, history = set(payload['prior_hashes']), list(payload['history'])
         proposal_evidence_snapshot = payload.get('proposal_evidence_snapshot')
@@ -31,6 +42,9 @@ async def run(engine, h, run_id, common, execution_constraints, proposal, commit
         current_hardware = await self.execution_hardware(run_id)
         assessment = assess_resources(proposal['resource_plan'], current_hardware, require_complete=common.get('resource_plan_protocol') == 1)
         context_key = f'{run_id}:{self.cycle(run_id)}:{round_number}:{proposal_hash}'
+        generation = payload.get('discussion_generation')
+        if generation:
+            context_key += ':rewind-' + generation
         if common.get('resource_plan_protocol') == 1:
             context_key += ':resource-policy-' + digest(current_hardware.get('execution_preferences', {}))[:16]
         if common.get('innovation_selection'):
@@ -71,6 +85,8 @@ async def run(engine, h, run_id, common, execution_constraints, proposal, commit
                     'instruction': innovation_policy.INSTRUCTION}
             context.update(source_tool_protocol=1, review_protocol_version=1, context_reference_protocol=1, evidence=(proposal_evidence_snapshot
                            if proposal_evidence_snapshot is not None else self.evidence_snapshot(run_id)))
+            if generation:
+                context['discussion_generation'] = generation
             context['previous_discussion'] = previous_review(history[-1] if history else None)
             if context.get('idea_provenance_protocol') == 1:
                 context['evidence'] = {**context['evidence'], 'novelty_search_scope': idea_provenance.search_scope(self.store, run_id)}
@@ -211,7 +227,7 @@ async def run(engine, h, run_id, common, execution_constraints, proposal, commit
             'review_evidence': evidence or record.get('evidence_assessment', {})}}
 
     async def revise_turn(state):
-        payload = dict(state['payload'])
+        payload = turn_payload(state)
         round_number, context, record = payload['round_number'], payload['context'], payload['record']
         votes, proposal_hash, evidence = payload['votes'], payload['proposal_hash'], payload['review_evidence']
         history = list(payload['history'])
@@ -245,7 +261,5 @@ async def run(engine, h, run_id, common, execution_constraints, proposal, commit
             'history': history, 'round_number': round_number + 1,
             'proposal_evidence_snapshot': proposal_evidence_snapshot}}
 
-    return await communicate(review_turn, revise_turn,
-        {'round_number': 1, 'proposal': proposal, 'prior_hashes': [], 'history': [],
-         'proposal_evidence_snapshot': None},
+    return await communicate(review_turn, revise_turn, initial,
         transition_limit=1_000_000_000 if until_stalled else 2 * run['config']['max_rounds'] + 2)

@@ -5,30 +5,53 @@ reading credit. Raw receipts stay in the journal after their prompt copy leaves.
 """
 from __future__ import annotations
 
-import ast
 import copy
 import hashlib
 
 from . import code_repair_contract as repair
+from .code_reading_memory import GUIDANCE as MEMORY_GUIDANCE
 
 TOOLS = ('code.locate', 'code.read', 'code.record_notes', 'documents.recall')
+MAX_READ_BATCH = 12
+BATCH_GUIDANCE = ('\n代码核验批量读取：可在一次 tool_calls 中核对互不依赖的已定位范围。'
+    '使用本轮工具分支允许的名称、数量和参数，单页仍遵守原范围和字符限制。'
+    '先定位再批量读相关函数和条款；同版本已读证据优先复用，不逐个组合重复读公共实现。'
+    '这只减少取证往返，不授权执行、修改或沿用其他角色的审查结论。')
+
+
+def read_batch_branch(context, allowed_tools):
+    from .engine import obj
+    if context.get('code_navigation_protocol') != 1 or not enabled(context, context.get('_purpose', '')):
+        return None
+    names = sorted(set(allowed_tools) & {'code.read', 'artifacts.read', 'documents.read', 'documents.recall'})
+    if not names:
+        return None
+    from .independent_full_review import tool_available
+    from .implementation_definition_review_scope import enabled as scoped_definition
+    maximum = 8 if (tool_available(context) or scoped_definition(context)
+                    or context.get('whole_code_source_clarification', {}).get('version') == 1) else MAX_READ_BATCH
+    return obj({'tool_calls': {'type': 'array', 'minItems': 1, 'maxItems': maximum,
+        'uniqueItems': True, 'items': obj({'name': {'enum': names}, 'arguments': {'type': 'object'}})}})
 HELP = {
     'code.locate': 'arguments={path?:exact relative file path,query?:literal symbol or text,offset?:nonnegative integer,limit?:integer 1..30}. Searches only this frozen delivery. With no path/query lists files; with path returns matching symbols/line locations. Returns artifact_id,sha256,offset,limit,start_line,end_line; navigation only, not reading evidence. Use code.read for decisive code.',
     'code.read': 'arguments={id:artifact_id,expected_sha256:64-hex,offset?:nonnegative character offset,limit?:integer 1..6000}. Reads only the requested exact frozen UTF-8 source range, preserving newlines. Returns receipt_sha256 and line/character coordinates. Read only relevant functions/callers; do not request whole repositories. Reopen with the same arguments if needed after eviction.',
-    'code.record_notes': 'arguments={notes:[{key:string,statement:string up to 1200 chars,receipt_sha256s:string[]}]}. Save concise observations or unresolved questions bound to successful code.read/documents.read receipts from this same role and handoff. No source body, new instructions, code approval or execution authorization. Save conclusions before requesting the next pages; consumed source text leaves subsequent context.',
+    'code.record_notes': 'arguments={notes:[{key:string,statement:string up to 1200 chars,receipt_sha256s:string[],code_analysis?:{version:1,conclusion:string,open_questions:string[],supersedes:old note ID[]}}]} saves; {action:read,note_id:exact old ID} reopens an original own observation without rereading code. code_analysis links actual submitted exact versions/ranges to conclusions and unresolved questions. Supersede only explicit prior own IDs with complete same-version source coverage including retained document receipts. No approval or execution authorization.',
     'documents.recall': 'arguments={document_id:string,expected_sha256:string,section_id?:string,query?:literal text,offset?:integer,limit?:integer 1..4}. Retrieve this role\'s already journaled same-version document passages and anchored notes. Prefer this before documents.read. Returns exact cached ranges with original handoff/receipt identity; no new source-reading claim. A miss means only missing memory; use documents.search/read for decisive gaps.',
 }
-GUIDANCE = ('\n代码按需阅读：先 code.locate 定位函数、调用处或关键词，再 code.read 读取必要范围。'
+AUTHOR_GUIDANCE = ('\n代码按需阅读：先 code.locate 定位函数、调用处或关键词，再 code.read 读取必要范围。'
     '目录和搜索命中不算已读。只能以批准实现文档的具体条款判定代码偏差；'
     '不能自创算法、参数、阈值、实验或测试门槛。文档未定义的行为保留待核实，不能下发修改。'
     '每批原文看完后，用 code.record_notes 保存带读取回执的简短发现和未决问题；'
     '继续读取时旧源码自动退出上下文，仅保留哈希、位置、笔记和回查入口。'
     '文档先 documents.recall 检索本角色同版本已读记忆；只在缺失、歧义或版本变化时 documents.read。'
     '补读不是重做已完成阶段，已保存同版本结论不因正文移出而作废。')
+GUIDANCE = AUTHOR_GUIDANCE + MEMORY_GUIDANCE
 
 
 def enabled(context, purpose):
-    return (context.get('code_repair_tool_review') == 1 or
+    return (context.get('whole_code_source_clarification', {}).get('version') == 1
+        and purpose.startswith('whole_code_source_clarification:') or
+        context.get('code_repair_tool_review') == 1 or
         context.get('implementation_definition_repair_protocol') == 1 and bool(context.get('definition_code_sources'))
         and purpose.split(':',1)[0] in {'implementation_spec','implementation_definition_review'} or
         context.get('implementation_alignment_protocol') == 1 and purpose.split(':', 1)[0] == 'code_review')
@@ -56,10 +79,16 @@ def packet_for(engine, run_id, context):
 
 
 def sources(engine, run_id, context):
+    if 'code_review_assignment' in context:
+        return {row['path']: row for row in context['delivery_artifacts']}
     if context.get('code_repair_tool_review') == 1:
         packet = packet_for(engine, run_id, context)
-        return {p: {**row, 'path': p} for p, row in packet['audit_sources']['code_files'].items()}
-    return {row['path']: row for row in context.get('definition_code_sources',context.get('delivery_artifacts',[]))}
+        from .repair_evidence_scope import code_sources
+        return {p: {**row, 'path': p} for p, row in code_sources(packet).items()}
+    if 'definition_code_sources' in context:
+        # The same relative path may occur on both sides of a reviewed diff.
+        return {row['artifact_id']:row for row in context['definition_code_sources']}
+    return {row['path']: row for row in context.get('delivery_artifacts',[])}
 
 
 def body(engine, run_id, context, source):
@@ -85,13 +114,20 @@ def locate(engine, run_id, role, hid, args):
     offset, limit = args.get('offset', 0), args.get('limit', 20)
     if (set(args) - {'path', 'query', 'offset', 'limit'} or not isinstance(query, str)
             or type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 30
-            or path is not None and path not in files):
+            or path is not None and not isinstance(path, str)):
         raise ValueError('Code location must stay within the frozen delivery with bounded literal search')
+    if path is not None and not any(s['path'] == path for s in files.values()):
+        from .tool_navigation import NavigationError
+        raise NavigationError('Code location must stay within the frozen delivery with bounded literal search',
+            code='frozen_code_path_unavailable', next_calls=[{'name': 'code.locate',
+                'arguments': {'offset': 0, 'limit': 20}}])
     entries = []
-    for name, source in sorted(files.items()):
-        if path is not None and path != name:
+    for source in sorted(files.values(), key=lambda s:(s['path'],s['artifact_id'])):
+        if path is not None and path != source['path']:
             continue
         meta = {k: source[k] for k in ('artifact_id', 'sha256', 'path')}
+        if 'base_attempt' in source:
+            meta['base_attempt'] = source['base_attempt']
         if path is None and not query:
             entries.append(meta)
             continue
@@ -105,15 +141,12 @@ def locate(engine, run_id, role, hid, args):
             starts.append(cursor)
             cursor += len(line)
         spans = []
-        try:
-            tree = ast.parse(text) if name.endswith('.py') else None
-        except (SyntaxError, ValueError):
-            tree = None
-        for node in ast.walk(tree) if tree else ():
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (not query or query.casefold() in node.name.casefold()):
-                start = starts[node.lineno - 1]
-                end = starts[node.end_lineno] if node.end_lineno < len(starts) else len(text)
-                spans.append({**meta, 'symbol': node.name, **coordinates(text, start, end)})
+        from .code_reading_memory import symbols
+        for symbol in symbols(source['path'], text):
+            if not query or query.casefold() in symbol['qualified_name'].casefold():
+                start, end = symbol['char_start'], symbol['char_end']
+                spans.append({**meta, 'symbol': symbol['qualified_name'].rsplit('.', 1)[-1],
+                    'qualified_symbol': symbol['qualified_name'], **coordinates(text, start, end)})
         if query:
             for number, line in enumerate(lines):
                 if query.casefold() in line.casefold() and not any(s['start_line'] == number + 1 for s in spans):
@@ -138,6 +171,13 @@ def read(engine, run_id, role, hid, args):
         raise ValueError('Code read requires the exact frozen file, SHA256 and bounded range')
     source = matches[0]
     text = body(engine, run_id, context, source)
+    from . import code_review_partition as partitions
+    if partitions.FIELD in context:
+        partitions.authenticate(engine, run_id, role, hid, context)
+        page = partitions.read_page(engine, run_id, role, hid, context, source, text, offset, limit)
+        page.update(coordinates(text, page['offset'], page['offset'] + page['limit']), untrusted=True)
+        page['receipt_sha256'] = repair.sha({'call': {'name': 'code.read', 'arguments': args}, 'result': page})
+        return page
     if offset >= len(text):
         raise ValueError('Code read range exceeds source')
     end = min(len(text), offset + limit)
@@ -212,12 +252,28 @@ def memory_owners(engine, run_id, role, hid, context):
                 or old.get('input_hash') != repair.sha({k: inputs.get(k) for k in ('instruction', 'context', 'schema')})):
             raise ValueError('Prior document memory is not this role\'s sealed evidence')
         owners.append(old_id)
+    from .review_inheritance import owners as inherited_owners
+    owners.extend(owner for owner in inherited_owners(engine, run_id, role, hid, context) if owner not in owners)
     return owners
+
+
+def _memory_arguments(context,args):
+    # The frozen review catalog already binds short references to exact IDs.
+    # Resolve that reference before checking version/ownership, just as reads
+    # do; never infer a version from a title or substitute its expected SHA.
+    from .code_review_catalog import PROTOCOL, VERSION, document_catalog
+    if context.get(PROTOCOL) in (1,VERSION):
+        docs=document_catalog(context)
+        item=docs.get(args.get('document_id'))
+        if item:
+            return {**args,'document_id':item['document_id']}
+    return args
 
 
 def recall(engine, run_id, role, hid, args):
     """Retrieve exact old pages, not an unbound LLM recollection or fresh read."""
     context = frozen(engine, run_id, role, hid)
+    args = _memory_arguments(context,args)
     sources_to_read = memory_owners(engine, run_id, role, hid, context)
     docs = context.get('indexed_documents', [])
     if context.get('code_repair_tool_review') == 1:
@@ -286,28 +342,40 @@ def recall(engine, run_id, role, hid, args):
 
 def notes(engine, run_id, role, hid, args):
     context = frozen(engine, run_id, role, hid)
+    if args.get('action') == 'read':
+        from .code_reading_memory import read_note, code_notes_schema
+        from .prose_schema import validate
+        validate(args, code_notes_schema())
+        return read_note(engine, run_id, role, hid, args['note_id'])
     owners = [hid, *audit_predecessors(engine, run_id, role, context)]
     rows = [r for owner in owners for r in engine.store.get('handoff_progress', owner, {}).get('tool_results', [])]
     known = {ref for r in rows if r.get('call', {}).get('name') in {'code.read', 'artifacts.read', 'documents.read', 'documents.recall'}
              and isinstance(r.get('result'), dict) and (r['result'].get('text') or r['result'].get('entries')) and not r['result'].get('error')
              for ref in read_receipt_ids(r)}
     values = args.get('notes')
-    if set(args) != {'notes'} or not isinstance(values, list) or not 1 <= len(values) <= 6:
+    if (set(args) - {'notes', 'action'} or args.get('action', 'save') != 'save'
+            or not isinstance(values, list) or not 1 <= len(values) <= 6):
         raise ValueError('Code notes require one to six concise observations')
     for note in values:
-        if (not isinstance(note, dict) or set(note) != {'key', 'statement', 'receipt_sha256s'}
+        if (not isinstance(note, dict) or set(note) - {'key', 'statement', 'receipt_sha256s', 'code_analysis'}
+                or not {'key', 'statement', 'receipt_sha256s'} <= set(note)
                 or not isinstance(note['key'], str) or not note['key']
                 or not isinstance(note['statement'], str) or not note['statement']
                 or not isinstance(note['receipt_sha256s'], list) or not 1 <= len(note['receipt_sha256s']) <= 20
                 or any(ref not in known for ref in note['receipt_sha256s'])):
             raise ValueError('Code notes must cite successful actual reads from this same handoff')
+    from .code_reading_memory import state, validate_notes, code_note_id
+    if any('code_analysis' in note for note in values):
+        validate_notes(state(engine, run_id, role, hid, for_save=True), values)
     return {'notes': copy.deepcopy(values), 'scientific_approval': False,
-            'provenance': 'role_observation_over_journaled_reads'}
+            'provenance': 'role_observation_over_journaled_reads',
+            'observation_ids': [code_note_id(run_id, role, hid, note) for note in values]}
 
 
 def verify_recall(engine, run_id, role, hid, args, result):
     """Check saved hits individually; later reads must not change old receipts."""
     context = frozen(engine, run_id, role, hid)
+    args = _memory_arguments(context,args)
     allowed = set(memory_owners(engine, run_id, role, hid, context))
     docs = context.get('indexed_documents', [])
     if context.get('code_repair_tool_review') == 1:
@@ -353,7 +421,8 @@ def verify_recall(engine, run_id, role, hid, args, result):
 
 def project(engine, run_id, role, hid, progress, prepared):
     context = prepared['context']
-    if not enabled(context, context.get('_purpose', '')):
+    from .implementation_definition_review_scope import enabled as scoped_definition
+    if not enabled(context, context.get('_purpose', '')) or scoped_definition(context):
         return prepared
     from .code_review_context import _consumed
     from .working_context import sha
@@ -386,7 +455,16 @@ def project(engine, run_id, role, hid, progress, prepared):
                     'scope': 'Already delivered; exact original remains in handoff_progress. Not new reading.'})
         else:
             page.setdefault('receipt_sha256', receipt)
-    return result
+    from .implementation_phase_context import enabled as isolated_author
+    if isolated_author(context):
+        # The author's phase owns the active context. Keep exact requested
+        # code receipts and reopen links without assembling review memory.
+        return result
+    from .full_review_window import requested_indices
+    result['context'].setdefault('full_review_source_window', {})['requested_tool_result_indices'] = (
+        requested_indices(progress, result['context'].get('tool_results', [])))
+    from .code_reading_memory import project as link_code
+    return link_code(engine, run_id, role, hid, result)
 
 
 def tool_limit(progress):

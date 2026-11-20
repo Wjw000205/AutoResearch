@@ -8,11 +8,13 @@ import copy
 
 KEY = 'revision_worklist'
 MAX_READS = 8
+KEY_BATCH = 'implementation_revision_read_batch'
+LARGE_BATCH = 24
 PAGE_CHARS = 6000
 GUIDANCE = ('\n批量修订：先同时检查 revision_worklist 中所有 pending_conditions，按 suggested_index_ids '
     '定位当前稿。source_ranges 来自原意见和当前稿显式引用，仅是定位线索，不是完整依赖证明。'
     '先复用记忆，集中列出全部真正缺失的材料；独立的 documents.read 在同一个 tool_calls 中批量请求，'
-    '每批最多8处、每处最多6000字符，包括同章节已知长度的后续页。不要每取一页就等待一轮模型。'
+    '每批按 max_read_calls（旧版8处、新版24处）、每处最多6000字符，包括同章节已知长度的后续页。不要每取一页就等待一轮模型。'
     'next_read_batch 是已扣除本次载入正文的候选批次；仅选择本轮修改需要的范围，'
     '不要为清空清单而读取无关材料。没有缺失依赖时立即合并相关索引修改，'
     '一次 edit_document 提交本批所有可完成位置；成功项立即保留，只重试失败项和补齐剩余条件。'
@@ -132,6 +134,7 @@ def dependencies(context, current, progress):
         {'C02': 0, 'C03': 1, 'C04': 2, 'C05': 3, 'C06': 4}.get(
         item['criterion_id'], 0), item['issue_id']))
     return {'version': 1, 'document_id': current['document']['document_id'],
+        'max_read_calls': LARGE_BATCH if context.get(KEY_BATCH) == 1 else MAX_READS,
         'write_constraints': write_constraints(context),
         'substantive_revision_first': [p['issue_id'] for p in pending if p['issue_id'] in needs_edit],
         'repair_order': '先成组完成影响实现的正文修改，再核对最终版本；不为措辞或重复状态说明另存版本。',
@@ -150,6 +153,7 @@ def dependencies(context, current, progress):
 def complete(plan, memory):
     """Subtract only text present in this request, not historical read indices."""
     plan = copy.deepcopy(plan)
+    maximum = plan.get('max_read_calls', MAX_READS)
     calls, missing_chars = [], 0
     for source in plan['source_ranges']:
         covered = [(p['char_start'], p['char_end']) for p in memory['restored_reading']
@@ -159,14 +163,14 @@ def complete(plan, memory):
         source['missing_ranges'] = missing
         for start, end in missing:
             missing_chars += end - start
-            while start < end and len(calls) < MAX_READS:
+            while start < end and len(calls) < maximum:
                 limit = min(PAGE_CHARS, end - start)
                 calls.append({'name': 'documents.read', 'arguments': {
                     'document_id': source['document_id'], 'expected_sha256': source['sha256'],
                     'section_id': source['section_id'], 'offset': start - source['section_start'], 'limit': limit}})
                 start += limit
     plan.update(next_read_batch=calls, missing_source_chars=missing_chars,
-                max_read_calls=MAX_READS, max_batch_chars=MAX_READS * PAGE_CHARS)
+                max_read_calls=maximum, max_batch_chars=maximum * PAGE_CHARS)
     return plan
 
 
@@ -181,5 +185,6 @@ def branch(context):
     validate(context)
     from .engine import obj
     from .tool_contracts import call_schema
-    return obj({'tool_calls': {'type': 'array', 'minItems': 1, 'maxItems': MAX_READS,
+    maximum = LARGE_BATCH if context.get(KEY_BATCH) == 1 else MAX_READS
+    return obj({'tool_calls': {'type': 'array', 'minItems': 1, 'maxItems': maximum,
         'uniqueItems': True, 'items': call_schema(['documents.read'], context)}})

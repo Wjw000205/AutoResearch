@@ -25,6 +25,22 @@ _RESERVED = {_CONTRACT, 'comparison_inputs', 'description'}
 _RUNNER_FIELDS = {'variant', 'phase', 'seed'}
 
 
+def dimension_name(name):
+    """Resolve known task aliases without changing saved declarations or paths."""
+    return next((key for key, aliases in _ALIASES.items() if name in aliases), name)
+
+
+def canonical_dimensions(values):
+    """Compare aliases by meaning while rejecting contradictory declarations."""
+    result = {}
+    for name, value in values.items():
+        key = dimension_name(name)
+        if key in result and not strict_equal(result[key], value):
+            raise ValueError(f'Conflicting task dimension aliases for {key}')
+        result[key] = value
+    return result
+
+
 def _finite_json(value, active=None):
     if value is None or type(value) in (str, bool, int):
         return True
@@ -228,7 +244,8 @@ def _candidates(plan):
     ablations = plan.get('ablation_candidates')
     if ablations is None and type(plan.get('ablation_params')) is dict:
         ablations = [plan['ablation_params']]
-    if type(ablations) is not list or not ablations:
+    if type(ablations) is not list or not ablations and not (
+            plan.get('condition_ablation_protocol') == 1 and plan.get('baseline_mode') == 'paper_reported'):
         _error('plan requires nonempty ablation_candidates (or legacy ablation_params)')
     for index, params in enumerate(ablations):
         if type(params) is not dict:

@@ -7,20 +7,31 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 from .local_codex import LocalCodexClient, LocalCodexError
-from .storage import now
+from .storage import now, RunDeletedError
+from .async_ownership import to_thread as owned_to_thread
 
 _locks = {}
 
 
 def due(record):
     audit = record.get('thread_cleanup', {})
-    return (audit.get('status') != 'deleted' and audit.get('attempts', 0) < 3
-            and audit.get('retry_after', '') <= now())
+    if not isinstance(audit, dict):
+        return False
+    attempts, retry = audit.get('attempts', 0), audit.get('retry_after', '')
+    return (audit.get('status') != 'deleted' and type(attempts) is int and 0 <= attempts < 3
+            and isinstance(retry, str) and retry <= now())
 
 
 def eligible(store, record):
     receipt, result = record.get('checkpoint', {}), record.get('result', {})
+    if (not isinstance(receipt, dict) or not isinstance(result, dict)
+            or any(not isinstance(record.get(field), str) or not record[field] for field in ('id', 'run_id', 'role'))
+            or not isinstance(result.get('transcript_id'), str) or not result['transcript_id']
+            or not isinstance(result.get('text'), str) or not result['text']):
+        return False
     transcript = store.get('transcripts', result.get('transcript_id', '')) or {}
+    if not isinstance(transcript, dict):
+        return False
     workspace = (store.path.parent / 'codex-reasoning' / record['id'] / record['role']).resolve()
     return (receipt.get('status') == 'completed' and receipt.get('reasoning_only') is True
         and receipt.get('auth_mode') == 'chatgpt' and not receipt.get('public_output_truncated')
@@ -35,6 +46,7 @@ def eligible(store, record):
 def _eligible_record(store, key):
     record = store.get('codex_reasoning', key)
     return record if (isinstance(record, dict) and record.get('id') == key
+                      and isinstance(record.get('run_id'), str) and not store.get('run_deletions', record['run_id'])
                       and due(record) and eligible(store, record)) else None
 
 
@@ -97,13 +109,13 @@ def _prepare_cleanup(store, key):
         return {**old, 'thread_cleanup': audit}
     try:
         store.mutate('codex_reasoning', key, claim)
-    except LocalCodexError:
+    except (LocalCodexError, RunDeletedError):
         return None
     return record, audit
 
 
 async def _cleanup_record(store, key, *, client=None):
-    prepared = await asyncio.to_thread(_prepare_cleanup, store, key)
+    prepared = await owned_to_thread(_prepare_cleanup, store, key)
     if prepared is None:
         return False
     record, audit = prepared
@@ -117,10 +129,10 @@ async def _cleanup_record(store, key, *, client=None):
         if code == 'codex_thread_writer_busy':
             audit.update(attempts=audit['attempts'] - 1,
                 retry_after=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
-        await asyncio.to_thread(store.mutate, 'codex_reasoning', key, lambda old: {**old, 'thread_cleanup': {
+        await owned_to_thread(store.mutate, 'codex_reasoning', key, lambda old: {**old, 'thread_cleanup': {
             **audit, 'error_code': code}})
         return False
-    await asyncio.to_thread(store.mutate, 'codex_reasoning', key, lambda old: {**old, 'thread_cleanup': {**audit, **result}})
+    await owned_to_thread(store.mutate, 'codex_reasoning', key, lambda old: {**old, 'thread_cleanup': {**audit, **result}})
     return True
 
 
@@ -131,7 +143,7 @@ async def cleanup_completed(store, *, run_id=None, limit=100):
     counts = {'deleted': 0, 'retained': 0}
     if limit == 0:
         return counts
-    candidates = await asyncio.to_thread(_candidate_keys, store, run_id, limit)
+    candidates = await owned_to_thread(_candidate_keys, store, run_id, limit)
     for key in candidates:
         deleted = await cleanup_record(store, key)
         counts['deleted' if deleted else 'retained'] += 1

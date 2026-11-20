@@ -131,13 +131,16 @@ def bindings(params):
     return rows
 
 
-def checked_asset(store, data_dir, run_id, asset_id, expected=None):
-    """Rehash the manifest and every retained file before reuse or staging."""
-    root = Path(data_dir).absolute()
+def checked_manifest(store, run_id, asset_id, expected=None):
+    """Authenticate the acquisition record without opening any retained file."""
     if store.get('run_deletions', run_id):
         raise RunDeletedError('Research is being deleted or has been deleted')
     record = store.get('dataset_assets', asset_id)
-    if not record or record.get('run_id') != run_id or record.get('status') != 'downloaded':
+    fixture = False
+    if record and record.get('status')=='fixture_registered':
+        from .implementation_fixture_runner import FixtureStore
+        fixture = isinstance(store,FixtureStore) and record.get('provenance',{}).get('kind')=='implementation_fixture'
+    if not record or record.get('run_id') != run_id or not (fixture or record.get('status') == 'downloaded'):
         raise ValueError('Downloaded dataset does not belong to this research')
     manifest = record['manifest']
     sha = digest(manifest)
@@ -146,6 +149,15 @@ def checked_asset(store, data_dir, run_id, asset_id, expected=None):
     key = asset_id.rsplit(':', 1)[-1]
     if not re.fullmatch(r'[0-9a-f]{32}', key) or asset_id != f'{run_id}:dataset:{key}':
         raise ValueError('Invalid dataset identity')
+    return record
+
+
+def checked_asset(store, data_dir, run_id, asset_id, expected=None):
+    """Rehash the manifest and every retained file before reuse or staging."""
+    root = Path(data_dir).absolute()
+    record = checked_manifest(store, run_id, asset_id, expected)
+    manifest = record['manifest']
+    key, sha = asset_id.rsplit(':', 1)[-1], record['manifest_sha256']
     directory = root / 'runs' / run_id / 'datasets' / key / sha
     for row in [manifest['download'], *manifest['files']]:
         relative = row['path']

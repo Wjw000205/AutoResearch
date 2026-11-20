@@ -26,7 +26,7 @@ def malformed_note_refs(value, schema):
         return False
     candidate, found = copy.deepcopy(value), False
     for call in candidate['tool_calls']:
-        if not isinstance(call, dict) or call.get('name') != 'experiments.record_notes':
+        if not isinstance(call, dict) or call.get('name') not in {'experiments.record_notes', 'reviews.record_notes'}:
             continue
         arguments = call.get('arguments', {})
         if not isinstance(arguments, dict) or not isinstance(arguments.get('notes'), list):
@@ -59,6 +59,27 @@ def read_index(progress):
             **{k:v for k,v in call.get('arguments',{}).items() if k in {'path','section','trial_id','offset','limit','snapshot','view'}}})
     # No source text, historic transcripts or complete logs enter the request.
     return rows[-32:]
+
+
+def correction_index(engine, run_id, key, role, progress, rejected):
+    calls = {call['name'] for call in rejected['tool_calls']}
+    index = read_index(progress) if 'experiments.record_notes' in calls else []
+    if 'reviews.record_notes' in calls:
+        from .full_review_notes import _submitted_receipts
+        _, receipts = _submitted_receipts(engine, run_id, role, key)
+        pages = []
+        for owner in dict.fromkeys(receipts.values()):
+            for row in engine.store.get('handoff_progress', owner)['tool_results']:
+                if row.get('call', {}).get('name') != 'reviews.read_material':
+                    continue
+                page = row.get('result', {})
+                ref = page.get('receipt_sha256')
+                if receipts.get(ref) == owner:
+                    pages.append({'receipt_sha256': ref, 'tool': row['call']['name'],
+                                  'material_id': row['call']['arguments'].get('material_id'),
+                                  'start': page['char_start'], 'end': page['char_end']})
+        index.extend(pages[-64:])
+    return index
 
 
 def source(h, run_id, key, original):
@@ -118,9 +139,12 @@ async def schedule(h, run_id, key, progress):
     if proof is None or original.get('prepared_sha256') != digest(prepared):
         raise ResearchBlocked('实验笔记补正缺少完整同源答复和已结算回执；未重发或改写原请求。')
     replacement, operation = copy.deepcopy(prepared), uid()
+    rejected = json.loads(proof['original_text'])
+    reads = await h.engine._read_consensus_check(run_id, correction_index, h.engine, run_id, key,
+                                                 prepared['role'], progress, rejected)
     replacement['context'].update(experiment_note_repair={
         'source_request_id':proof['request_id'],'diagnostic':proof['diagnostic'],
-        'rejected_output':json.loads(proof['original_text']), 'available_reads':read_index(progress),
+        'rejected_output':rejected, 'available_reads':reads,
         'original_tool_batch_executed':False}, _output_token_limit=proof['effective_output_limit'])
     replacement['context']['_harness_control']={**replacement['context'].get('_harness_control',{}),
         'operation_id':operation, MARKER:proof['request_id']}

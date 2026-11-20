@@ -4,6 +4,7 @@ This stays inside the experiment stage. Source, requirements, partial files and
 native receipts are durable; the coordinator only receives delivery identities.
 """
 from __future__ import annotations
+from .async_ownership import to_thread as owned_to_thread
 from .prose_schema import validator as response_validator
 
 import asyncio
@@ -78,16 +79,35 @@ def delivery_issue(exc):
     return f'{path}: validation failed ({rule}); see delivery_contract.json'[:1200]
 
 
-def _file_draft(files):
+def _base_adapters(state):
+    from .code_bundle import digest
+    name = '_experiment_input/source_index.json'
+    if name not in state.get('protected', {}):
+        return {}
+    raw = _bytes(Path(state['workspace']) / name)
+    if hashlib.sha256(raw).hexdigest() != state['protected'][name]:
+        raise ValueError('Frozen source index changed')
+    index = json.loads(raw)
+    if digest(index['files']) != index['source_bundle_sha256'] or index['source_bundle_sha256'] != state['identity']['source_bundle_sha256']:
+        raise ValueError('Frozen source index does not match the base bundle')
+    return {row['path']: row['sha256'] for row in index['files']
+            if row['path'].startswith('dataset_runtime/') and row['path'].endswith('.py')
+            and row['path'] not in state['protected']}
+
+
+def _file_draft(files, state):
+    base = _base_adapters(state)
     return {'configuration_json': files['_experiment_delivery/configuration.json'],
         'checks': files['_experiment_delivery/checks.py'],
         'rationale': files['_experiment_delivery/rationale.txt'],
-        'budget_plan': json.loads(files['_experiment_delivery/budget_plan.json']),
+        **({'budget_plan': json.loads(files['_experiment_delivery/budget_plan.json'])}
+           if '_experiment_delivery/budget_plan.json' in files else {}),
         'adapter_files': [{'path': name, 'source': source} for name, source in sorted(files.items())
-            if name.startswith('dataset_runtime/') and name.endswith('.py')]}
+            if name.startswith('dataset_runtime/') and name.endswith('.py')
+            and base.get(name) != hashlib.sha256(source.encode()).hexdigest()]}
 
 
-def _repair_packet(saved, repair, previous_job):
+def _repair_packet(saved, repair, previous_job, *, previous_sources=None):
     packet = {k: copy.deepcopy(repair.get(k)) for k in ('kind', 'message', 'details', 'votes', 'notes')}
     if previous_job and '_experiment_input/host_runtime_contract.json' not in previous_job.get('protected', {}):
         packet['runtime_compatibility'] = {
@@ -99,9 +119,9 @@ def _repair_packet(saved, repair, previous_job):
     if previous_job and previous_job.get('partial_delivery'):
         from .dataset_experiments import configuration_schema
         try:
-            files = previous_files(previous_job)
+            files = previous_files(previous_job) if previous_sources is None else previous_sources
             configuration = json.loads(files['_experiment_delivery/configuration.json'])
-            issues = [delivery_issue(e) for e in response_validator(configuration_schema()).iter_errors(configuration)][:8]
+            issues = [delivery_issue(e) for e in response_validator(configuration_schema(saved['dataset_packet'])).iter_errors(configuration)][:8]
             if issues:
                 packet['configuration_issues'] = issues
                 packet['configuration_instruction'] = '修正解析后的配置字段及相应 CPU 断言。预算只在 budget_plan.json 中交付；运行配置不可添加 trial_budget。'
@@ -110,7 +130,8 @@ def _repair_packet(saved, repair, previous_job):
     if packet['kind'] == 'codex_delivery' and previous_job and previous_job.get('partial_delivery'):
         from .dataset_experiments import DRAFT
         try:
-            draft = _file_draft(previous_files(previous_job))
+            files = previous_files(previous_job) if previous_sources is None else previous_sources
+            draft = _file_draft(files, previous_job)
             issues = [delivery_issue(e) for e in response_validator(DRAFT['oneOf'][0]).iter_errors(draft)][:8]
         except (KeyError, ValueError) as exc:
             issues = ['Delivery file missing: ' + str(exc) if isinstance(exc, KeyError) else delivery_issue(exc)]
@@ -147,11 +168,43 @@ def prepare(engine, run_id, saved):
     selection = {'project_root': config.get('codex_project_dir') or original['program'].get('codex_project_dir'),
         'model': config.get('codex_model') or None, 'effort': config.get('codex_reasoning_effort') or None,
         'timeout': config.get('codex_timeout_seconds', 1800)}
+    from . import code_model_migration as worker_models
+    selected_profile = worker_models.run_profile(engine, run_id)
+    if worker_models.FIELD in selected_profile:
+        selection.update(model=selected_profile['model'] or None, effort=selected_profile['effort'] or None)
     identity = {'version': VERSION, 'setup_id': saved['id'], 'request_sha256': sha(saved['request']),
         'source_bundle_sha256': bundle['sha256'], 'selection': selection,
         'work_order_sha256': work_order['result_sha256'] if work_order else None}
+    if work_order and work_order.get('protocol_evidence'):
+        from .experiment_protocols import checked, _notes
+        notes = _notes(engine, run_id)
+        for ref in work_order['protocol_evidence']['protocols']:
+            checked(engine, run_id, ref['id'], ref['sha256'], notes=notes)
+        identity['protocol_evidence_sha256'] = sha(work_order['protocol_evidence'])
     if direct:
         identity['repair_assignment_sha256'] = sha(direct)
+    if worker_models.FIELD in selected_profile:
+        # Reconcile the same already-frozen setup even if a crash preceded the
+        # setup's job pointer. Never replace a prepared/started native request.
+        base_identity = {k: v for k, v in identity.items() if k != 'selection'}
+        prior_jobs = []
+        for prior_id in engine.store.record_keys(COLLECTION,
+                predicate="json_extract(data,'$.run_id')=? AND json_extract(data,'$.setup_id')=?",
+                parameters=[run_id, saved['id']]):
+            previous = engine.store.get(COLLECTION, prior_id)
+            frozen = previous.get('identity', {})
+            if {k: v for k, v in frozen.items() if k not in {'selection', worker_models.FIELD}} == base_identity:
+                if (previous.get('id') != prior_id or previous.get('run_id') != run_id
+                        or prior_id != run_id + ':dataset-codex:' + sha(frozen)
+                        or previous.get('selection') != frozen.get('selection')):
+                    raise ValueError('Frozen dataset code job identity changed')
+                worker_models.job_profile(engine, run_id, previous)
+                prior_jobs.append(previous)
+        if len(prior_jobs) > 1:
+            raise ValueError('Multiple frozen code jobs own this dataset setup')
+        if prior_jobs:
+            return prior_jobs[0]
+        identity[worker_models.FIELD] = copy.deepcopy(selected_profile[worker_models.FIELD])
     key = run_id + ':dataset-codex:' + sha(identity)
     prior = engine.store.get(COLLECTION, key)
     if prior:
@@ -159,7 +212,12 @@ def prepare(engine, run_id, saved):
     if not selection['project_root']:
         raise ValueError('Dataset Codex delivery requires the configured project directory')
     workspace = allocate(selection['project_root'], run_id, key, run.get('title'), engine.cycle(run_id), 'runtime_repair')
-    files = {r['path']: _bytes(Path(bundle['root']) / r['path']) for r in bundle['files']}
+    files = {}
+    for row in bundle['files']:
+        raw = _bytes(Path(bundle['root']) / row['path'])
+        if hashlib.sha256(raw).hexdigest() != row['sha256']:
+            raise ValueError('Frozen source changed during workspace preparation: ' + row['path'])
+        files[row['path']] = raw
     # The reviewed host shim supplies CLI parsing; Codex owns only the adapter.
     files.update({'experiment.py': ENTRY.encode(), 'dataset_runtime/__init__.py': b'',
         'dataset_runtime/config.py': Path(experiment_config.__file__).read_bytes(),
@@ -180,7 +238,14 @@ def prepare(engine, run_id, saved):
     previous_job = engine.store.get(COLLECTION, previous_job_id) if previous_job_id else None
     prior_files = {}
     if previous_job and previous_job.get('run_id') == run_id:
-        prior_files = previous_files(previous_job)
+        if direct and direct.get('protected_source_recovery'):
+            prior_files, recovery = repair_inputs(engine, run_id, saved, previous_job, repair, bundle=bundle)
+            if recovery != direct['protected_source_recovery'] or sha(prior_files) != direct['previous_files_sha256']:
+                raise ValueError('Frozen predecessor repair inputs changed before staging')
+            if any(protected.get(name) != item['expected_sha256'] for name, item in recovery['changed_files'].items()):
+                raise ValueError('Successor workspace does not restore the exact protected file identities')
+        else:
+            prior_files = previous_files(previous_job)
         for name, text in prior_files.items():
             if name.startswith('_experiment_delivery/') or name.startswith('dataset_runtime/') and name not in protected:
                 files[name] = text.encode()
@@ -191,14 +256,17 @@ def prepare(engine, run_id, saved):
         files['_experiment_delivery/budget_plan.json'] = _json(previous_draft['budget_plan']).encode()
     from .dataset_experiments import DRAFT, configuration_schema
     from .dataset_runtime_contract import describe
-    task, repair_packet = _repair_packet(saved, repair, previous_job)
+    task, repair_packet = _repair_packet(saved, repair, previous_job, previous_sources=prior_files)
+    if direct and direct.get('protected_source_recovery'):
+        repair_packet['protected_source_recovery'] = direct['protected_source_recovery']
     dispatch_samples = None
     if previous_draft.get('configuration_json'):
         from .dataset_experiments import compile_configuration
         from .dataset_runtime_contract import dispatch_samples as samples
         try:
             _, previous_plan = compile_configuration(engine, run_id,
-                json.loads(previous_draft['configuration_json']), saved['dataset_packet'], previous_draft.get('budget_plan'))
+                json.loads(previous_draft['configuration_json']), saved['dataset_packet'], previous_draft.get('budget_plan'),
+                dataset_catalog=saved['request'].get('dataset_catalog'))
             dispatch_samples = samples(previous_plan)
         except ValueError:
             pass  # Invalid drafts retain their precise configuration repair issue.
@@ -207,7 +275,7 @@ def prepare(engine, run_id, saved):
         '_experiment_input/host_runtime_contract.json': _json(describe()),
         '_experiment_input/contract.md': WRITE,
         '_experiment_input/delivery_contract.json': _json({'schema': relax(DRAFT['oneOf'][0]),
-            'configuration_schema': relax(configuration_schema()),
+            'configuration_schema': relax(configuration_schema(saved['dataset_packet'])),
             'files': {'configuration_json': '_experiment_delivery/configuration.json',
                 'checks': '_experiment_delivery/checks.py', 'rationale': '_experiment_delivery/rationale.txt',
                 'budget_plan': '_experiment_delivery/budget_plan.json', 'adapter_files': 'dataset_runtime/*.py'},
@@ -221,7 +289,10 @@ def prepare(engine, run_id, saved):
     if work_order:
         inputs['_experiment_input/agent_work_order.json'] = _json({'plan_id': work_order['id'],
             'sha256': work_order['result_sha256'], 'author_handoff_id': work_order['author_handoff_id'],
-            'task': work_order['result']})
+            'task': work_order['result'],
+            **({'protocol_evidence': work_order['protocol_evidence'],
+                'execution_conditions': {v['role']: v['execution_conditions'] for v in work_order['votes']}}
+               if work_order.get('protocol_evidence') else {})})
     if dispatch_samples is not None:
         inputs['_experiment_input/dispatch_samples.json'] = _json(dispatch_samples)
     failure = failure_receipt(engine, run_id, repair_packet.get('details') or {})
@@ -229,17 +300,69 @@ def prepare(engine, run_id, saved):
         inputs['_experiment_input/failure_receipt.json'] = _json(failure)
     if direct:
         inputs['_experiment_input/repair_assignment.json'] = _json(direct)
+        if direct.get('project_protocol'):
+            from .weather_project_protocol import verify, seed_configuration
+            approved = verify(engine.store, run_id, direct['project_protocol'])
+            inputs['_experiment_input/project_protocol.json'] = _json({
+                'receipt': direct['project_protocol'], 'proposal': approved['proposal'], 'votes': approved['votes']})
+            configuration = '_experiment_delivery/configuration.json'
+            if configuration in files:
+                try:
+                    files[configuration] = seed_configuration(files[configuration], approved['proposal'])
+                except (KeyError, TypeError, ValueError) as exc:
+                    # A malformed previous delivery remains an editable input.
+                    # The collector still requires the complete reviewed fields.
+                    inputs['_experiment_input/project_configuration_issue.txt'] = str(exc)
+        # Carry the exact reviewed protocol addendum and execution conditions
+        # through repairs, including when the active setup now has a new request.
+        name = '_experiment_input/agent_work_order.json'
+        if previous_job and name in previous_job['protected'] and name not in inputs:
+            raw = _bytes(Path(previous_job['workspace']) / name)
+            if hashlib.sha256(raw).hexdigest() != previous_job['protected'][name]:
+                raise ValueError('Previous approved work order changed')
+            inputs[name] = raw.decode('utf-8')
+    inputs['_experiment_input/write_scope.json'] = _json({
+        'read_only_base_files': sorted(protected), 'read_only_inputs': '_experiment_input/',
+        'editable': ['_experiment_delivery/configuration.json', '_experiment_delivery/checks.py',
+                     '_experiment_delivery/rationale.txt', 'dataset_runtime/*.py (except the named read-only files)'],
+        'budget_plan': 'Only when required by the current task',
+        'adapter_edits': 'Only new or changed dataset_runtime Python modules count as edits; omitted inherited adapters remain in the assembled candidate.',
+        'configuration_destination': 'Write configuration.json in _experiment_delivery; the host stages it at dataset_runtime/configurations.json.'})
     files.update({k: v.encode() for k, v in inputs.items()})
     protected.update({k: hashlib.sha256(v.encode()).hexdigest() for k, v in inputs.items()})
     _write_files(workspace, files)
     instruction = INSTRUCTION + ('\n\n研究 agent 本轮实现指令：\n' + work_order['result']['implementation_brief'] if work_order else '')
+    if work_order and work_order.get('protocol_evidence'):
+        instruction += '\n任务单的 protocol_evidence 是三方已审补证，按其字段更新旧待核实描述；保留 execution_conditions 作为执行前条件。'
     if direct:
         instruction += '\n\n' + direct['instruction']
+        if direct.get('project_protocol'):
+            instruction += ('\n先读 _experiment_input/project_protocol.json。三方已对该 SHA 的非论文等价 128→32 项目协议作出独立决定。'
+                '该补充决定解决原工单中等待明确窗口授权的问题。把真实 CSV 的字段、半开区间、fit_rows、地板及异常时间边界策略'
+                '落实到三分支与嵌套消融、comparison_task/task_dimensions。在每个 *_params 顶层写 project_protocol_sha256=receipt.sha256；'
+                '项目窗口只适用于这份精确批准，保留两条原论文记录。落实 invalid_value_policy，真实表头中的替换字符按原字节解码保留。'
+                '修改 dataset_runtime/contracts.py 的窗口判断以分别核验论文记录和项目协议；data.py 只允许列出的时间异常，'
+                '排除跨越异常的完整输入+预测窗口；checks.py 验证真实前缀、异常两侧、合法窗口和留出隔离。'
+                '保留未更改模型及其他有效检查。根据实际宿主 YAML 契约区分训练和 code_check。旧 dispatch_samples 是上版快照，'
+                'CPU 检查运行时使用宿主从新计划生成的样本；不得以旧快照覆盖新配置。不需要重写工单或再次申请同一个项目窗口。')
+    instruction += ('\n文件写入范围见 _experiment_input/write_scope.json。工单中“同步 YAML/schema”须通过适配层消费已冻结的契约，'
+                    '所有 configs/ 文件均只读。配置参数写入 _experiment_delivery/configuration.json；'
+                    '用原契约声明的运行时 YAML 与回执路径。若不兼容，报告具体冲突，不修改冻结文件。')
+    if 'configs/hyperparameters.contract.json' in files:
+        instruction += ('\n核对 dataset_runtime/hyperparameters.py 的 resolve_profile/load_runtime 及 checks.py：'
+                        '逐试验 YAML 和摘要回执由宿主按 contract 的 runtime_file/receipt_file 交付，'
+                        'configs/ 下的默认值只作对照。核验实际 YAML、参数与 profile 的绑定并返回约定的元数据；'
+                        '不得要求原 schema 中不存在的 dataset_contract 或以 environment.json 替代该回执。')
+    from .request_hash_policy import instruction as hash_checked_instruction
+    instruction = hash_checked_instruction(instruction)
     state = {'id': key, 'run_id': run_id, 'setup_id': saved['id'], 'cycle': engine.cycle(run_id),
         'identity': identity, 'workspace': str(workspace), 'selection': selection, 'instruction': instruction,
         'agent_work_order': copy.deepcopy(saved.get('agent_work_order')),
         'instruction_sha256': hashlib.sha256(instruction.encode()).hexdigest(), 'protected': protected,
         'status': 'prepared', 'created_at': now()}
+    if worker_models.FIELD in selected_profile:
+        state['operation_id'] = key
+        worker_models.bind_job(engine, run_id, state)
     engine.check_active(run_id)
     engine.store.put(COLLECTION, key, state)
     engine.store.event(run_id, 'experiment.configuration_codex_prepared',
@@ -267,25 +390,41 @@ def failure_receipt(engine, run_id, details):
 def collect(state):
     from .dataset_experiments import DRAFT, configuration_schema
     root = Path(state['workspace'])
-    for name, digest in state['protected'].items():
-        if hashlib.sha256(_bytes(root / name)).hexdigest() != digest:
-            raise ValueError('Codex changed protected model/source or input: ' + name)
+    changed = protected_changes(state)
+    if changed:
+        raise ProtectedSourceChanged('Codex changed protected model/source or input: ', changed)
     adapters = []
+    base = _base_adapters(state)
     from .codex_workspace import _plain
     _plain(root / 'dataset_runtime')
     for path in sorted((root / 'dataset_runtime').rglob('*.py')):
         name = path.relative_to(root).as_posix()
         if name in state['protected']:
             continue
-        adapters.append({'path': name, 'source': _text(path, 96000)})
+        raw = _bytes(path)
+        if base.get(name) == hashlib.sha256(raw).hexdigest():
+            continue
+        if len(raw) > 96000:
+            raise ValueError('Configuration delivery file exceeds its bounded size: ' + name)
+        adapters.append({'path': name, 'source': raw.decode('utf-8-sig')})
     output = root / '_experiment_delivery'
     draft = {'configuration_json': _text(output / 'configuration.json', 320000),
-        'checks': _text(output / 'checks.py', 48000), 'rationale': _text(output / 'rationale.txt', 6000),
+        'checks': _text(output / 'checks.py', 48000), 'rationale': _text(output / 'rationale.txt', 320000),
         'adapter_files': adapters}
     if (output / 'budget_plan.json').is_file():
         draft['budget_plan'] = json.loads(_text(output / 'budget_plan.json', 24000))
-    validate(draft, DRAFT['oneOf'][0])
-    validate(json.loads(draft['configuration_json']), configuration_schema())
+    contract_path = '_experiment_input/delivery_contract.json'
+    frozen_contract = (json.loads(_bytes(root / contract_path))
+                       if contract_path in state['protected'] else {})
+    validate(draft, frozen_contract.get('schema') or DRAFT['oneOf'][0])
+    validate(json.loads(draft['configuration_json']), frozen_contract.get('configuration_schema') or configuration_schema())
+    protocol = '_experiment_input/project_protocol.json'
+    if protocol in state['protected']:
+        from .weather_project_protocol import check_profiles
+        value = json.loads(_bytes(root / protocol))
+        if sha(value['proposal']) != value['receipt']['sha256']:
+            raise ValueError('Staged Weather project protocol changed')
+        check_profiles(json.loads(draft['configuration_json']), value['proposal'])
     return draft
 
 
@@ -309,17 +448,88 @@ def partial(state):
     return result
 
 
+class ProtectedSourceChanged(ValueError):
+    def __init__(self, prefix, changes):
+        self.changes = changes
+        super().__init__(prefix + ', '.join(changes))
+
+
+def protected_changes(state):
+    from .code_bundle import relative_file
+    changed = {}
+    root = Path(state['workspace'])
+    for name, expected in state['protected'].items():
+        relative_file(name)
+        try:
+            actual = hashlib.sha256(_bytes(root / name)).hexdigest()
+        except FileNotFoundError:
+            actual = None
+        if actual != expected:
+            changed[name] = {'expected_sha256': expected, 'observed_sha256': actual}
+    return changed
+
+
 def previous_files(state):
     """Read a completed local delivery as new repair input; keep its old receipt."""
     if (state.get('checkpoint', {}).get('status') in {'completed', 'failed', 'interrupted', 'unknown'}
             and Path(state['workspace']).is_dir()):
-        for name, digest in state['protected'].items():
-            if hashlib.sha256(_bytes(Path(state['workspace']) / name)).hexdigest() != digest:
-                raise ValueError('Previous Codex protected source/input changed: ' + name)
+        changed = protected_changes(state)
+        if changed:
+            raise ProtectedSourceChanged('Previous Codex protected source/input changed: ', changed)
         # These are source snapshots for a new repair, not a terminal receipt
         # or approval of an interrupted/unknown native turn.
         return partial(state)
     return copy.deepcopy(state.get('partial_delivery') or {})
+
+
+def repair_inputs(engine, run_id, saved, job, repair, *, bundle=None):
+    """Salvage captured editable inputs from a rejected terminal job into a new workspace."""
+    from .code_bundle import relative_file
+    from .dataset_experiments import _base_bundle, _source_gate
+    try:
+        return previous_files(job), None
+    except ProtectedSourceChanged as exc:
+        changed = exc.changes
+    ref = saved.get('previous_setup') or {}
+    archive = engine.store.get('experiment_evidence', ref.get('id', '')) or {}
+    history = archive.get('summary', {})
+    old = history.get('setup', {})
+    failure = history.get('failure', {})
+    snapshot = job.get('partial_delivery', {})
+    material = {k: v for k, v in (old.get('draft') or {}).items()
+                if k in ('configuration_json', 'adapter_files', 'checks', 'budget_plan')}
+    material['native_files'] = snapshot
+    if (not snapshot or job.get('checkpoint', {}).get('status') != 'completed'
+            or job.get('run_id') != run_id or job.get('setup_id') != saved['id']
+            or saved.get('previous_codex_job_id') != job['id'] or old.get('codex_job_id') != job['id']
+            or old.get('id') != saved['id'] or job['identity'].get('request_sha256') != sha(old.get('request'))
+            or archive.get('run_id') != run_id or sha(history) != ref.get('sha256')
+            or repair.get('previous_setup') != ref or repair.get('kind') != 'codex_delivery'
+            or failure.get('kind') != repair['kind'] or failure.get('details', {}).get('job_id') != job['id']
+            or not any('Codex changed protected model/source or input: ' + name in failure.get('message', '') for name in changed)
+            or sha(material) != saved.get('repair_progress', {}).get('material_sha256')):
+        raise ValueError('No matching archived protected-file rejection and captured editable delivery')
+    bundle = bundle or _base_bundle(engine, run_id, _source_gate(engine, run_id))
+    originals = {r['path']: r['sha256'] for r in bundle['files']}
+    if (bundle['sha256'] != job['identity']['source_bundle_sha256']
+            or any(originals.get(name) != info['expected_sha256'] or name.startswith('_experiment_input/')
+                   for name, info in changed.items())):
+        raise ValueError('Protected repair inputs cannot be rebuilt from the verified source bundle')
+    editable = {}
+    outputs = {'_experiment_delivery/' + name for name in ('configuration.json', 'checks.py', 'rationale.txt', 'budget_plan.json')}
+    for name, text in snapshot.items():
+        relative_file(name)
+        if name in job['protected'] or not (name in outputs or name.startswith('dataset_runtime/') and name.endswith('.py')):
+            continue
+        if _text(Path(job['workspace']) / name, 320000) != text:
+            raise ValueError('Previously captured editable file no longer matches disk: ' + name)
+        editable[name] = text
+    if not editable:
+        raise ValueError('No authenticated editable inputs in the rejected delivery')
+    return editable, {'source_bundle_sha256': bundle['sha256'], 'previous_job_id': job['id'],
+                      'previous_setup': ref, 'captured_snapshot_sha256': sha(snapshot),
+                      'changed_files': changed, 'retained_editable_files': sorted(editable),
+                      'instruction': '新目录内列出的受保护文件均来自冻结原件；只修复适配层、配置交付及 CPU 断言对它们的消费。'}
 
 
 async def deliver(engine, harness, run_id, saved):
@@ -331,13 +541,15 @@ async def deliver(engine, harness, run_id, saved):
     engine.check_active(run_id)
     state = engine.store.get(COLLECTION, saved.get('codex_job_id', ''))
     if state is None:
-        state = await asyncio.to_thread(prepare, engine, run_id, saved)
+        state = await owned_to_thread(prepare, engine, run_id, saved)
     engine.check_active(run_id)
     saved.update(codex_job_id=state['id'], status='implementing_configuration')
     engine.store.put(SETUPS, saved['id'], saved)
+    from . import code_model_migration as worker_models
+    profile = worker_models.job_profile(engine, run_id, state)
     if state.get('draft'):
         return copy.deepcopy(state['draft'])
-    selected = state['selection']
+    selected = {**state['selection'], 'model': profile['model'] or None, 'effort': profile['effort'] or None}
     def progress(receipt):
         state.update(checkpoint=copy.deepcopy(receipt), status=receipt['status'], updated_at=now())
         engine.store.put(COLLECTION, state['id'], state)
@@ -364,10 +576,11 @@ async def deliver(engine, harness, run_id, saved):
     except LocalCodexError as exc:
         raise ResearchBlocked('本机 Codex 配置交付：' + str(exc)) from exc
     progress(receipt)
+    worker_models.job_profile(engine, run_id, state)
     engine.check_active(run_id)
     if receipt['status'] != 'completed':
         if receipt['status'] in {'failed', 'interrupted'}:
-            state['partial_delivery'] = await asyncio.to_thread(partial, state)
+            state['partial_delivery'] = await owned_to_thread(partial, state)
             engine.store.put(COLLECTION, state['id'], state)
             harness.intelligence._settle(state['reservation'], {}, 0, verified=False, status=receipt['status'],
                 provenance='local_codex_app_server', cost_status='not_reported_by_local_codex')
@@ -377,9 +590,9 @@ async def deliver(engine, harness, run_id, saved):
     harness.intelligence._settle(state['reservation'], {}, 0, verified=False, status='completed',
         provenance='local_codex_app_server', cost_status='not_reported_by_local_codex')
     try:
-        state['partial_delivery'] = await asyncio.to_thread(partial, state)
+        state['partial_delivery'] = await owned_to_thread(partial, state)
         engine.store.put(COLLECTION, state['id'], state)
-        draft = await asyncio.to_thread(collect, state)
+        draft = await owned_to_thread(collect, state)
     except (OSError, ValueError, ValidationError) as exc:
         detail = delivery_issue(exc)
         raise NeedsRepair('Codex 配置交付待修正：' + detail, kind='codex_delivery',

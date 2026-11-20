@@ -13,7 +13,9 @@ class ToolOutcomeUnknown(RuntimeError):
 
 
 READ_ONLY = frozenset({
-    'experiments.status', 'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module',
+    'materials.request_read',
+    'reviews.read_material',
+    'experiments.files', 'experiments.status', 'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module',
     'literature.protocols',
     'datasets.discover', 'datasets.inspect',
     'memory.search', 'experiments.history', 'hardware.inspect', 'resources.assess',
@@ -31,6 +33,9 @@ READ_ONLY = frozenset({
 # patch. A changed draft must still pass its ordinary hash/CAS gates. This is
 # not a read-only classification or a generic external exactly-once guarantee.
 LOCAL_REPLAY_SAFE = frozenset({
+    'reviews.record_notes',  # Same-role delivered-source anchors and immutable content-addressed entries.
+    'bayes.write_script',  # Immutable dataset/architecture/source-addressed file.
+    'bayes.start_search',  # Per-point CAS manifest and validation job ledger gate every actual launch.
     'experiments.cleanup',  # Saved per-file intent; changed/recreated files never replay deletion.
     'experiments.record_notes',
     'literature.record_protocol',

@@ -108,6 +108,10 @@ def validate_recovery_call(context, call, *, engine=None, run_id=None):
 
 
 def recovery_error(context, output):
+    from .code_review_reread import clarification_result
+    reading_clarification = clarification_result(context, output)
+    if reading_clarification is not None:
+        return reading_clarification
     focus = recovery_focus(context)
     if output.get('validation', {}).get('code') == 'note_too_large':
         return {**output, 'validation': {**output['validation'],
@@ -258,7 +262,8 @@ class LocalPDF:
             reader = PdfReader(stream)
             if reader.is_encrypted or page > len(reader.pages):
                 raise ValueError('Requested PDF page is unavailable')
-            local_text = (reader.pages[page - 1].extract_text() or '').replace('\r\n', '\n').replace('\r', '\n')
+            from .pdf_text_encoding import normalize
+            local_text = normalize(reader.pages[page - 1].extract_text() or '')[0].replace('\r\n', '\n').replace('\r', '\n')
         if not local_text.startswith(retained['text']) or (not retained.get('text_truncated') and local_text != retained['text']):
             raise ValueError('Local PDF extraction changed; refusing to mix source versions')
         if offset > len(retained['text']):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 from .memory_capture import read_captured_input, sha_text, render_active_v1
 from .storage import now
@@ -33,6 +34,10 @@ def _resolved(active):
               '$text': active.get('shared_context_text', {})}
     def expand(value, visited=frozenset()):
         if isinstance(value, dict):
+            from .context_records import text_slice
+            sliced = text_slice(value, active)
+            if sliced is not None:
+                return sliced
             if len(value) == 1 and next(iter(value), None) in tables:
                 kind, key = next(iter(value.items()))
                 marker = (kind, str(key))
@@ -137,6 +142,37 @@ def inventory(active):
             return
         if not isinstance(value, dict):
             return
+        card = value.get('evidence_card')
+        if isinstance(card, dict) and value.get('primary_text_displayed') is False:
+            # Only literal anchored quotations were delivered, not the whole
+            # original page or the card's interpretation. Bind their exact
+            # visible ranges separately; delivery_spans still verifies each
+            # quote hash against the immutable source before granting credit.
+            source, digest = card.get('source_id'), card.get('text_sha256')
+            offset, chars = card.get('original_offset'), card.get('original_chars')
+            if (isinstance(source, str) and source and isinstance(digest, str)
+                    and re.fullmatch('[0-9a-f]{64}', digest)
+                    and type(offset) is int and type(chars) is int and offset >= 0 and chars > 0
+                    and value.get('source_id', source) == source
+                    and value.get('text_sha256', digest) == digest):
+                def quoted(node, quote_path):
+                    if isinstance(node, list):
+                        for i,child in enumerate(node):
+                            quoted(child, quote_path + '/' + str(i))
+                    elif isinstance(node, dict):
+                        quote, locator = node.get('quote'), node.get('locator')
+                        match = (re.fullmatch(re.escape(source) + r'#chars=(\d+):(\d+)', locator)
+                                 if isinstance(locator, str) else None)
+                        if match and isinstance(quote, str) and quote:
+                            start, end = map(int, match.groups())
+                            if offset <= start < end <= offset + chars and end-start == len(quote):
+                                sources({'source_id': source, 'text_sha256': digest, 'text': quote,
+                                         'char_start': start, 'char_end': end}, quote_path, tool)
+                        for key,child in node.items():
+                            if key in {'exact_fields', 'conditions', 'numerical_results'}:
+                                quoted(child, quote_path + '/' + key)
+                for key in ('findings', 'protected_source_spans'):
+                    quoted(card.get(key), path + '/evidence_card/' + key)
         identity = _identity(value)
         source = identity.get('source_id') or identity.get('document_id') or identity.get('artifact_id') or identity.get('rag_version_id')
         if source:

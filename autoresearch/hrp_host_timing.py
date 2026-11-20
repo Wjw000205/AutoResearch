@@ -27,6 +27,40 @@ RECEIPTS = 'definition_execution_receipts'
 CLAIMS = 'implementation_timing_claims'
 
 
+def entry_binding(engine,run_id,state,spec,attempt,plan_record):
+    from .implementation_definition_repair import timing_authorization
+    authorization=timing_authorization(engine,state)
+    return {'version':1,'workflow_id':state['id'],'attempt':attempt['index'],
+        'spec_hash':spec['spec_hash'],'document_sha256':spec['document']['sha256'],
+        'delivery_hash':attempt['delivery_hash'],'snapshot_sha256':attempt['snapshot']['files_hash'],
+        'authorization_sha256':authorization['sha256'],'plan_receipt_sha256':plan_record['sha256']}
+
+
+def entry_review_schema(schema,binding):
+    result=copy.deepcopy(schema)
+    result['properties'].update(timing_entry_approved={'type':'boolean'},timing_entry_binding={'const':binding})
+    result['required']=list(dict.fromkeys([*result['required'],'timing_entry_approved','timing_entry_binding']))
+    return result
+
+
+def validate_entry_votes(engine,run_id,state,spec,attempt,plan_record,votes):
+    from . import independent_full_review as full
+    if not full.members(votes) or not all(v.get('timing_entry_approved') is True for v in votes):
+        raise ValueError('Timing entry needs its exact independent reviewer set and explicit approvals')
+    if full.reviewers(votes)==full.REVIEWERS:
+        from .code_whole_review import validate_vote
+        expected=entry_binding(engine,run_id,state,spec,attempt,plan_record)
+        full.authenticate_complete(engine.store,run_id,votes)
+        for vote in votes:
+            frozen=full.authenticate(engine.store,run_id,vote)
+            if (frozen['context'].get('whole_timing_entry_review')!=expected
+                    or vote.get('timing_entry_binding')!=expected):
+                raise ValueError('Whole timing entry votes belong to another exact plan/source/authorization')
+            full.validate_delivery(engine.store,run_id,vote,engine=engine)
+            validate_vote(engine,run_id,state,spec,attempt,vote)
+    return True
+
+
 def task_contract(spec):
     value = copy.deepcopy(spec.get('supplemental_timing'))
     required = {'entrypoint', 'report_path', 'deadline_check_entrypoint', 'transport_reserve_bytes',
@@ -304,8 +338,7 @@ async def run(engine,run_id,state,spec,attempt,plan_record,entry_votes):
         raise ValueError('Timing interface differs from the reviewed plan')
     if plan_record['identity']['adapter_sha256']!=file_sha(__file__):
         raise ValueError('Host adapter changed after transport review')
-    if {v['role'] for v in entry_votes}!={'director','engineer','scout'} or len(entry_votes)!=3 or not all(v.get('timing_entry_approved') is True for v in entry_votes):
-        raise ValueError('Three independent timing entry approvals required')
+    validate_entry_votes(engine,run_id,state,spec,attempt,plan_record,entry_votes)
     identity={'kind':'supplemental_timing_v2','snapshot_sha256':attempt['snapshot']['files_hash'],
         'spec_hash':spec['spec_hash'],'document_sha256':spec['document']['sha256'],
         'authorization_sha256':authorization['sha256'],'plan_receipt_sha256':plan_record['sha256'],
@@ -369,11 +402,17 @@ async def run(engine,run_id,state,spec,attempt,plan_record,entry_votes):
     cancelled=False
     try: result=await asyncio.shield(task)
     except asyncio.CancelledError:
-        stop.set();result=await task;cancelled=True
+        from .async_ownership import finish
+        stop.set();result=await finish(task,propagate_cancel=False);cancelled=True
     except Exception as exc:
         result={'status':'failed','passed':False,'error':type(exc).__name__+': '+str(exc)[:1000]}
     paths=[p for p in output.rglob('*') if p.is_file() and not p.is_symlink()]
-    receipt=await asyncio.to_thread(seal,engine,run_id,identity,result,paths)
+    from .async_ownership import finish
+    sealing=asyncio.create_task(asyncio.to_thread(seal,engine,run_id,identity,result,paths))
+    try:
+        receipt=await asyncio.shield(sealing)
+    except asyncio.CancelledError:
+        receipt=await finish(sealing,propagate_cancel=False);cancelled=True
     admitted.update(status='finished',receipt_id=receipt['id'],finished_at=now())
     engine.store.put(CLAIMS,authorization['id'],admitted)
     engine.store.event(run_id,'implementation.supplemental_timing_finished',

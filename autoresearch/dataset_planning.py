@@ -11,6 +11,7 @@ from .prose_schema import validate
 from .experiment_workflow import sha
 from .experiment_requirements import SEED_GUIDANCE
 from .storage import now
+from . import independent_full_review as full_review
 
 COLLECTION = 'dataset_agent_plans'
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 1600}
@@ -22,11 +23,20 @@ def obj(properties):
         'required': list(properties), 'properties': properties}
 
 
-TARGET = obj({'note_id': TEXT, 'dataset': TEXT, 'asset_id': TEXT, 'manifest_sha256': TEXT})
+from .dataset_contract import name_schema
+TARGET = obj({'note_id': TEXT, 'dataset': name_schema(**TEXT), 'asset_id': TEXT, 'manifest_sha256': TEXT})
 SELECTION = obj({'candidates': {'type': 'array', 'minItems': 1, 'maxItems': 8, 'items': obj({
     'target': TARGET, 'selected': {'type': 'boolean'}, 'task_fit': TEXT,
     'selection_reason': TEXT, 'protocol_basis': TEXT, 'limitations': TEXTS})}, 'coverage_rationale': TEXT})
 VOTE = obj({'approve': {'type': 'boolean'}, 'rationale': TEXT, 'issues': TEXTS})
+PROTOCOL_VOTE = obj({**VOTE['properties'], 'execution_conditions': TEXTS})
+
+
+class ProtocolEvidenceNeeded(ValueError):
+    """The work-order author needs a Scout evidence task before another draft."""
+    def __init__(self, plan_id, message):
+        self.plan_id = plan_id
+        super().__init__(message)
 READ_TOOLS = {'datasets.discover', 'datasets.inspect', 'datasets.download', 'sources.read', 'sources.links',
     'sources.fetch', 'web.search', 'literature.search', 'literature.read_papers', 'literature.protocols'}
 
@@ -44,16 +54,38 @@ def tool_limit(progress):
 
 def approval(store, plan):
     votes = plan.get('votes', [])
-    if (sha(plan['result']) != plan.get('result_sha256') or len(votes) != 3
-            or {v['role'] for v in votes} != {'director','engineer','scout'}
+    if (sha(plan['result']) != plan.get('result_sha256') or not full_review.members(votes)
             or not all(v['approve'] and not v['issues'] for v in votes)):
         raise ValueError('Dataset planning approval identity changed')
+    if full_review.reviewers(votes) == full_review.REVIEWERS:
+        full_review.authenticate_complete(store, plan['run_id'], votes)
+        for vote in votes:
+            full_review.validate_delivery(store, plan['run_id'], vote)
+            frozen=full_review.authenticate(store,plan['run_id'],vote)
+            if full_review.source_context(frozen['context'])!=full_review.source_context(plan['review_context']):
+                raise ValueError('Dataset review received another frozen plan scope')
+            ref=frozen['context'].get('validation_evidence',{})
+            archive=store.get('experiment_evidence',ref.get('id','')) or {}
+            if (archive.get('run_id')!=plan['run_id'] or sha(archive.get('summary'))!=ref.get('sha256')
+                    or archive['summary'].get('proposal')!=plan['result']
+                    or frozen['context'].get('dataset_planning',{}).get('scope')!=plan['scope']):
+                raise ValueError('Dataset review is not bound to this exact authored result')
+        author=store.get('decisions',plan.get('author_handoff_id','')) or {}
+        if author.get('role')!='engineer':raise ValueError('New dataset full review requires an independent Engineer author')
+    schema = PROTOCOL_VOTE if plan.get('protocol_evidence') else VOTE
     records = [(plan['author_handoff_id'], plan['result'])] + [
-        (v['handoff_id'], {k: v[k] for k in VOTE['properties']}) for v in votes]
+        (v.get('handoff_id') or v[full_review.KEY]['handoff_id'], {k: v[k] for k in schema['properties']}) for v in votes]
     for key, result in records:
         actual = store.get('decisions', key) or {}
         if actual.get('run_id') != plan['run_id'] or actual.get('result') != result:
             raise ValueError('Dataset planning approval requires matching saved agent decisions')
+    if plan.get('protocol_evidence'):
+        bundle = plan['protocol_evidence']
+        for vote in votes:
+            frozen = store.get('handoff_inputs', vote.get('handoff_id') or vote[full_review.KEY]['handoff_id']) or {}
+            ctx = frozen.get('context', {}).get('dataset_planning', {})
+            if ctx.get('protocol_evidence') != bundle or ctx.get('reviewed_result_sha256') != plan['result_sha256']:
+                raise ValueError('Dataset reviewer did not receive this work order and protocol addendum')
 
 SELECT = '''根据本任务研究问题、方法假设、baseline、评估目标和资源约束选择实验数据集。
 先用 experiments.compare 读取 /task_requirements、/method、/requested_targets，再用 datasets.discover 查看本任务论文笔记。
@@ -90,7 +122,7 @@ def _context(engine, run_id, scope, evidence, phase):
 
 
 async def _reviewed(engine, harness, run_id, *, scope, evidence, author, instruction, schema, checker,
-                    author_request=None):
+                    author_request=None, retained=None, route_protocol_gaps=False):
     from .engine import ResearchBlocked, Harness
     key = run_id + ':dataset-plan:' + sha({'version': 1, 'scope': scope, 'evidence': sha(evidence)})
     state = engine.store.get(COLLECTION, key)
@@ -98,6 +130,11 @@ async def _reviewed(engine, harness, run_id, *, scope, evidence, author, instruc
         state = {'id': key, 'run_id': run_id, 'cycle': engine.cycle(run_id), 'scope': scope,
             'status': 'authoring', 'round': 0, 'stalled': 0, 'created_at': now(),
             'context': _context(engine, run_id, scope, evidence, 'selection' if author == 'scout' else 'work_order')}
+        if retained:
+            validate(retained['result'], schema)
+            state.update(result=copy.deepcopy(retained['result']), result_sha256=retained['result_sha256'],
+                         author_handoff_id=retained['author_handoff_id'], source_plan_id=retained['plan_id'],
+                         status='reviewing', votes=[], protocol_evidence=evidence['protocol_evidence'])
         engine.store.put(COLLECTION, key, state)
     limit = max(1, engine.store.get('runs', run_id)['config'].get('stagnation_rounds', 3))
     while True:
@@ -106,9 +143,30 @@ async def _reviewed(engine, harness, run_id, *, scope, evidence, author, instruc
             approval(engine.store, state)
             await asyncio.to_thread(checker, state['result'])
             return state
+        if state.get('waiting_for_protocol_evidence'):
+            raise ProtocolEvidenceNeeded(key, state['issues'][0])
         if state['stalled'] >= limit:
             raise ResearchBlocked('数据选型或任务单连续未解决相同问题：' + '; '.join(state.get('issues', []))[:1200])
         try:
+            if 'result' in state and not (full_review.members(state.get('votes',[])) and full_review.reviewers(state['votes'])==full_review.LEGACY_REVIEWERS):
+                actual=engine.store.get('decisions',state.get('author_handoff_id','')) or {}
+                if actual.get('role')!='engineer':
+                    from .experiment_decisions import _archive
+                    original=copy.deepcopy(state)
+                    source=_archive(engine,run_id,{'binding':{'plan_id':key},'proposal':state['result'],
+                        'original_author_handoff_id':state['author_handoff_id'],'original_result_sha256':state['result_sha256']})
+                    ctx=copy.deepcopy(state['context']);ctx.update(validation_evidence=source,evidence_sha256=source['sha256'])
+                    ctx['dataset_planning']['retained_author_candidate']={'source':source,'handoff_id':state['author_handoff_id'],
+                        'result_sha256':state['result_sha256'],'instruction':'保留原候选与真实来源，按原要求统一整理为工程师当前交付，再交两位独立全文审核。'}
+                    task=instruction+'\n工程师读取retained_author_candidate的原交付，统一整理或按需修订；不得冒充原作者或更改原记录。'
+                    purpose='dataset_work_order:engineer-author-v1:'+sha([key,state['round'],state['result_sha256']])
+                    result=await harness.ask(run_id,'engineer',purpose,task,ctx,schema)
+                    validate(result,schema);await asyncio.to_thread(checker,result)
+                    state.setdefault('legacy_author_history',[]).append(original)
+                    state.update(result=result,result_sha256=sha(result),author_role='engineer',
+                        author_handoff_id=Harness.decision_key(run_id,'engineer',purpose,task,ctx,schema),votes=[])
+                    state.pop('review_context',None)
+                    engine.store.put(COLLECTION,key,state)
             if 'result' not in state:
                 purpose = 'dataset_select:' if author == 'scout' else 'dataset_work_order:'
                 purpose += key.rsplit(':', 1)[-1] + ':' + str(state['round'])
@@ -116,28 +174,51 @@ async def _reviewed(engine, harness, run_id, *, scope, evidence, author, instruc
                 if author_request:
                     purpose, task, context, output_schema = author_request(
                         engine, state, purpose, task, context, output_schema)
-                result = await harness.ask(run_id, author, purpose, task, context, output_schema)
+                if state.get('protocol_evidence') and state.get('previous'):
+                    from .dataset_protocol_evidence import retained_order
+                    previous = retained_order(engine.store, state)
+                    context = copy.deepcopy(context)
+                    context['dataset_planning'].update(protocol_evidence=state['protocol_evidence'],
+                        prior_work_order=previous['result'], operator_transition=evidence.get('operator_transition'))
+                    task = ('依据已保留工单、已登记的 protocol_evidence 和本轮 repair_issues，只改具体被否决的实现条款。'
+                            '保留数据、预算及其余已成立的约束；项目选择和论文报告值分别注明。返回修订后的工单。')
+                    output_schema = copy.deepcopy(schema)
+                    for field in ('dataset', 'budget_plan'):
+                        output_schema['properties'][field] = {'const': previous['result'][field]}
+                dispatch_role='engineer'
+                if author=='scout':
+                    legacy_id=Harness.decision_key(run_id,'scout',purpose,task,context,output_schema)
+                    if engine.store.get('handoffs',legacy_id):dispatch_role='scout'
+                result = await harness.ask(run_id, dispatch_role, purpose, task, context, output_schema)
                 engine.check_active(run_id)
                 validate(result, output_schema)
                 validate(result, schema)
                 state.update(result=result, result_sha256=sha(result), status='reviewing', votes=[],
-                    author_handoff_id=Harness.decision_key(run_id, author, purpose, task, context, output_schema))
+                    author_role=dispatch_role,author_handoff_id=Harness.decision_key(run_id, dispatch_role, purpose, task, context, output_schema))
                 engine.store.put(COLLECTION, key, state)
+                if dispatch_role!='engineer':continue
             await asyncio.to_thread(checker, state['result'])
             if 'review_context' not in state:
                 state['review_context'] = _context(engine, run_id, scope,
                     {**evidence, 'proposal': state['result']}, state['context']['dataset_planning']['phase'])
+                if state.get('protocol_evidence'):
+                    state['review_context']['dataset_planning'].update(protocol_evidence=state['protocol_evidence'],
+                        reviewed_result_sha256=state['result_sha256'], operator_transition=evidence.get('operator_transition'))
                 engine.store.put(COLLECTION, key, state)
-            for role in ('director', 'engineer', 'scout'):
-                if any(v['role'] == role for v in state['votes']):
-                    continue
+            if not full_review.members(state['votes']):
                 purpose = 'dataset_plan_review:' + key.rsplit(':',1)[-1] + ':' + str(state['round'])
-                vote = await harness.ask(run_id, role, purpose,
-                    REVIEW, state['review_context'], VOTE)
+                review, vote_schema = REVIEW, VOTE
+                if state.get('protocol_evidence'):
+                    vote_schema = PROTOCOL_VOTE
+                    review += ('\n本次审原工单与随附 protocol_evidence 的组合。以已登记证据更新原文中的旧待办。'
+                        '区分论文报告设置与已标明的项目选择；未报告的列名或指标尺度不要求冒充论文事实。'
+                        'operator_transition 是已发生的队列转场及其限定。只判断当前实现任务能否下发。'
+                        '执行前仍需做的测试、资源核验及科研限制列 execution_conditions。'
+                        '只有必须修改本工单才能开始实现的具体问题列 issues，注明位置、原因、改法。')
+                if state['votes']:
+                    state.setdefault('review_history', []).append(copy.deepcopy(state['votes']))
+                state['votes'] = await full_review.group(harness, run_id, purpose, review, state['review_context'], vote_schema)
                 engine.check_active(run_id)
-                validate(vote, VOTE)
-                state['votes'].append({'role': role, **vote, 'handoff_id':
-                    Harness.decision_key(run_id, role, purpose, REVIEW, state['review_context'], VOTE)})
                 engine.store.put(COLLECTION, key, state)
             issues = [issue for vote in state['votes'] if not vote['approve'] or vote['issues']
                 for issue in (vote['issues'] or [vote['rationale']])]
@@ -164,6 +245,12 @@ async def _reviewed(engine, harness, run_id, *, scope, evidence, author, instruc
                 'selection' if author == 'scout' else 'work_order')
             state['context']['dataset_planning']['repair_issues'] = [message]
             engine.check_active(run_id)
+            if route_protocol_gaps:
+                from .dataset_protocol_evidence import needs_evidence
+                if needs_evidence([message]):
+                    state['waiting_for_protocol_evidence'] = True
+                    engine.store.put(COLLECTION, key, state)
+                    raise ProtocolEvidenceNeeded(key, message) from exc
             engine.store.put(COLLECTION, key, state)
             continue
         approval(engine.store, state)
@@ -211,11 +298,16 @@ def selected(plan):
     return [copy.deepcopy(row) for row in plan['result']['candidates'] if row['selected']]
 
 
-def check_design(result, plan):
+def check_design(result, plan, *, proposal=None):
     chosen = {row['target']['dataset']: row['target'] for row in selected(plan)}
     tasks = result.get('benchmark_tasks', [])
-    if set(chosen) != {t.get('dataset') for t in tasks}:
-        raise ValueError('Design must cover the agent-approved dataset selection')
+    actual = {t.get('dataset') for t in tasks}
+    if set(chosen) != actual:
+        missing = sorted(chosen.keys() - actual, key=repr)
+        unexpected = sorted(actual - chosen.keys(), key=repr)
+        raise ValueError('Design must cover the agent-approved dataset selection: '
+            f'missing={missing!r}; unexpected={unexpected!r}. '
+            'Dataset metadata must be an exact identity; put protocol status in limitations.')
     for task in tasks:
         target = chosen[task['dataset']]
         expected = [{'asset_id': target['asset_id'], 'manifest_sha256': target['manifest_sha256']}]

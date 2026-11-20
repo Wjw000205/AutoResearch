@@ -4,6 +4,65 @@ from __future__ import annotations
 from .implementation_review_routing import digest
 from .implementation_authoring_preservation import _tokens, _index, SaveConflict
 
+CONTEXT = 'acceptance_author_patch_scope'
+GUIDANCE = ('修订范围以 acceptance_author_patch_scope.allowed_fields 和上一送审稿为准，'
+    '每次保存后检查 acceptance_author_patch_manifest 的累计 actual_paths 与 forbidden_fields。'
+    '中间草稿可以保存，但最终不得保留范围外的改动；恢复范围外字段时须恢复上一送审稿原值，'
+    '并保留其余有效修改。不得仅从 patch_reports 删除声明来隐藏实际改动。'
+    '若原义务确实无法在冻结范围内完成，明确报告具体来源冲突和所需授权，不得自行扩大范围。')
+
+
+def view(context):
+    from .implementation_acceptance import criterion_fields
+    contract = context['acceptance_contract']
+    issues = [{'issue_id': i['issue_id'], 'criterion_id': i['criterion_id'],
+        'allowed_fields': sorted(criterion_fields(contract, i['criterion_id']))}
+        for i in context['acceptance_issues']]
+    return {'version': 1, 'contract_sha256': contract.get('sha256'), 'issues': issues,
+        'allowed_fields': sorted({field for i in issues for field in i['allowed_fields']}),
+        'scientific_approval': False}
+
+
+def allowed_fields(context):
+    """Same frozen dependency scope for producer, manifest and every validator."""
+    value = view(context)
+    marker = context.get(CONTEXT)
+    if CONTEXT in context and (not isinstance(marker, dict)
+            or type(marker.get('version')) is not int or marker != value):
+        from .engine import ResearchBlocked
+        raise ResearchBlocked('作者修订范围目录与冻结合同或原问题不一致。')
+    return set(value['allowed_fields'])
+
+
+def attach(context):
+    value = dict(context)
+    value[CONTEXT] = view(context)
+    return value
+
+
+def repair_metadata(context, previous, row, scope):
+    return {'version': 1, 'scope': view(context), 'diagnostic': scope,
+        'baseline_spec_hash': previous['spec_hash'],
+        'baseline_document': {k: previous['document'][k] for k in ('document_id', 'sha256')},
+        'draft_spec_hash': row['spec_hash'],
+        'draft_document': {k: row['document'][k] for k in ('document_id', 'sha256')},
+        'scientific_approval': False, 'reading_credit': False}
+
+
+def validate_repair(context, state, source, pending):
+    """Recompute the frozen diagnosis from original draft/answer and baseline."""
+    repairs = [p['submission_scope_repair'] for p in pending if 'submission_scope_repair' in p]
+    if not repairs:
+        return
+    from .implementation_authoring import COLLECTION
+    from .engine import ResearchBlocked
+    row = source[COLLECTION]['row']
+    previous = next(r for r in state['specifications'] if r['index'] == row['index'] - 1)
+    actual = diagnostic(previous['spec'], row['spec'], source['decisions']['result']['patch_reports'], allowed_fields(context))
+    if (len(repairs) != 1 or type(repairs[0].get('version')) is not int or actual['valid']
+            or repairs[0] != repair_metadata(context, previous, row, actual)):
+        raise ResearchBlocked('作者范围补正诊断与原始提交、累计修改或冻结基线不一致。')
+
 
 def pointer(tokens):
     return ''.join('/' + str(token).replace('~', '~0').replace('/', '~1') for token in tokens)

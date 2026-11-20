@@ -5,11 +5,14 @@ import math
 def validate(found, candidate):
     protocol = found['protocol']
     allowed = {'name', 'context_window', 'max_output_tokens', 'timeout_seconds', 'deep_timeout_seconds'}
-    allowed |= {'model', 'reasoning_effort', 'deep_reasoning_effort'}
+    allowed |= {'model', 'bounded_model', 'reasoning_effort', 'deep_reasoning_effort'}
     if candidate.get('protocol', protocol) != protocol or candidate.get('api_key'):
         raise ValueError('套餐通道不接受 API 密钥或其他协议')
     value = {**found, **{k: v for k, v in candidate.items() if k in allowed}}
-    for field in ('name', 'model'):
+    text_fields = ['name', 'model']
+    if 'bounded_model' in value:
+        text_fields.append('bounded_model')
+    for field in text_fields:
         if not isinstance(value.get(field), str) or not value[field].strip() or len(value[field]) > 160:
             raise ValueError('名称和模型标识必须为非空文本')
     for field in ('timeout_seconds', 'deep_timeout_seconds'):

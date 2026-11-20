@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 
 from . import code_repair_contract as repair
+from .repair_evidence_scope import matches_code_receipt
 
 TASK = ('严格按当前批准实现文档核对本清单修改意见。只核对 targets 中的原问题，'
     '不得新增未定义算法、参数、测试门槛或研究任务。原文缺失先用工具定位、补读，不能直接推测。'
@@ -46,6 +47,14 @@ def request(packet, prior=None, memory=None):
         'deferred_issue_ids': [i['issue_id'] for i in packet.get('deferred_items', [])]}
     if prior:
         view['prior_audit'] = copy.deepcopy(prior)
+    host = packet.get('clarification', {}).get('host_constraint_reconciliation')
+    if packet.get('clarification',{}).get('evidence_work_item'):
+        view['evidence_work_item']=copy.deepcopy(packet['clarification']['evidence_work_item'])
+    if host:
+        view['host_constraint_reconciliation'] = copy.deepcopy(host)
+        view['host_control_scope'] = ('有效约束与优先关系由 Harness 回执说明，无需再评审宿主账本或要求补文档。'
+            '只核对 targets 中代码修改的原问题、准确位置、修改办法及批准依据；'
+            '此回执不代表代码通过或新增执行许可。')
     if prior and prior.get('tool_review'):
         view['reading_memory'] = copy.deepcopy(memory or {'reads': [], 'notes': []})
         view['continuation'] = ('上一轮已有结论和读取保持有效。剩余 targets 缺少决定性依据，'
@@ -104,8 +113,8 @@ def validate(engine, run_id, role, hid, packet, context, value, *, ancestry=None
                 owner, row = receipts.get(ref, (None, None))
                 if not row or row['call']['name'] not in ({tool, 'documents.recall'} if tool == 'documents.read' else {tool}):
                     repair.fail('补读引用没有同一交接的真实读取回执。')
-                if tool == 'code.read' and row['result']['path'] not in targets[identity]['allowed_paths']:
-                    repair.fail('补读代码不属于原问题允许范围。')
+                if tool == 'code.read' and not matches_code_receipt(packet, row['result']):
+                    repair.fail('补读代码不属于同一冻结证据集或版本已变化。')
                 if ref not in checked:
                     if row['call']['name'] == 'documents.recall':
                         verify_recall(engine, run_id, role, owner, row['call']['arguments'], row['result'])
@@ -121,8 +130,6 @@ def validate(engine, run_id, role, hid, packet, context, value, *, ancestry=None
 def reading_memory(engine, run_id, role, packet, prior):
     from .code_navigation import audit_predecessors, read_receipt_id
     context = {'packet_sha256': repair.sha(packet), 'repair_packet_view': {'prior_audit': prior}}
-    targets = {c['issue_id'] for c in prior['result']['checks'] if not c['supported']}
-    paths = {p for i in packet['items'] if i['issue_id'] in targets for p in i['allowed_paths']}
     reads, notes = {}, {}
     for owner in audit_predecessors(engine, run_id, role, context):
         for row in engine.store.get('handoff_progress', owner, {}).get('tool_results', []):
@@ -130,10 +137,22 @@ def reading_memory(engine, run_id, role, packet, prior):
             if not isinstance(page, dict) or page.get('error'):
                 continue
             if name == 'code.record_notes':
+                args = row.get('call', {}).get('arguments', {})
+                if args.get('action') == 'read' or page.get('history_only'):
+                    continue  # Reopening an old note never creates a new observation.
+                if 'observation_ids' in page or any('code_analysis' in n for n in page.get('notes', [])):
+                    from .code_reading_memory import code_note_id
+                    values = args.get('notes', [])
+                    identities = [code_note_id(run_id, role, owner, n) for n in values]
+                    if page.get('notes') != values or page.get('observation_ids') != identities:
+                        raise ValueError('Prior code observations changed their immutable save identities')
+                    for identity, note in zip(identities, values):
+                        notes.setdefault(('id', identity), {'observation_id': identity, **copy.deepcopy(note)})
+                    continue  # Preserve all explicit branches, never choose by key/time.
                 for note in page.get('notes', []):
                     notes.setdefault(note['key'], copy.deepcopy(note))
             elif name in {'code.read', 'documents.read', 'documents.recall'} and (page.get('text') or page.get('entries')):
-                if name == 'code.read' and page.get('path') not in paths:
+                if name == 'code.read' and not matches_code_receipt(packet, page):
                     continue
                 identity = read_receipt_id(row)
                 meta = {k: page[k] for k in ('path', 'artifact_id', 'document_id', 'sha256', 'section_id',
@@ -170,39 +189,3 @@ def authenticate(engine, run_id, packet, audit, *, seen=None):
     return value
 
 
-async def review(engine, h, run_id, role, packet):
-    """Use unchanged legacy decisions; supplement only a compact audit's gaps."""
-    purpose = 'code_repair_audit:' + repair.sha(packet)
-    hid = h.decision_key(run_id, role, purpose, repair.audit_task(packet), repair.audit_context(packet), repair.AUDIT_SCHEMA)
-    decision = engine.store.get('decisions', hid, {})
-    prior = None
-    if decision:
-        prior = {'role': role, 'handoff_id': hid, 'result': decision['result']}
-        authenticate(engine, run_id, packet, prior)
-        repair.validate_audit(prior['result'], packet, require_approval=False)
-        if prior['result']['approve'] or not packet.get('audit_revision'):
-            return prior
-    visited = set()
-    while True:
-        memory = reading_memory(engine, run_id, role, packet, prior) if prior and prior.get('tool_review') else None
-        context = request(packet, prior, memory)
-        value = await h.ask(run_id, role, purpose, TASK, context, SCHEMA)
-        hid = h.decision_key(run_id, role, purpose, TASK, context, SCHEMA)
-        validate(engine, run_id, role, hid, packet, context, value)
-        current = {'role': role, 'handoff_id': hid, 'result': semantic(value), 'tool_review': 1}
-        unsupported = {r['issue_id'] for r in value['checks'] if not r['supported']}
-        unread = unsupported - {e['issue_id'] for e in value['evidence']}
-        if not unread:
-            return current
-        # Missing source reading belongs to this auditor, not to the author of
-        # an otherwise unchanged edit. No synthetic support or issue deletion.
-        inspected = reading_memory(engine, run_id, role, packet, current)
-        mark = repair.sha({'unread': sorted(unread), 'reads': sorted(r['receipt_sha256'] for r in inspected['reads'])})
-        if mark in visited:
-            repair.fail('原审查者补读未取得新依据；保留原分歧，不能转成修改授权。')
-        visited.add(mark)
-        engine.check_active(run_id)
-        engine.store.event(run_id, 'implementation.repair_reading_continued',
-            '原审查者继续补齐缺失证据，保留本人已支持结论和已读记忆。',
-            {'role': role, 'packet_sha256': repair.sha(packet), 'handoff_id': hid, 'issue_ids': sorted(unread)})
-        prior = current

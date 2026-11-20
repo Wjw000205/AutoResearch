@@ -10,6 +10,15 @@ from .delivery_files import io_path
 STATE_KEY='full_acceptance_check_budget'
 PREFIX='# Host CPU-check resource contract SHA256: '
 CAPS={'cpu_cores':1,'memory_mb':1024,'disk_mb':256}
+DIAGNOSTIC_LIMITS_FILE = '_delivery/cpu_limits.json'
+
+
+def diagnostic_limits(raw):
+    limits = json.loads(raw)
+    if (not isinstance(limits, dict) or set(limits) - (set(CAPS) | {'timeout_seconds', 'cpu_seconds'})
+            or any(type(value) is not int or value <= 0 for value in limits.values())):
+        raise ValueError('CPU diagnostic limits must be positive integer resource ceilings')
+    return limits
 
 
 def review_schema(candidate,schema):
@@ -45,7 +54,16 @@ def checked(candidate):
 def caps(candidate,run):
     value=checked(candidate)
     seconds=min((value or {}).get('timeout_seconds',60),run['config']['experiment_timeout'])
-    return {'timeout_seconds':seconds,'cpu_seconds':seconds,**CAPS}
+    limits = {'timeout_seconds':seconds,'cpu_seconds':seconds,**CAPS}
+    if 'diagnostic_limits' in candidate:
+        bundle = candidate['check_bundle']
+        raw = io_path(Path(bundle['root']) / DIAGNOSTIC_LIMITS_FILE).read_bytes()
+        entry = next(row for row in bundle['files'] if row['path'] == DIAGNOSTIC_LIMITS_FILE)
+        authored = diagnostic_limits(raw)
+        if hashlib.sha256(raw).hexdigest() != entry['sha256'] or authored != candidate['diagnostic_limits']:
+            raise ValueError('CPU diagnostic limits differ from the reviewed delivery')
+        limits.update({name: min(limits[name], value) for name, value in authored.items()})
+    return limits
 
 
 def resource_request(resource,candidate,run):
@@ -59,6 +77,7 @@ def resource_request(resource,candidate,run):
 
 
 def attach(engine,run_id,candidate,value):
+    from .saved_validation_configuration import archived_workspace_inputs
     from .rapid_experiment_revision import _write_files
     from .experiment_analysis import freeze_sources
     from .check_instrumentation import split_future_prefix
@@ -75,9 +94,12 @@ def attach(engine,run_id,candidate,value):
     root=engine.run_dir(run_id)/'host-check-budgets'/c['checks_sha256'][:20]
     files={r['path']:io_path(Path(c['check_bundle']['root'])/r['path']).read_bytes() for r in c['check_bundle']['files']}
     files.update({'experiment.py':c['check_code'].encode(),'host_check_budget.json':raw})
-    c['check_bundle']=_write_files(root/'check',files)
+    c['check_bundle']=_write_files(root/'check',files,archived_inputs=archived_workspace_inputs(files))
     review={r['path']:io_path(Path(c['review_bundle']['root'])/r['path']).read_bytes() for r in c['review_bundle']['files']}
-    review['host_check_budget.json']=raw;c['review_bundle']=_write_files(root/'review',review)
+    review['host_check_budget.json']=raw;c['review_bundle']=_write_files(root/'review',review,archived_inputs=archived_workspace_inputs(review))
+    if 'diagnostic_execution' in c:
+        from .scoped_work_order_contract import diagnostic_execution
+        c['diagnostic_execution'] = diagnostic_execution(engine.store.get('runs', run_id), c)
     c['code_sources']=freeze_sources(engine,run_id,c['program'],c['review_bundle'],delivery_support=True)
     c['changed_ranges']=[r for r in c['changed_ranges'] if r['path']!='host_check_budget.json']
     c['changed_ranges'].append({'path':'host_check_budget.json','start':0,'end':len(raw.decode()),

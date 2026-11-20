@@ -179,8 +179,10 @@ def unchanged(engine, record):
 
 
 def review_context(engine, record, result=None):
+    import copy
     from .experiment_decisions import _archive
     summary={'binding':record['binding'],'code_sources':record['candidate']['code_sources'],
+        'candidate_code_sources':record['candidate']['code_sources'],
         'candidate_not_executed':result is None,'controlled_protocol':record['protocol'],
         'original_validation_evidence':record['original_evidence'],
         'acceptance_checks':{'scope':'Offline code/gate checks only, not scientific acceptance',
@@ -189,29 +191,62 @@ def review_context(engine, record, result=None):
         summary['controlled_admission']={**record['admission'],'candidate_sha256':record['candidate']['bundle']['sha256'],
             'source':'Host SQLite experiment ledger; revalidated after independent votes and immediately before execution'}
     if result is not None:summary['controlled_result']=result
+    if record.get('source_binding_repair'):
+        summary['source_binding_repair'] = record['source_binding_repair']
+    if record.get('resource_evidence'):
+        summary['controlled_admission']['resource_contract'] = {
+            'candidate_sha256': record['candidate']['bundle']['sha256'], 'plan_sha256': record['plan_sha256'],
+            'enforcement_sha256': record['resource_evidence']['sha256'],
+            'terminal_commit_protocol': record['resource_evidence'].get('terminal_commit_protocol',1),
+            'effective_ceiling': record['protocol']['reviewed_limits'],
+            **({'supervised_closeout':1, 'fault_probe_receipt':record['resource_evidence']['closeout_checks']['sha256']}
+               if record['resource_evidence'].get('closeout_checks') else {}),
+            'file_ownership': record['candidate']['file_ownership'], 'runtime_reassessment_required': True}
+    if record.get('prior_review_items'):
+        from .diagnostic_review_issues import table
+        proof=record['resource_evidence']
+        summary.update(issues=table(record), cpu_checks=proof['closeout_checks']['body']['cases'],
+                       closeout_checks=proof['closeout_checks'], candidate_io_checks=record['candidate_io_checks'],
+                       prior_review_receipts={i['handoff_id']:i['original_read_receipts'] for i in record['prior_review_items']},
+                       continuation_evidence=record['continuation_author_material'])
+        summary['controlled_admission']['resource_contract'].update(issues_path='/issues',
+            issue_count=len(summary['issues']), issue_table_sha256=sha(summary['issues']))
+        source_ref = record['author_context']['validation_evidence']
+        frozen = engine.store.get('experiment_evidence', source_ref['id'])
+        if frozen.get('run_id') != record['run_id'] or sha(frozen['summary']) != source_ref['sha256']:
+            raise ValueError('Diagnostic author source changed before review projection')
+        summary = {**copy.deepcopy(frozen['summary']), **summary}
     ref=_archive(engine,record['run_id'],summary)
     return {'training_context_protocol':1,'experiment_workflow_protocol':1,'research_cycle':record['cycle'],
         'evidence_sha256':ref['sha256'],'validation_evidence':ref,'experiment_decision':{'controlled_check':True},
         'rapid_revision':{'id':record['id'],'amendment_sha256':record['candidate']['amendment_sha256'],
+            **({'source_binding_repair':record['source_binding_repair'],
+                'source_selection':'snapshot=candidate selects the explicit candidate_code_sources in this frozen evidence. '
+                    'Verify source_sha256 against each changed_ranges entry. Earlier misbound reads grant no coverage or votes.'}
+               if record.get('source_binding_repair') else {}),
+            **({'host_resource_contract':summary['controlled_admission']['resource_contract']}
+               if record.get('resource_evidence') else {}),
             'candidate_sha256':record['candidate']['bundle']['sha256'],'checks_sha256':record['candidate']['checks_sha256'],
             'changed_ranges':record['candidate']['changed_ranges'],'controlled_protocol':record['protocol'],
             'scope':'New bounded diagnosis only; existing training remains immutable.'}}
 
 
 def verify_result_reads(engine, record, answer, context):
+    from . import independent_full_review as full_review
     from .engine import Harness
     from .experiment_tools import compare
     purpose='experiment_diagnose:controlled-result:'+context['evidence_sha256']
-    key=Harness.decision_key(record['run_id'],answer['role'],purpose,AFTER_INSTRUCTION,context,AFTER)
+    key=full_review.decision_key(engine,record['run_id'],answer,purpose,AFTER_INSTRUCTION,context,AFTER)
     frozen=engine.store.get('handoff_inputs',key) or {}
     owner=engine.store.get('handoffs',key) or {}
     saved=(engine.store.get('decisions',key) or {}).get('result')
-    if (frozen.get('context')!=context or answer['evidence_sha256']!=context['evidence_sha256']
+    if (full_review.source_context(frozen.get('context',{}))!=full_review.source_context(context) or answer['evidence_sha256']!=context['evidence_sha256']
             or owner.get('run_id')!=record['run_id'] or owner.get('to_role')!=answer['role']
-            or saved!={k:v for k,v in answer.items() if k!='role'}):
+            or saved!=full_review.answer(answer)):
         raise ValueError('Result review is not owned by this frozen role')
     valid=set();ranges=[];total=None
-    for receipt in (engine.store.get('handoff_progress',key) or {}).get('tool_results',[]):
+    ids=full_review.reading_handoffs(engine.store,record['run_id'],answer) if full_review.KEY in answer else [key]
+    for receipt in [row for own in ids for row in engine.store.get('handoff_progress',own,{}).get('tool_results',[])]:
         call,result=receipt.get('call',{}),receipt.get('result',{})
         if result.get('receipt_sha256') not in answer['read_receipts']:continue
         body={k:v for k,v in result.items() if k!='receipt_sha256'}
@@ -292,8 +327,7 @@ async def execute(engine,harness,run_id):
     save(status='reviewing_results',outcome=outcome)
     result_context=review_context(engine,record,outcome)
     if not record.get('analyses'):
-        analyses=await _group(harness,run_id,'experiment_diagnose:controlled-result:'+result_context['evidence_sha256'],
-                              AFTER_INSTRUCTION,result_context,AFTER)
+        analyses=await result_reviews(engine,harness,run_id,record,result_context)
         result_reads=[verify_result_reads(engine,record,a,result_context) for a in analyses]
         save(analyses=analyses,result_reads=result_reads)
     save(status='completed',completed_at=now())
@@ -301,3 +335,15 @@ async def execute(engine,harness,run_id):
         {'trial_id':identifier,'report_sha256':outcome['report_sha256']})
     return {'tuning_pending':True,'next_node':'tuning','activity':'controlled_diagnostic','controlled_check_id':record['id'],
             'scientific_approval':False}
+
+
+async def result_reviews(engine,harness,run_id,record,context):
+    from . import independent_full_review as full
+    def verify(vote):
+        try:return verify_result_reads(engine,record,vote,context)
+        except ValueError as exc:
+            exc.covered_chars=full.read_progress(engine.store,run_id,vote,{'experiments.compare'})
+            exc.missing_read_targets=[{'path':'/controlled_result/summary','instruction':'按原结果协议分页补齐全部真实读取与引用。'}]
+            raise
+    return await full.group(harness,run_id,'experiment_diagnose:controlled-result:'+context['evidence_sha256'],
+        AFTER_INSTRUCTION,context,AFTER,validator=verify)

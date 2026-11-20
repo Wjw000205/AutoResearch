@@ -12,10 +12,10 @@ ROLES = {'director', 'engineer', 'scout'}
 ERROR = 'All three agents must read comparison/ablation analysis and relevant module source before optimization'
 
 
-def complete(reads, proposal):
+def complete(reads, proposal, roles=ROLES):
     if proposal.get('action') not in ACTIONS:
         return True
-    return (len(reads) == 3 and {r.get('role') for r in reads} == ROLES
+    return (len(reads) == len(roles) and {r.get('role') for r in reads} == set(roles)
             and all(r.get('module_source_read')
                     and set(r.get('analysis_kinds', [])) & {'comparison', 'ablation'} for r in reads))
 
@@ -35,9 +35,11 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
     from .experiment_decisions import analysis_receipts, analysis_schema
     from .experiment_evidence_handoff import merge_reads
 
-    if complete(reads, proposal):
+    from .independent_full_review import reviewers
+    roles = reviewers(record.get('analyses', []))
+    if complete(reads, proposal, roles):
         return reads
-    if len(reads) != 3 or {r.get('role') for r in reads} != ROLES:
+    if len(reads) != len(roles) or {r.get('role') for r in reads} != set(roles):
         raise ResearchBlocked(ERROR)
     digest = sha(proposal)
     repairs = copy.deepcopy(record.get('optimization_read_repairs', {}))
@@ -61,6 +63,9 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
                 'source_read_required': not original.get('module_source_read'),
                 'module_paths': proposal.get('training_response', {}).get('module_paths', []),
                 'execution_authorized': False, 'scientific_approval': False}}
+            index = context.get('tuning_point_reads')
+            if index and index.get('latest_unit'):
+                request['experiment_decision']['optimization_read_repair']['comparison_unit_ids'] = [index['latest_unit']]
             # Keep the action vocabulary for architecture-first datasets.
             if context.get('experiment_decision', {}).get('dataset_optimization'):
                 request['experiment_decision']['dataset_optimization'] = copy.deepcopy(
@@ -102,7 +107,7 @@ async def ensure_reads(engine, harness, run_id, record, proposal, reads, context
         assignment['read'] = receipt
         effective = merged
         await checkpoint(optimization_read_repairs=repairs)
-    if not complete(effective, proposal):
+    if not complete(effective, proposal, roles):
         raise ResearchBlocked(ERROR)
     await checkpoint(analysis_reads=effective, optimization_read_repairs=repairs, status='proposing')
     return effective

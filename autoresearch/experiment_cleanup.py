@@ -17,6 +17,7 @@ import psutil
 from .deletion import _plain_path
 from .experiment_workflow import sha
 from .storage import now
+from .async_ownership import to_thread as owned_to_thread
 
 COLLECTION = 'experiment_cleanups'
 MAX_FILES, MAX_SCAN, MAX_BYTES = 20, 5000, 64 * 1024 * 1024
@@ -30,13 +31,7 @@ async def dispatch(harness, run_id, role, owner, args):
     from .experiment_tools import execute
     lock = harness.engine.runner._locks.setdefault(run_id + ':' + args['trial_id'], asyncio.Lock())
     async with lock:
-        task = asyncio.create_task(asyncio.to_thread(execute, harness, run_id, role, owner,
-                                                    'experiments.cleanup', args))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+        return await owned_to_thread(execute, harness, run_id, role, owner, 'experiments.cleanup', args)
 
 
 def _attempt(engine, run_id, trial_id, cycle):

@@ -116,6 +116,15 @@ def credit_existing(store, run_id, context, reads, references):
     files = None
     for read in result:
         for reference in sorted(set(references) - set(read.get('source_paths', []))):
+            if read.get('tuning_point_reads_sha256'):
+                from .training_read_dispatch import _gaps
+                files = source_files(store, run_id, context) if files is None else files
+                identity = resolve(files, reference)
+                pages = read.get('source_page_ranges', {}).get(identity['path'])
+                if (pages and pages['sha256'] == identity['source_sha256']
+                        and not _gaps(pages['total_chars'], pages['ranges'])):
+                    read['source_paths'] = sorted(set(read['source_paths']) | {reference, identity['path']})
+                    continue
             for owner in dict.fromkeys([read.get('handoff_id'), read.get('supplemental_handoff_id')]):
                 if not owner:
                     continue

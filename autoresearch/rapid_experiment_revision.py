@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import json
 from pathlib import Path
 
 from .prose_schema import validate
@@ -42,12 +43,19 @@ checks 是短小的 Python CPU 断言，验证修改模块的实际行为和关�
 检查入口的 sys.argv[1] 是 params.json 文件路径；需要参数时读取该文件再解析 JSON。
 必须有实际 assert；不得伪造指标/测试结果。正常结束的标记由宿主添加。给出断言与问题的对应理由。
 缺少局部可行修复时不能用无关修改冒充完成。完整源码和历史日志按需读取，不复述到回答。'''
-REVIEW = '''独立审查这个局部架构/代码修订是否准确实现已批准修改单。
+PAIRED_REVIEW_SCOPE = '批准只授权本次 CPU 检查和通过后的最小成对验证批次，不代表科学成功、完整 SPEC 重新验收或最终测试通过。'
+REVIEW = f'''独立审查这个局部架构/代码修订是否准确实现已批准修改单。
 复用已有方案，只审查差异、受影响模块、baseline 公平性、数据泄漏、资源与断言充分性。
 必须用 experiments.inspect_module 读取 candidate 中每个改动区间的 source，返回真实 read_receipts。
 结合 rapid_revision 中的修改前后内容及 checks 核对因果假设和实现；需要上下游源码时按需读取。
-批准只授权本次 CPU 检查和通过后的最小成对验证批次，不代表科学成功、完整 SPEC 重新验收或最终测试通过。
+{PAIRED_REVIEW_SCOPE}
 未解决问题列出具体 issues；不展开从零讨论，不把候选代码当成已经运行。'''
+
+
+def review_instruction(record):
+    if record.get('diagnostic_review_protocol') == 1:
+        return REVIEW.replace(PAIRED_REVIEW_SCOPE, '批准范围仅为在已审资源限额下运行本次候选的 CPU 检查。宿主保存观测供后续架构评估，训练或验证另行决策。')
+    return REVIEW
 
 
 def _fail(message):
@@ -75,7 +83,7 @@ def latest(engine, run_id):
     """One terminal amendment, never accumulated review/source history."""
     rows = engine.store.list(COLLECTION, run_id)
     rows = [r for r in rows if r.get('cycle') == engine.cycle(run_id)
-            and r.get('status') in {'activated', 'rejected', 'check_failed', 'invalid', 'diagnostic_checked'}]
+            and r.get('status') in {'activated', 'rejected', 'check_failed', 'invalid', 'diagnostic_checked', 'admission_blocked'}]
     # An older work item may finish after recovery. Its newly measured failure
     # must take precedence over later-created, never-dispatched placeholders.
     return max(rows, key=lambda r: (r.get('completed_at') or r['created_at'], r['id']), default=None)
@@ -113,11 +121,11 @@ def _validate_base(engine, run_id, record):
         _fail('快速修订的原始验证证据发生变化。')
 
 
-def _write_files(root, files):
+def _write_files(root, files, *, archived_inputs=()):
     """Idempotent immutable writes; reject stale or linked destinations."""
     from .code_bundle import relative_file
     for name, source in files.items():
-        relative_file(name)
+        relative_file(name, archived_input=name in archived_inputs)
         path = io_path(root / name)
         for part in (path, *path.parents):
             if part.is_symlink() or getattr(part, 'is_junction', lambda: False)():
@@ -288,9 +296,18 @@ def build_candidate(engine, run_id, record, patch):
             ('delivery_id', 'delivery_hash', 'spec_hash', 'implementation_document_sha256', 'rapid_revision_id')},
         'acceptance_scope': 'Reviewed scoped amendment; paired validation still required',
         'scientific_approval': False}
+    if record.get('revision_documents'):
+        program['revision_documents'] = copy.deepcopy(record['revision_documents'])
+    if record.get('revision_documents') or record['decision'].get('implementation_correction'):
+        program['revision_comparison_protocol'] = 1
+    else:
+        program.pop('revision_comparison_protocol', None)
     if record.get('yaml_migration') or base.get('hyperparameter_yaml_protocol') == 1:
         from .yaml_migration import inspect_contract
-        program['hyperparameter_contract'] = inspect_contract(bundle)
+        expected_yaml_scope = record.get('yaml_configuration_scope') or base.get(
+            'hyperparameter_contract', {}).get('contract', {}).get('configuration_scope')
+        program['hyperparameter_contract'] = inspect_contract(bundle,
+            **({'expected_scope': expected_yaml_scope} if expected_yaml_scope else {}))
         program['hyperparameter_yaml_protocol'] = 1
         program['dependencies'] = list(dict.fromkeys([*base.get('dependencies', []), 'PyYAML>=6,<7']))
     from .experiment_analysis import freeze_sources
@@ -305,17 +322,24 @@ def build_candidate(engine, run_id, record, patch):
         ranges.append({'path':'host_pathlib_compat.py','start':0,'end':len(raw.decode()),
                        'sha256':hashlib.sha256(raw).hexdigest(),'scope':'host_check_compatibility'})
     delivery_context = {n: v.encode() for n, v in patch.get('delivery_context_files', {}).items()}
+    supplied = {}
+    if 'work_order.json' in delivery_context:
+        from .saved_validation_configuration import input_files
+        supplied = input_files(json.loads(delivery_context['work_order.json']))
+        if set(map(Path, supplied)) & set(map(Path, files.keys() | supports.keys())):
+            _fail('Selected validation input collides with a candidate file')
+        delivery_context.update(supplied)
     review_bundle = (_write_files(root / 'review', {**files, **supports, **compatibility_files,
         **delivery_context,
         **{'_control/' + n:raw for n,raw in control_files.items()},
-        '_delivery/checks.py': patch['checks'].encode()}) if modern else bundle)
+        '_delivery/checks.py': patch['checks'].encode()}, archived_inputs=supplied) if modern else bundle)
     sources = freeze_sources(engine, run_id, program, review_bundle, delivery_support=modern)
     if any(isinstance(n, ast.Name) and n.id.startswith('__rapid_') for n in ast.walk(tree)):
         _fail('检查源码不能覆盖宿主断言计数器。')
     # An uncalled test function or swallowed failed assertion is not a pass.
     from .check_instrumentation import instrument
     instrumented, assertion_count = instrument(patch['checks'], '__rapid_passed')
-    from .check_instrumentation import split_future_prefix
+    from .check_instrumentation import REQUIRE_ASSERTIONS, split_future_prefix
     future, instrumented = split_future_prefix(instrumented)
     # Check scripts may verify the exact authored source and delivery hashes.
     # Keep that complete layout intact below the host's instrumented launcher.
@@ -328,11 +352,19 @@ def build_candidate(engine, run_id, record, patch):
             '__rapid_cwd = Path.cwd()\n'
             'os.chdir(Path.cwd() / "_delivery_snapshot")\n'
             'sys.path.insert(0, str(Path.cwd()))\n')
-    checks = (future + compatibility_prefix + 'import sys, json\nfrom pathlib import Path\n'
+    report = 'print(json.dumps({"metrics": {"rapid_check_passed": 1.0, "rapid_assertions": len(__rapid_passed)}}))\n'
+    if record.get('check_measurement_protocol') == 1:
+        report = ('if not isinstance(cpu_observations, dict) or not cpu_observations:\n'
+                  '    raise ValueError("CPU diagnostic must report the measured observations from its work order")\n'
+                  '__rapid_metrics = {"cpu_observation." + name: value for name, value in cpu_observations.items()}\n'
+                  '__rapid_metrics.update(rapid_check_passed=1.0, rapid_assertions=len(__rapid_passed))\n'
+                  'print(json.dumps({"metrics": __rapid_metrics}, allow_nan=False))\n')
+    guard = REQUIRE_ASSERTIONS if record.get('diagnostic_review_protocol') == 1 else ''
+    checks = (future + guard + compatibility_prefix + 'import sys, json\nfrom pathlib import Path\n'
         + check_preamble + 'sys.path.insert(0, str(Path.cwd() / "src"))\n__rapid_passed = set()\n' + instrumented
         + ('\nos.chdir(__rapid_cwd)\n' if delivery_context else '')
         + f'\nassert len(__rapid_passed) == {assertion_count}, "Not every declared assertion was exercised successfully"\n'
-        + 'print(json.dumps({"metrics": {"rapid_check_passed": 1.0, "rapid_assertions": len(__rapid_passed)}}))\n')
+        + report)
     if 'candidate_entry.py' in files:
         _fail('候选项目已占用快速检查入口名称 candidate_entry.py。')
     check_files = {**files, **supports, **compatibility_files,
@@ -348,17 +380,35 @@ def build_candidate(engine, run_id, record, patch):
     # Leave room for relative source paths on Windows inside the preserved layout.
     check_root = engine.run_dir(run_id).resolve() / 'rapid-checks' / (
         check_identity[:20] if delivery_context else check_identity)
-    check_bundle = _write_files(check_root, check_files)
+    check_bundle = _write_files(check_root, check_files, archived_inputs={'_delivery_snapshot/' + n for n in supplied})
     control_bundle = _write_files(root / 'control', control_files) if modern else None
+    from .check_workspace import LAYOUT, STAGED_LAYOUT
+    staged = bool(record.get('staged_cpu_observations'))
     candidate = {'program': program, 'bundle': bundle, 'code_sources': sources,
-        **({'check_workspace_layout':'rapid-v1'} if compatibility_files else {}),
+        **({'check_workspace_layout': STAGED_LAYOUT if staged else LAYOUT} if compatibility_files else {}),
         **({'review_bundle': review_bundle, 'repair_source': copy.deepcopy(record.get('candidate_repair_source')),
             'control_bundle': control_bundle,
             'approval_inherited': False} if modern else {}),
         'changed_ranges': ranges, 'check_code': checks, 'check_bundle': check_bundle,
         'checks_sha256': _bytes_sha(checks), 'assertion_count': assertion_count, 'amendment_sha256': sha(patch)}
-    from .rapid_check_budget import apply_future
-    return apply_future(engine,run_id,record,candidate)
+    from .rapid_check_budget import apply_future, diagnostic_limits, DIAGNOSTIC_LIMITS_FILE
+    if modern and record.get('check_measurement_protocol') == 1:
+        if DIAGNOSTIC_LIMITS_FILE not in supports:
+            _fail('CPU diagnostic delivery lacks the approved resource ceilings in ' + DIAGNOSTIC_LIMITS_FILE)
+        candidate['diagnostic_limits'] = diagnostic_limits(supports[DIAGNOSTIC_LIMITS_FILE])
+    if staged:
+        from .diagnostic_observations import FIELD, names
+        candidate[FIELD] = names(record['decision'][FIELD])
+    candidate = apply_future(engine,run_id,record,candidate)
+    if record.get('diagnostic_review_protocol') == 1:
+        from .scoped_work_order_contract import diagnostic_execution
+        candidate['diagnostic_execution'] = diagnostic_execution(engine.store.get('runs', run_id), candidate)
+        if staged:
+            from .diagnostic_check_evidence import matching
+            checks = matching(candidate['diagnostic_execution']['observation_delivery']['host_source_sha256'])
+            if checks:
+                candidate['diagnostic_host_checks'] = checks
+    return candidate
 
 
 def _review_context(engine, run_id, record):
@@ -369,6 +419,9 @@ def _review_context(engine, run_id, record):
     summary = {'binding': record['binding'], 'code_sources': candidate['code_sources'],
         'candidate_not_executed': True, 'rapid_revision': {'patch': patch, 'decision': record['decision']},
         'original_validation_evidence': record['evidence']}
+    if record.get('revision_documents'):
+        from .architecture_amendment_documents import material
+        summary['revision_documents'] = material(engine, run_id, record['revision_documents'])
     ref = _archive(engine, run_id, summary)
     from .research_anchor import read as read_anchor
     context = {'training_context_protocol': 1, 'experiment_workflow_protocol': 1,
@@ -378,7 +431,11 @@ def _review_context(engine, run_id, record):
         **context_fields(engine.store, run_id, binding=record['binding']),
         'research_cycle': record['cycle'], 'evidence_sha256': ref['sha256'], 'validation_evidence': ref,
         'experiment_decision': {'decision_id': record['decision_id']},
+        **({'revision_documents': summary['revision_documents']} if 'revision_documents' in summary else {}),
         'rapid_revision': {'id': record['id'], 'amendment_sha256': candidate['amendment_sha256'],
+            **({'material_format': 'shared_text_v1'} if record.get('diagnostic_review_protocol') == 1 else {}),
+            **({'host_execution': candidate['diagnostic_execution']} if 'diagnostic_execution' in candidate else {}),
+            **({'diagnostic_host_checks': candidate['diagnostic_host_checks']} if 'diagnostic_host_checks' in candidate else {}),
             **({'host_check_repair': {**{k: record['host_check_repair'][k] for k in
                 ('original', 'reason', 'failed_trial_id')},
                 'scope': review_scope(record)}}
@@ -386,7 +443,10 @@ def _review_context(engine, run_id, record):
             **({'source_read_recovery': record['source_read_recovery']} if record.get('source_read_recovery') else {}),
             'candidate_sha256': candidate['bundle']['sha256'], 'checks_sha256': candidate['checks_sha256'],
             **({'check_execution_limits':copy.deepcopy(candidate['check_budget'])} if candidate.get('check_budget') else {}),
+            **({'diagnostic_resource_ceilings': candidate['diagnostic_limits']} if 'diagnostic_limits' in candidate else {}),
             'changes': record['decision']['changes'], 'hypothesis': record['decision']['hypothesis'],
+            **({'implementation_correction': record['decision']['implementation_correction']}
+               if record['decision'].get('implementation_correction') else {}),
             **({'architecture_review': copy.deepcopy(record['decision']['architecture_review'])}
                 if record['decision'].get('architecture_review') else {}),
             **({'candidate_repair_source': copy.deepcopy(record['candidate_repair_source']),
@@ -436,7 +496,8 @@ def review_receipts(engine, run_id, record, vote, context, *, purpose=None, inst
             require_complete=require_complete)
         return {**reads, 'clarification_handoff_id': key, 'approval_inherited': False}
     purpose = purpose or record.get('review_purpose') or 'rapid_review:' + record['candidate']['amendment_sha256']
-    key = Harness.decision_key(run_id, vote['role'], purpose, instruction or REVIEW, context, schema or record.get('review_schema') or VOTE)
+    from .independent_full_review import decision_key
+    key = decision_key(engine, run_id, vote, purpose, instruction or review_instruction(record), context, schema or record.get('review_schema') or VOTE)
     owner = engine.store.get('handoffs', key) or {}
     frozen = (engine.store.get('handoff_inputs', key) or {}).get('context', {})
     if (owner.get('run_id') != run_id or owner.get('to_role') != vote['role']
@@ -444,6 +505,10 @@ def review_receipts(engine, run_id, record, vote, context, *, purpose=None, inst
         _fail('局部代码复审缺少本角色的冻结源码读取任务。')
     valid, windows = set(), {}
     progress = engine.store.get('handoff_progress', key) or {}
+    from . import independent_full_review as full_review
+    if full_review.KEY in vote:
+        progress = {**progress, 'tool_results': [row for hid in full_review.reading_handoffs(engine.store, run_id, vote)
+            for row in (engine.store.get('handoff_progress', hid) or {}).get('tool_results', [])]}
     from .dataset_review_protocol import inherited_rows
     inherited = inherited_rows(engine,run_id,vote['role'],context)
     if record.get('structured_review'):
@@ -501,7 +566,7 @@ def _recover_source_review(engine, run_id, record, votes, context):
     purpose = 'rapid_review:' + record['candidate']['amendment_sha256']
     owners = []
     for vote in votes:
-        key = Harness.decision_key(run_id, vote['role'], purpose, REVIEW, context, record.get('review_schema') or VOTE)
+        key = Harness.decision_key(run_id, vote['role'], purpose, review_instruction(record), context, record.get('review_schema') or VOTE)
         owner = engine.store.get('handoffs', key) or {}
         frozen = (engine.store.get('handoff_inputs', key) or {}).get('context', {})
         progress = engine.store.get('handoff_progress', key) or {}
@@ -548,6 +613,10 @@ def _recover_source_review(engine, run_id, record, votes, context):
 
 
 async def _clarify_review_votes(engine, harness, run_id, record, votes, context):
+    from . import independent_full_review as full
+    if any(full.KEY in v for v in votes):
+        full.authenticate_complete(engine.store,run_id,votes)
+        return votes
     """Ask the original reviewer once to resolve approve=true with issues."""
     from .engine import Harness
     clarified = []
@@ -559,7 +628,7 @@ async def _clarify_review_votes(engine, harness, run_id, record, votes, context)
         assignments = record.setdefault('review_clarifications', {})
         if role not in assignments:
             purpose = record.get('review_purpose') or 'rapid_review:' + record['candidate']['amendment_sha256']
-            prior = Harness.decision_key(run_id, role, purpose, REVIEW, context, record.get('review_schema') or VOTE)
+            prior = Harness.decision_key(run_id, role, purpose, review_instruction(record), context, record.get('review_schema') or VOTE)
             original = {k:v for k,v in vote.items() if k != 'role'}
             if (engine.store.get('decisions', prior) or {}).get('result') != original:
                 _fail('局部复核澄清必须绑定原审阅人的真实答复。')
@@ -574,7 +643,7 @@ async def _clarify_review_votes(engine, harness, run_id, record, votes, context)
                 strict['properties'][field] = {'const': original[field]}
             assignments[role] = {'purpose': purpose + ':approval-clarification', 'context': updated,
                 'schema': strict, 'original_vote': original, 'original_handoff': prior,
-                'instruction': REVIEW + '\n你上一答复 approve=true 且 issues 非空。请依据自己已读的同版本源码澄清：issues 只放阻止当前补丁执行的具体缺陷；有缺陷则 approve=false，否则 approve=true 且 issues=[]。已知局限、未运行状态及后续门禁写入 rationale。版本哈希和原始读取回执保持不变，不改变实验范围，无需重读或重做设计。'}
+                'instruction': review_instruction(record) + '\n你上一答复 approve=true 且 issues 非空。请依据自己已读的同版本源码澄清：issues 只放阻止当前补丁执行的具体缺陷；有缺陷则 approve=false，否则 approve=true 且 issues=[]。已知局限、未运行状态及后续门禁写入 rationale。版本哈希和原始读取回执保持不变，不改变实验范围，无需重读或重做设计。'}
             engine.store.put(COLLECTION, record['id'], record)
         assignment = assignments[role]
         response = await harness.ask(run_id, role, assignment['purpose'], assignment['instruction'],
@@ -585,9 +654,16 @@ async def _clarify_review_votes(engine, harness, run_id, record, votes, context)
 
 
 def _reviewed(record):
+    from .independent_full_review import members
+    full_results=record.get('bounded_evidence_review',{}).get('full_reviews')
+    if full_results:
+        from .bounded_evidence_review import checked_plan
+        body=checked_plan(record)
+        return (members(full_results) and body['candidate_sha256']==record['candidate']['bundle']['sha256']
+            and all(v.get('verdict')=='approve' for v in full_results))
     candidate = record['candidate']
     votes = record.get('votes', [])
-    return (len(votes) == 3 and {v.get('role') for v in votes} == {'director', 'engineer', 'scout'}
+    return (members(votes)
         and all(v.get('approve') is True and v.get('issues') == []
             and v.get('amendment_sha256') == candidate['amendment_sha256']
             and v.get('candidate_sha256') == candidate['bundle']['sha256']
@@ -598,6 +674,16 @@ def _reviewed(record):
 def _candidate_unchanged(record):
     from .code_bundle import validate as check
     candidate = record['candidate']
+    if (record.get('check_measurement_protocol') == 1 and record.get('native_delivery_protocol') == 2
+            and 'diagnostic_limits' not in candidate):
+        _fail('CPU diagnostic candidate lost its reviewed resource ceilings')
+    if record.get('staged_cpu_observations'):
+        from .check_workspace import STAGED_LAYOUT
+        from .diagnostic_observations import FIELD, names
+        required = names(record['decision'][FIELD])
+        if (candidate.get('check_workspace_layout') != STAGED_LAYOUT or candidate.get('required_cpu_observations') != required
+                or candidate.get('diagnostic_execution', {}).get('required_cpu_observations') != required):
+            _fail('Diagnostic observation inventory differs from the reviewed bundle')
     from .rapid_check_budget import checked as checked_budget
     checked_budget(candidate)
     if sha(record['patch']) != candidate['amendment_sha256'] or _bytes_sha(candidate['check_code']) != candidate['checks_sha256']:
@@ -620,6 +706,14 @@ def check_parameters(record):
     return {'phase': 'code_check', 'rapid_revision_id': record['id']}
 
 
+def check_input_contract(record):
+    result = {'argv1': 'Path to the host-owned params.json', 'params': check_parameters(record),
+              'training_configuration': False}
+    if record.get('check_input_contract_version') == 2:
+        result['module_paths_relative_to_cwd'] = True
+    return result
+
+
 async def _check(engine, run_id, record):
     from .lab import assess_resources
     from .training_adjustment import _basis
@@ -636,6 +730,12 @@ async def _check(engine, run_id, record):
         _fail('快速 CPU 检查未通过当前资源准入。')
     run = engine.store.get('runs', run_id)
     c = record['candidate']
+    if 'diagnostic_execution' in c:
+        reviewed = c['diagnostic_execution']
+        if (reviewed['execution_mode'] != run['config'].get('execution_mode', 'local')
+                or reviewed['checks_sha256'] != c['checks_sha256'] or reviewed['check_bundle_sha256'] != c['check_bundle']['sha256']):
+            _fail('诊断 CPU 执行模式或候选与已审核工作单不一致。')
+        caps = {name: min(value, reviewed['resource_ceilings'][name]) for name, value in caps.items()}
     if record.get('post_exit_protocol') == 1:
         from . import rapid_post_exit
         from .rapid_review_plan import checked
@@ -648,9 +748,11 @@ async def _check(engine, run_id, record):
         'experiment_binding': {'research_cycle': record['cycle'], 'code_revision': c['program']['revision'],
             'code_sha256': c['checks_sha256'], 'experiment_plan_sha256': record['binding']['plan_sha256']}}
     if c.get('check_workspace_layout'):
-        from .check_workspace import LAYOUT
-        if c['check_workspace_layout']!=LAYOUT:_fail('Unsupported CPU check workspace layout')
-        limits['check_workspace_layout']=LAYOUT
+        from .check_workspace import LAYOUT, STAGED_LAYOUT
+        if c['check_workspace_layout'] not in (LAYOUT, STAGED_LAYOUT):_fail('Unsupported CPU check workspace layout')
+        limits['check_workspace_layout']=c['check_workspace_layout']
+        if c['check_workspace_layout'] == STAGED_LAYOUT:
+            limits['required_cpu_observations'] = c['required_cpu_observations']
     for field, cap in caps.items():
         limits[field] = min(limits.get(field, cap), cap)
     identifier = 'rapid-check-' + sha({'amendment': c['amendment_sha256'], 'checks': c['checks_sha256']})[:24]
@@ -664,6 +766,10 @@ async def _check(engine, run_id, record):
             record['post_exit_verification'] = rapid_post_exit.capture(engine,run_id,record,existing)
             engine.store.put(COLLECTION,record['id'],record)
         return existing
+    if record.get('staged_cpu_observations'):
+        from .scoped_work_order_contract import staged_contract
+        if c['diagnostic_execution'].get('observation_delivery') != staged_contract():
+            _fail('The reviewed diagnostic host contract changed before first launch')
     _budget(engine, run_id, 1)
     _base_unchanged(engine, run_id, record)
     try:
@@ -685,6 +791,16 @@ def _check_passed(engine, run_id, record):
     saved = record.get('check') or {}
     result = engine.store.get('experiments', run_id + ':' + saved.get('id', '')) or {}
     c = record['candidate']
+    if record.get('check_measurement_protocol') == 1:
+        observations = _observations(result)
+        if not observations or saved.get('cpu_observations') != observations:
+            return False
+        if record.get('staged_cpu_observations') and (
+                set(observations) != set(c['required_cpu_observations'])
+                or observations != result.get('received_cpu_observations')
+                or result.get('check_input_staging', {}).get('code_bundle_sha256') != c['check_bundle']['sha256']
+                or result.get('check_input_staging', {}).get('staged_before') != 'process_launch'):
+            return False
     if record.get('post_exit_protocol') == 1:
         from .rapid_post_exit import passed
         if not passed(engine.store,record,result):
@@ -694,6 +810,11 @@ def _check_passed(engine, run_id, record):
         and result.get('limits', {}).get('code_bundle') == c['check_bundle']
         and result.get('metrics', {}).get('rapid_check_passed') == 1
         and result.get('metrics', {}).get('rapid_assertions') == c['assertion_count'])
+
+
+def _observations(result):
+    return {name.removeprefix('cpu_observation.'): value for name, value in result.get('metrics', {}).items()
+            if name.startswith('cpu_observation.')}
 
 
 def runtime_bundle(store, run_id, program, base_program, plan_sha256):
@@ -833,7 +954,7 @@ async def run(engine, harness, run_id, review):
     record = engine.store.get(COLLECTION, key)
     if record and record.get('status') == 'review_blocked':
         _fail('候选已有经原始回执验证的独立否决；保留其余阅读进度，先处理具体问题，不自动重开修改轮次。')
-    if record and record['status'] == 'diagnostic_checked':
+    if record and record['status'] in {'diagnostic_checked', 'admission_blocked'}:
         _base_unchanged(engine, run_id, record)
         return {'rapid_revision': key, 'status': record['status'], 'next_node': 'tuning', 'tuning_pending': True}
     if record and record['status'] == 'activated':
@@ -867,13 +988,28 @@ async def run(engine, harness, run_id, review):
                 'inherits_previous_candidate': False,
                 'previous_candidate': {k: copy.deepcopy((evidence.get('rapid_revision') or {}).get(k))
                                        for k in ('id', 'status', 'code_sources')}}}
-        if scoped['proposal'].get('architecture_review') or evidence.get('hyperparameter_yaml', {}).get('migration_required') or (
+        from .scoped_work_order_contract import native_cpu_checks
+        if scoped_repair(scoped['proposal']):
+            record['diagnostic_review_protocol'] = 1
+        cpu_amendment = scoped_repair(scoped['proposal']) and native_cpu_checks(basis['program'])
+        if cpu_amendment and scoped['proposal']['training_response']['disposition'] == 'instrument':
+            record['check_measurement_protocol'] = 1
+            if 'required_cpu_observations' in scoped['proposal']:
+                record['staged_cpu_observations'] = True
+        if cpu_amendment or scoped['proposal'].get('architecture_review') or scoped['proposal'].get('implementation_correction') or evidence.get('hyperparameter_yaml', {}).get('migration_required') or (
                 basis['program'].get('hyperparameter_yaml_protocol') == 1 and scoped['proposal']['action'] == 'revise_architecture'):
             record.update(native_codex_protocol=1,
                           check_runtime_compatibility=1,
                           yaml_migration=bool(evidence.get('hyperparameter_yaml', {}).get('migration_required')))
+            if record['yaml_migration'] and evidence.get('hyperparameter_yaml', {}).get('configuration_scope') == 'experiment':
+                record['yaml_configuration_scope'] = 'experiment'
             record['review_schema'] = copy.deepcopy(VOTE)
             record['review_schema']['properties']['read_receipts']['maxItems'] = 256
+        if scoped['proposal'].get('architecture_review') and scoped['proposal']['action'] == 'revise_architecture':
+            from .architecture_amendment_documents import publish
+            from .async_ownership import to_thread
+            record['revision_documents'] = await to_thread(publish, engine, harness, run_id, record)
+            engine.check_active(run_id)
         engine.store.put(COLLECTION, key, record)
     _base_unchanged(engine, run_id, record)
     from . import rapid_check_repair
@@ -902,16 +1038,13 @@ async def run(engine, harness, run_id, review):
                 '仅开放已审修改单范围；已有训练不重跑，新增版本须通过后续验证、架构评审和新的源绑定调参计划。')
         if record.get('check_input_contract_version') in (1, 2):
             # New assignments only: never rewrite an already dispatched request.
-            context['rapid_revision']['check_input_contract'] = {
-                'argv1': 'Path to the host-owned params.json', 'params': check_parameters(record),
-                'training_configuration': False}
+            context['rapid_revision']['check_input_contract'] = check_input_contract(record)
             instruction += ('\nrapid_revision.check_input_contract 给出 CPU 检查的真实入参。'
                 'sys.argv[1] 指向宿主 code_check 信封，不包含 seed、variant 或训练配置；'
                 '不要把该信封直接交给训练配置加载器。需要测试加载器时，在隔离目录另写符合'
                 '已批准固定种子和 validation 阶段的最小配置夹具，再把该夹具路径传给加载器。'
                 '不得覆盖宿主 params.json，也不得放松生产配置校验。')
             if record['check_input_contract_version'] == 2:
-                context['rapid_revision']['check_input_contract']['module_paths_relative_to_cwd'] = True
                 instruction += ('\n运行文件按清单中的相对路径复制到 cwd；src 只是额外的导入搜索路径，'
                     '不代表全部模块都位于 src 下。源码身份断言应使用已读取的清单路径，'
                     '例如 dataset_runtime/training.py 对应 cwd/dataset_runtime/training.py，不得擅自添加 src/。')
@@ -936,21 +1069,31 @@ async def run(engine, harness, run_id, review):
         record['status'] = 'reviewing'
         engine.store.put(COLLECTION, key, record)
     from .rapid_check_budget import review_schema as budget_review_schema
-    if not record['votes'] and record['candidate'].get('check_budget'):
-        record['review_schema']=budget_review_schema(record['candidate'],record.get('review_schema') or VOTE)
-        engine.store.put(COLLECTION,key,record)
+    if not record['votes']:
+        candidate = record['candidate']
+        schema = copy.deepcopy(record.get('review_schema') or VOTE)
+        if candidate.get('check_budget'):
+            schema = budget_review_schema(candidate, schema)
+        if record.get('diagnostic_review_protocol') == 1:
+            for field, value in (('amendment_sha256', candidate['amendment_sha256']),
+                                 ('candidate_sha256', candidate['bundle']['sha256']),
+                                 ('checks_sha256', candidate['checks_sha256'])):
+                schema['properties'][field] = {'const': value}
+        if schema != (record.get('review_schema') or VOTE):
+            record['review_schema'] = schema
+            engine.store.put(COLLECTION, key, record)
     context = _review_context(engine, run_id, record)
     if not record['votes']:
         if record.get('structured_review'):
             from .rapid_review_plan import collect
             votes = await collect(engine,harness,run_id,record,context)
         else:
-            votes = await _group(harness, run_id,
-                record.get('review_purpose') or 'rapid_review:' + record['candidate']['amendment_sha256'], REVIEW, context, record.get('review_schema') or VOTE)
+            from .rapid_review_plan import full_collect
+            votes = await full_collect(engine,harness,run_id,record,context)
         _base_unchanged(engine, run_id, record)
         if _recover_source_review(engine, run_id, record, votes, context):
             context = _review_context(engine, run_id, record)
-            votes = await _group(harness, run_id, record['review_purpose'], REVIEW, context, record.get('review_schema') or VOTE)
+            votes = await _group(harness, run_id, record['review_purpose'], review_instruction(record), context, record.get('review_schema') or VOTE)
             _base_unchanged(engine, run_id, record)
         from .rapid_review_rejection import rejection_reads
         rejected = rejection_reads(engine, run_id, record, votes, context)
@@ -978,10 +1121,20 @@ async def run(engine, harness, run_id, review):
     for vote in record['votes']:
         review_receipts(engine, run_id, record, vote, context)
     if not record.get('check'):
+        from .diagnostic_resources import admission
+        refusal = admission(engine.store, record)
+        if refusal:
+            _candidate_unchanged(record)
+            record.update(status='admission_blocked', review_outcome='resource_admission_blocked', resource_admission=refusal)
+            return _finish(engine, run_id, record, activate=False)
         result = await _check(engine, run_id, record)
         _base_unchanged(engine, run_id, record)
         record['check'] = {'id': result['id'], 'receipt_sha256': sha(result), 'status': result['status'],
                            'stderr_tail': str(result.get('stderr') or '')[-1800:]}
+        if record.get('check_measurement_protocol') == 1 and result['status'] == 'completed':
+            record['check']['cpu_observations'] = _observations(result)
+        elif 'received_cpu_observations' in result:
+            record['check']['partial_observations'] = result['received_cpu_observations']
         engine.store.put(COLLECTION, key, record)
     if not _check_passed(engine, run_id, record):
         record['status'] = 'check_failed'

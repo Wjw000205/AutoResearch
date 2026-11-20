@@ -17,6 +17,7 @@ from .training_adjustment import obj
 
 COLLECTION = 'parameter_resolution_tasks'
 ROLES = ('director', 'engineer', 'scout')
+from . import independent_full_review as full
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 1200}
 PATHS = {'type': 'array', 'minItems': 1, 'maxItems': 12, 'uniqueItems': True,
          'items': {'type': 'string', 'minLength': 2, 'maxLength': 500}}
@@ -116,6 +117,12 @@ def validate_plan(plan, evidence, ref):
 
 
 def owner(engine, run_id, role, request):
+    if request.get('full_review_receipt'):
+        full.authenticate(engine.store, run_id, request['full_review_receipt'])
+        full.validate_delivery(engine.store, run_id, request['full_review_receipt'], engine=engine)
+        if (request['full_review_receipt']['role'] != role
+                or full.answer(request['full_review_receipt']) != request['answer']):
+            raise ValueError('Request-map review lost the exact independent original result')
     return authenticate(engine, run_id, role, request['purpose'],
                         {k: request[k] for k in ('instruction', 'context', 'schema')}, request['answer'])
 
@@ -139,9 +146,12 @@ def verified(engine, run_id, task):
     validate_plan(plan, evidence, task['evidence'])
     if task.get('plan_sha256') != sha(plan):
         raise ValueError('Parameter resolution plan changed')
-    if set(final.get('votes', {})) != set(ROLES):
+    if not full.assignment_members(final.get('votes', {})):
         raise ValueError('Parameter resolution requires all three independent votes')
     for role, request in final['votes'].items():
+        if request.get('full_review_receipt'):
+            full.authenticate(engine.store, run_id, request['full_review_receipt'])
+            full.validate_delivery(engine.store, run_id, request['full_review_receipt'], engine=engine)
         owner(engine, run_id, role, request)
         vote = request['answer']
         if (vote['proposal_sha256'] != sha(plan) or vote['evidence_sha256'] != task['evidence']['sha256']
@@ -290,8 +300,7 @@ async def resume(engine, harness, run_id, evidence, record):
 
     async def ask(role, request, status):
         if 'answer' not in request:
-            request['answer'] = await harness.ask(run_id, role, request['purpose'], request['instruction'],
-                                                request['context'], request['schema'])
+            request['answer'] = await full.ask_assignment(harness, run_id, role, request)
             await save(status=status)
         owner(engine, run_id, role, request)
         return request['answer']
@@ -378,8 +387,9 @@ async def resume(engine, harness, run_id, evidence, record):
                 current.update(error=str(second), needs_reconciliation=True)
                 await save(status='reconciling')
                 return pending(task_id=key, reason='参数处置合同需进一步定向修订')
-        current.setdefault('votes', {})
-        for role in ROLES:
+        review_roles, review_binding = full.prepare_assignments(current, 'votes', full.make_binding({
+            'proposal_sha256': sha(plan), 'source_evidence': ref}, 'parameter_resolution'))
+        for role in review_roles:
             if role not in current['votes']:
                 vote_context = copy.deepcopy(context)
                 vote_context.update(decision_proposal=plan, proposal_sha256=sha(plan))
@@ -389,6 +399,8 @@ async def resume(engine, harness, run_id, evidence, record):
                         '需要代理继续设计的事项不能归给外部。批准仅发布处置证据和待办，后续仍经提案/三方/资源/预算门禁。'
                         '同意时 approve=true、issues=[]；否则明确具体异议。',
                     'context': vote_context, 'schema': disposition_vote_schema(ref['sha256'], sha(plan))}
+                if review_binding:
+                    current['votes'][role]['context'] = full.bind(vote_context, review_binding)
                 await save(status='reviewing_plan')
             await ask(role, current['votes'][role], 'reviewing_plan')
         votes = [v['answer'] for v in current['votes'].values()]

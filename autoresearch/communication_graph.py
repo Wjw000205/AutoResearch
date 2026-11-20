@@ -17,11 +17,12 @@ class CommunicationState(TypedDict, total=False):
     result: dict
 
 
-async def _invoke(graph, payload, transition_limit):
+async def _invoke(graph, payload, transition_limit, *, checkpointer=None):
     with tracing_context(enabled=False):
         try:
-            return await graph.compile().ainvoke({'phase': 'review', 'payload': payload},
-                                                  {'recursion_limit': transition_limit})
+            return await graph.compile(checkpointer=checkpointer).ainvoke(
+                {'phase': 'review', 'payload': payload}, {'recursion_limit': transition_limit},
+                durability='async' if checkpointer is False else None)
         except NodeCancelledError as exc:
             # Existing controllers and recovery callers use cancellation as a
             # pause, not a scientific rejection or a new paid assignment.
@@ -38,7 +39,10 @@ async def communicate(review, revise, payload, *, transition_limit):
     graph.add_conditional_edges('review', lambda state: state['phase'],
                                 {'review': 'review', 'revise': 'revise', 'done': END})
     graph.add_edge('revise', 'review')
-    state = await _invoke(graph, payload, transition_limit)
+    # Rewound rounds reconstruct from the verified revision and handoff journal.
+    # An inherited checkpoint could restore the superseded round instead.
+    checkpointer = False if payload.get('discussion_generation') else None
+    state = await _invoke(graph, payload, transition_limit, checkpointer=checkpointer)
     return state['result']
 
 

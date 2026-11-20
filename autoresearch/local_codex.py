@@ -32,7 +32,7 @@ from typing import Callable
 from .codex_executable import resolve_codex
 
 
-TERMINAL = {'completed', 'failed', 'interrupted', 'blocked', 'unknown'}
+TERMINAL = {'completed', 'failed', 'interrupted', 'cancelled', 'blocked', 'unknown'}
 PUBLIC_PHASES = {None, 'commentary', 'final_answer'}
 MAX_LINE = 8 * 1024 * 1024
 MAX_PUBLIC_TEXT = 200_000
@@ -46,9 +46,9 @@ RECEIPT_FIELDS = {'run_id', 'operation_id', 'workspace', 'project_root', 'instru
     'output_schema_policy','effective_output_schema_sha256',
     'native_tool_violation', 'image_inputs_sha256', 'initialization_recovery', 'rpc_errors',
     'account_read_retries', 'initialization_diagnostic', 'initialization_connection_retries',
-    'non_retryable_server_error', 'cleanup_error_code'}
+    'non_retryable_server_error', 'cleanup_error_code', 'model_catalog_pending', 'model_catalog_recheck', 'code_resume_source'}
 RPC_METHODS = {'initialize', 'account/read', 'model/list', 'config/read', 'thread/read',
-    'thread/turns/list', 'thread/list', 'thread/delete', 'thread/start', 'thread/resume', 'turn/start'}
+    'thread/turns/list', 'thread/list', 'thread/delete', 'thread/start', 'thread/resume', 'thread/unarchive', 'turn/start'}
 RPC_ERROR_CATEGORIES = {'parse_error', 'invalid_request', 'method_not_found', 'invalid_params',
     'internal_error', 'server_error', 'other', 'malformed_error'}
 # Per-thread overrides; never change the user's global Codex configuration.
@@ -337,6 +337,9 @@ async def close_after_operation(client):
         primary_error.add_note('codex_process_shutdown_failed')
 
 
+MODEL_CATALOG_POLL_SECONDS = 30
+
+
 class LocalCodexClient:
     """One process per operation/readback, never attached to the current chat.
 
@@ -348,7 +351,8 @@ class LocalCodexClient:
     """
 
     def __init__(self, executable=None, *, timeout=900, request_timeout=30,
-                 blocked_env_names=(), process_factory=None):
+                 blocked_env_names=(), process_factory=None, resume_cancelled_writer=False):
+        self.resume_cancelled_writer = resume_cancelled_writer
         if not 1 <= timeout <= 86400 or not 0.05 <= request_timeout <= 300:
             raise ValueError('invalid_codex_timeout')
         self.executable = executable
@@ -477,6 +481,10 @@ class LocalCodexClient:
                         await self._save(**updates)
                     if 'already has an active writer' in str(remote_message):
                         raise LocalCodexBlocked('codex_thread_writer_busy')
+                    if method == 'thread/resume' and code == -32600 and remote_message == (
+                            f"session {params['threadId']} is archived. Run `codex unarchive {params['threadId']}` "
+                            "to unarchive it first."):
+                        raise LocalCodexBlocked('codex_thread_archived')
                     if method == 'thread/read' and 'thread not loaded:' in str(remote_message):
                         raise LocalCodexBlocked('codex_thread_not_found')
                     raise LocalCodexRPCError(transient_reason)
@@ -646,14 +654,14 @@ class LocalCodexClient:
             self._item(item)
             self._activity(item, source=source)
         status = turn.get('status')
-        if status in {'completed', 'failed', 'interrupted'}:
+        if status in {'completed', 'failed', 'interrupted', 'cancelled'}:
             self._state['status'] = status
             self._state['error_code'] = 'codex_turn_failed' if status == 'failed' else None
             if status == 'failed':
                 # Missing terminal error is unclassified, not proof that a
                 # previous transient error also explains this terminal result.
                 self._server_error(turn.get('error'))
-        elif status == 'inProgress' and self._state['status'] not in {'completed', 'failed', 'interrupted'}:
+        elif status == 'inProgress' and self._state['status'] not in {'completed', 'failed', 'interrupted', 'cancelled'}:
             self._state['status'] = 'running'
         elif status != 'inProgress':
             raise LocalCodexError('codex_unknown_turn_status')
@@ -718,8 +726,11 @@ class LocalCodexClient:
             for _ in range(20):
                 page = await self._rpc('thread/turns/list', {'threadId': thread_id,
                     'limit': 100, 'itemsView': 'full', 'sortDirection': 'asc', 'cursor': cursor})
-                turns.extend(page.get('data', []))
-                cursor = page.get('nextCursor')
+                if (not isinstance(page.get('data'), list) or 'nextCursor' not in page
+                        or page['nextCursor'] is not None and not isinstance(page['nextCursor'], str)):
+                    raise LocalCodexError('codex_invalid_history')
+                turns.extend(page['data'])
+                cursor = page['nextCursor']
                 if not cursor:
                     break
             if cursor:
@@ -769,7 +780,8 @@ class LocalCodexClient:
                     return {'status': 'deleted', 'thread_id': checkpoint['thread_id'],
                             'deleted_at': _now(), 'confirmed_absent': True}
                 turns = thread.get('turns', [])
-                if (len(turns) != 1 or turns[0].get('id') != checkpoint['turn_id']
+                if (not isinstance(turns, list) or len(turns) != 1
+                        or not isinstance(turns[0], dict) or turns[0].get('id') != checkpoint['turn_id']
                         or turns[0].get('status') != 'completed' or thread.get('isPinned') is True
                         or (thread.get('status') or {}).get('type') == 'active'):
                     raise LocalCodexBlocked('codex_thread_changed_after_capture')
@@ -850,6 +862,36 @@ class LocalCodexClient:
             raise LocalCodexBlocked('codex_selected_effort_unsupported')
         return selected[0]['model'] or selected[0]['id']
 
+    @staticmethod
+    def _validate_readback_items(turn):
+        """Validate complete authoritative history before merging any output.
+
+        Stream notifications may omit items; thread/read may not. Validation
+        is atomic so malformed history cannot overwrite a retained final.
+        """
+        if 'items' not in turn:
+            raise LocalCodexError('codex_readback_items_missing')
+        items = turn['items']
+        if not isinstance(items, list):
+            raise LocalCodexError('codex_readback_items_not_array')
+        message_ids = set()
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get('type'), str) or not item['type']:
+                raise LocalCodexError('codex_readback_item_invalid')
+            if item['type'] != 'agentMessage':
+                continue
+            phase = item.get('phase')
+            if phase is not None and (not isinstance(phase, str) or phase not in PUBLIC_PHASES):
+                raise LocalCodexError('codex_readback_public_phase_invalid')
+            identifier = item.get('id')
+            if not isinstance(identifier, str) or not identifier.strip():
+                raise LocalCodexError('codex_readback_public_id_invalid')
+            if identifier in message_ids:
+                raise LocalCodexError('codex_readback_public_id_duplicate')
+            message_ids.add(identifier)
+            if not isinstance(item.get('text'), str):
+                raise LocalCodexError('codex_readback_public_text_invalid')
+
     async def _recover(self):
         # Never retain an older successful readback marker across a new read
         # that fails, cannot locate the turn, or finds it still running.
@@ -866,13 +908,15 @@ class LocalCodexClient:
         thread = await self._read(thread_id)
         self._state.update(reported_model=thread.get('model'), reported_effort=thread.get('reasoningEffort'),
             model_reporting_scope='thread_configuration_not_per_turn_telemetry')
-        turns = thread.get('turns', [])
-        if not isinstance(turns, list):
+        turns = thread.get('turns')
+        if not isinstance(turns, list) or any(not isinstance(t, dict) for t in turns):
             raise LocalCodexError('codex_invalid_history')
         turn_id = self._state.get('turn_id')
         if turn_id:
             matches = [turn for turn in turns if turn.get('id') == turn_id]
         else:
+            for turn in turns:
+                self._validate_readback_items(turn)
             matches = [turn for turn in turns if any(isinstance(item, dict)
                        and item.get('type') == 'userMessage'
                        and item.get('clientId') == self._state['operation_id']
@@ -880,7 +924,8 @@ class LocalCodexClient:
         if len(matches) != 1:
             await self._save(status='unknown', error_code='codex_original_turn_not_uniquely_found')
             return
-        clients = {item.get('clientId') for item in matches[0].get('items', [])
+        self._validate_readback_items(matches[0])
+        clients = {item.get('clientId') for item in matches[0]['items']
                    if isinstance(item, dict) and item.get('type') == 'userMessage'
                    and item.get('clientId') is not None}
         if clients and self._state['operation_id'] not in clients:
@@ -899,6 +944,66 @@ class LocalCodexClient:
                     'observed_at': _now(), 'thread_id': thread_id, 'turn_id': self._state['turn_id'],
                     'source': 'readback'}
             await self._save(recovered_read_only=True)
+
+    @staticmethod
+    def unsubmitted_code_resume(cp, *, cancelled_writer=False):
+        """Recover a writer interrupted before persisting the turn/start marker."""
+        if (not isinstance(cp, dict) or set(cp) - RECEIPT_FIELDS or type(cp.get('version')) is not int
+                or cp['version'] != 1 or not isinstance(cp.get('thread_id'), str) or not cp['thread_id'].strip()
+                or not isinstance(cp.get('operation_id'), str) or not cp['operation_id'].strip()):
+            return False
+        failure = cp.get('first_failure') or {}
+        errors = cp.get('rpc_errors') or []
+        rejected = (isinstance(failure, dict) and failure.get('thread_id') == cp.get('thread_id')
+                and failure.get('turn_id') is None and failure.get('error_code') in {
+                    'codex_rpc_error','codex_thread_archived','codex_thread_writer_busy'}
+                and isinstance(errors, list) and any(isinstance(e, dict) and e.get('method') == 'thread/resume'
+                    and e.get('category') == 'invalid_request' and e.get('code') == -32600 for e in errors))
+        cancelled = (cancelled_writer and isinstance(failure,dict) and failure.get('status')=='unknown'
+                and failure.get('thread_id')==cp['thread_id'] and failure.get('turn_id') is None
+                and failure.get('error_code')=='codex_cancelled_result_unknown'
+                and cp.get('error_code') in {'codex_cancelled_result_unknown','codex_original_turn_not_uniquely_found'})
+        return (not cp.get('reasoning_only') and bool(cp.get('thread_id'))
+                and (cp.get('status') in {'thread_resume_dispatched', 'thread_ready'}
+                     or cp.get('status') in {'unknown', 'blocked'} and (rejected or cancelled))
+                and 'turn_dispatched_at' not in cp
+                and not any(cp.get(k) for k in ('turn_id', 'last_event_at',
+                    'usage', 'activities', 'public_messages', 'interrupt_requested', 'event_counts')))
+
+    def _check_idle_code_thread(self, thread):
+        turns = thread.get('turns')
+        if not isinstance(turns, list):
+            raise LocalCodexBlocked('codex_invalid_history')
+        for turn in turns:
+            if not isinstance(turn, dict) or turn.get('status') not in {'completed', 'interrupted', 'cancelled', 'failed'}:
+                raise LocalCodexBlocked('codex_thread_already_running')
+            self._validate_readback_items(turn)
+            if any(item.get('type') == 'userMessage' and item.get('clientId') == self._state['operation_id']
+                   for item in turn['items']):
+                raise LocalCodexBlocked('codex_operation_already_in_history')
+
+    async def observe_original_turn(self, checkpoint):
+        """Read a saved turn without initializing, retrying or dispatching it."""
+        if (self._busy or checkpoint.get('version') != 1
+                or not all(isinstance(checkpoint.get(key), str) and checkpoint[key]
+                    for key in ('operation_id', 'thread_id', 'turn_id', 'workspace', 'project_root'))):
+            raise LocalCodexBlocked('codex_original_turn_unverifiable')
+        workspace = _directory(checkpoint['workspace'])
+        if str(workspace) != checkpoint['workspace'] or not workspace.is_relative_to(_directory(checkpoint['project_root'])):
+            raise LocalCodexBlocked('codex_original_turn_workspace_mismatch')
+        self._state = copy.deepcopy(checkpoint)
+        self._busy = True
+        try:
+            async with asyncio.timeout(self.timeout):
+                await self._open(workspace)
+                await self._recover()
+                return {key: copy.deepcopy(self._state.get(key)) for key in (
+                    'run_id', 'operation_id', 'thread_id', 'turn_id', 'status', 'recovered_read_only', 'recovery_history')}
+        finally:
+            try:
+                await close_after_operation(self)
+            finally:
+                self._busy = False
 
     @staticmethod
     def _unsubmitted_initialization(checkpoint, reasoning_only):
@@ -921,7 +1026,7 @@ class LocalCodexClient:
             return False
         # Missing thread/turn IDs alone do not establish a safe retry. Once auth
         # succeeded, a lost thread-start acknowledgement is an uncertain dispatch.
-        if any(name in checkpoint for name in ('auth_mode', 'turn_dispatched_at',
+        if any(name in checkpoint for name in ('auth_mode', 'model_catalog_pending', 'turn_dispatched_at',
                 'project_id', 'model', 'model_provider', 'reported_model', 'reported_effort',
                 'model_reporting_scope', 'usage_scope', 'usage_observed_at', 'initialization_recovery')):
             return False
@@ -1121,7 +1226,8 @@ class LocalCodexClient:
 
     async def run(self, run_id, workspace, instruction, *, operation_id, checkpoint=None,
                   on_progress: Callable, check_active=None, thread_id=None, project_root=None,
-                  model=None, effort=None, reasoning_only=False, output_schema=None, keep_open=False, image_inputs=None):
+                  model=None, effort=None, reasoning_only=False, output_schema=None, keep_open=False, image_inputs=None,
+                  retry_unsubmitted=False, previously_used_model=None):
         if self._busy or self._process is not None or self._close_task is not None:
             raise LocalCodexBlocked('codex_client_already_running')
         workspace = _directory(workspace)
@@ -1171,6 +1277,13 @@ class LocalCodexClient:
                     'prepared', 'thread_start_dispatched', 'thread_resume_dispatched', 'thread_ready',
                     'turn_start_dispatched', 'running'}:
                 raise LocalCodexBlocked('codex_invalid_checkpoint')
+        if retry_unsubmitted:
+            from .native_preflight_retry import eligible_checkpoint
+            if not reasoning_only or thread_id is not None or not eligible_checkpoint(checkpoint):
+                raise LocalCodexBlocked('codex_unsubmitted_receipt_mismatch')
+            # The host archives the old receipt with the first durable progress
+            # update. All identity checks above still apply to this dispatch.
+            checkpoint = None
         self._state = {key: copy.deepcopy(value) for key, value in checkpoint.items()
                        if key in RECEIPT_FIELDS} if checkpoint is not None else {
             **identity, 'version': 1, 'status': 'prepared', 'thread_id': thread_id, 'turn_id': None,
@@ -1188,6 +1301,8 @@ class LocalCodexClient:
         returned = None
         self._turn_dispatched_here = False
         resume_initialization = self._unsubmitted_initialization(checkpoint, reasoning_only)
+        resume_code = bool(thread_id and not reasoning_only and self.unsubmitted_code_resume(
+            checkpoint,cancelled_writer=self.resume_cancelled_writer))
         try:
             await _invoke(check_active)
             if checkpoint is not None and checkpoint.get('status') == 'completed':
@@ -1200,7 +1315,7 @@ class LocalCodexClient:
                     'resumed_at': _now(), 'operation_id': operation_id,
                     'scope': 'Finish first reasoning initialization before durable auth marker; not another model turn'}
                 await self._save(status='prepared', error_code=None, initialization_recovery=audit)
-            async with asyncio.timeout(self.timeout):
+            async with asyncio.timeout(self.timeout) as request_deadline:
                 if reasoning_only:
                     account = (await self._initialize_reasoning_connection(workspace, initial_dispatch_allowed=(
                         checkpoint is None or resume_initialization))).get('account') or {}
@@ -1208,22 +1323,54 @@ class LocalCodexClient:
                         await self._save(initialization_diagnostic=self._initialization_diagnostic(
                             'account_read', 'authentication_required', 'check_login'))
                         raise LocalCodexBlocked('codex_chatgpt_login_required')
-                    await self._save(auth_mode='chatgpt', initialization_diagnostic=self._initialization_diagnostic(
+                    await self._save(auth_mode='chatgpt',
+                        **({'model_catalog_pending': True} if checkpoint is None or resume_initialization else {}),
+                        initialization_diagnostic=self._initialization_diagnostic(
                         'authenticated', 'ready', 'continue' if checkpoint is None or resume_initialization
                             else 'read_original_turn'))
                 else:
                     await self._open(workspace)
-                if checkpoint is not None and not resume_initialization:
+                if checkpoint is not None and not (resume_initialization or resume_code):
                     await self._recover()
                     returned = copy.deepcopy(self._state)
                     return returned
                 catalog = await self._models() if model is not None or effort is not None else None
+                if (reasoning_only and thread_id is None and model is not None
+                        and self._state.get('model_catalog_pending') is True
+                        and not any(model in (item['id'], item.get('model')) for item in catalog)):
+                    # A running handoff can lose its already-used model from the public catalog temporarily.
+                    # Only poll the authenticated catalog here, before creating a thread or sending user input.
+                    continuing = previously_used_model is not None and previously_used_model()
+                    loop = asyncio.get_running_loop()
+                    deadline = min(request_deadline.when() - self.request_timeout,
+                                   loop.time() + self.timeout / 2) if continuing else loop.time()
+                    recheck = {'initial_count': len(catalog), 'at': _now()}
+                    count, delay = 0, 1
+                    while True:
+                        await _invoke(check_active)
+                        count += 1
+                        await self._save(model_catalog_recheck={**recheck, 'attempt': count})
+                        await asyncio.sleep(delay)
+                        await _invoke(check_active)
+                        catalog = await self._models()
+                        if any(model in (item['id'], item.get('model')) for item in catalog) or loop.time() >= deadline:
+                            break
+                        delay = min(MODEL_CATALOG_POLL_SECONDS, deadline - loop.time())
                 selected_model = self._model_choice(catalog, model, effort) if model is not None else None
                 if thread_id:
                     existing = await self._read(thread_id)
-                    if any(turn.get('status') == 'inProgress' for turn in existing.get('turns', [])):
-                        raise LocalCodexBlocked('codex_thread_already_running')
+                    try:
+                        self._check_idle_code_thread(existing)
+                    except LocalCodexBlocked as exc:
+                        if not resume_code or exc.code != 'codex_operation_already_in_history':
+                            raise
+                        await self._recover()
+                        returned = copy.deepcopy(self._state)
+                        return returned
+                if resume_code and 'code_resume_source' not in self._state:
+                    await self._save(code_resume_source=copy.deepcopy(checkpoint))
                 await _invoke(check_active)
+                self._state.pop('model_catalog_pending', None)
                 await self._save(status='thread_start_dispatched' if not thread_id else 'thread_resume_dispatched')
                 params = {'cwd': str(project_root), 'sandbox': 'read-only', 'approvalPolicy': 'never'}
                 if reasoning_only:
@@ -1244,14 +1391,28 @@ class LocalCodexClient:
                     params['model'] = selected_model
                 if thread_id:
                     params['threadId'] = thread_id
-                response = await self._rpc('thread/resume' if thread_id else 'thread/start', params)
+                try:
+                    response = await self._rpc('thread/resume' if thread_id else 'thread/start', params)
+                except LocalCodexBlocked as exc:
+                    if exc.code != 'codex_thread_archived' or reasoning_only or not thread_id:
+                        raise
+                    await self._save(status='blocked', error_code=exc.code)
+                    await _invoke(check_active)
+                    opened = await self._rpc('thread/unarchive', {'threadId': thread_id})
+                    self._verify_thread(opened.get('thread'), thread_id=thread_id)
+                    self._check_idle_code_thread(await self._read(thread_id))
+                    await _invoke(check_active)
+                    response = await self._rpc('thread/resume', params)
                 thread = response.get('thread')
                 self._verify_thread(thread, thread_id=thread_id)
                 if reasoning_only and response.get('modelProvider') != 'openai':
                     raise LocalCodexBlocked('codex_chatgpt_provider_required')
                 if response.get('approvalPolicy') != 'never' or response.get('sandbox', {}).get('type') != 'readOnly':
                     raise LocalCodexBlocked('codex_initial_sandbox_not_read_only')
-                await self._save(status='thread_ready', thread_id=thread['id'],
+                if thread_id and not reasoning_only:
+                    self._check_idle_code_thread(thread)
+                    self._check_idle_code_thread(await self._read(thread_id))
+                await self._save(status='thread_ready', error_code=None, thread_id=thread['id'],
                     project_id=thread.get('projectId'), model=response.get('model'),
                     model_provider=response.get('modelProvider'), reported_model=response.get('model'),
                     reported_effort=response.get('reasoningEffort'),

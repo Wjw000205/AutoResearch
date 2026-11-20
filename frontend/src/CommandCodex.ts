@@ -13,7 +13,7 @@ export interface CodexParticipant {
 
 const phaseNames: Record<string, string> = {
   specification: '等待实现文档', spec_review: '等待文档审查', implementing: '代码实现与修复',
-  acceptance: '本地交付验收', code_review: '三方实际代码评审', completed: '实现交付流程已完成', blocked: '等待处理',
+  acceptance: '本地交付验收', code_review: '实际代码独立审核', completed: '实现交付流程已完成', blocked: '等待处理',
 };
 const receiptNames: Record<string, string> = {
   completed: '已返回', interrupted: '已中断', failed: '失败', unknown: '状态待核对', blocked: '等待处理',
@@ -53,7 +53,7 @@ export function codexParticipant(progress?: Json | null, execution?: CodexExecut
       summary: '研究当前已停止推进；最近一次写码请求和交付记录已保留。' };
   }
   if (running) return { ...result, status: 'running', label: '正在实现', summary: execution?.action ?? '本机 Codex 正在实现或修复代码，完成后交回产物并进入验收。' };
-  if (phase === 'code_review') return { ...result, status: 'idle', label: '等待代码评审', summary: '流程已进入三方代码评审，Codex 等待后续修改任务。' };
+  if (phase === 'code_review') return { ...result, status: 'idle', label: '等待代码评审', summary: '正在独立核对当前交付代码，Codex 等待审核反馈。' };
   if (phase === 'acceptance') return { ...result, status: 'idle', label: '等待本地验收', summary: '流程正在核验实际交付，验收结果与请求是否返回分别记录。' };
   if (phase === 'completed') return { ...result, status: 'completed', label: '流程已完成', summary: '实现交付流程已保存完成记录，可查看代码、回执及验收结果。' };
   if (requestStatus === 'completed') return { ...result, status: 'idle', label: '请求已返回', summary: '写码请求已返回，等待产物与验收检查。' };

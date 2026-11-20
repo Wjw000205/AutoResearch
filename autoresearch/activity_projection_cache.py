@@ -11,7 +11,7 @@ from .billing_projection_cache import TotalsCache
 
 
 CACHE = TotalsCache(capacity=96)
-COLLECTIONS = ('handoff_inputs', 'handoff_progress', 'implementation_document_drafts',
+COLLECTIONS = ('handoffs', 'handoff_inputs', 'handoff_progress', 'implementation_document_drafts',
                'codex_workflows', 'stage_contexts')
 
 

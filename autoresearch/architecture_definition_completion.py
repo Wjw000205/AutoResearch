@@ -334,13 +334,14 @@ def check_unit(engine, run_id, record, unit):
     decision = engine.store.get('decisions', hid, {})
     frozen = engine.store.get('handoff_inputs', hid, {})
     context = frozen.get('context', {})
+    author_role=unit.get('author_role','director')
     issue = next((i for i in record['issues'] if i['id'] == unit['issue_id']), None)
     if (not issue or [d['issue_id'] for d in result['definitions']] != [unit['issue_id']]
-            or decision.get('run_id') != run_id or decision.get('role') != 'director'
+            or decision.get('run_id') != run_id or decision.get('role') != author_role or author_role not in {'director','engineer'}
             or decision.get('result') != result or context.get('definition_issues') != [issue]
             or context.get('definition_completion_id') != record['id']
             or context.get('predecessor_sha256') != record['predecessor_sha256']
-            or Harness.decision_key(run_id, 'director', unit['purpose'], frozen.get('instruction'),
+            or Harness.decision_key(run_id, author_role, unit['purpose'], frozen.get('instruction'),
                                     context, frozen.get('schema')) != hid):
         raise ResearchBlocked('逐项定义缺少绑定原范围的实际作者交付。')
     navigation = _prior_issue_navigation(engine, run_id, record, unit['issue_id'])
@@ -376,6 +377,10 @@ def assemble(record):
 
 @once
 def check_candidate(engine, run_id, record):
+    from .architecture_definition_full import FIELD as FULL
+    if FULL in record:
+        from .architecture_definition_full import check_candidate as full_check
+        return full_check(engine,run_id,record)
     from .engine import ResearchBlocked
     candidate = record['candidate']
     definitions._binding(record, candidate)
@@ -388,7 +393,7 @@ def check_candidate(engine, run_id, record):
             check_unit(engine, run_id, record, unit)
     else:
         decision = engine.store.get('decisions', record.get('author_handoff_id', ''), {})
-        if decision.get('role') != 'director' or decision.get('run_id') != run_id or decision.get('result') != candidate:
+        if decision.get('role') != record.get('author_role','director') or decision.get('run_id') != run_id or decision.get('result') != candidate:
             raise ResearchBlocked('科学定义候选缺少实际作者交付。')
     ids = [d['issue_id'] for d in candidate['definitions']]
     _, text = document_index.load(engine, run_id, record['document']['document_id'], record['document']['sha256'])
@@ -502,20 +507,22 @@ async def write(engine, h, run_id, record):
         purpose = 'architecture_definition_issue_author:' + digest([record['id'], issue['id']])
         output_schema = schema()
         active = record.get('active_issue_handoff') or {}
+        author_role='engineer'
         if active.get('issue_id') == issue['id']:
             frozen = engine.store.get('handoff_inputs', active['handoff_id'])
             if not frozen or frozen.get('run_id') != run_id:
                 raise ResearchBlocked('逐项定义在途交接缺少原冻结输入。')
             instruction, context, output_schema = (copy.deepcopy(frozen[field])
                 for field in ('instruction', 'context', 'schema'))
-            if h.decision_key(run_id, 'director', purpose, instruction, context, output_schema) != active['handoff_id']:
+            author_role=engine.store.get('handoffs',active['handoff_id'],{}).get('to_role')
+            if author_role not in {'director','engineer'} or h.decision_key(run_id, author_role, purpose, instruction, context, output_schema) != active['handoff_id']:
                 raise ResearchBlocked('逐项定义在途交接的原冻结身份发生变化。')
-        hid = h._handoff(run_id, 'director', purpose, instruction, context, output_schema)['id']
+        hid = h._handoff(run_id, author_role, purpose, instruction, context, output_schema)['id']
         record.update(status='drafting', active_issue_handoff={'handoff_id': hid, 'issue_id': issue['id'],
             'number': number + 1}, reason=f'正在逐项编写：已保存 {number}/{len(record["issues"])} 项，尚未进入独立评议。')
         engine.store.put('architecture_definitions', record['id'], record)
-        result = await h.ask(run_id, 'director', purpose, instruction, context, output_schema)
-        unit = {'issue_id': issue['id'], 'handoff_id': hid, 'purpose': purpose, 'result': copy.deepcopy(result)}
+        result = await h.ask(run_id, author_role, purpose, instruction, context, output_schema)
+        unit = {'issue_id': issue['id'], 'handoff_id': hid, 'purpose': purpose, 'author_role':author_role,'result': copy.deepcopy(result)}
         try:
             check_unit(engine, run_id, record, unit)
         except ResearchBlocked as exc:

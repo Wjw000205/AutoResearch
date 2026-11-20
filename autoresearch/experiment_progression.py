@@ -85,8 +85,8 @@ def validate_coverage(proposal, evidence):
     classification = outcome.get('summary', {}).get('classification', {})
     reviews = causal.get('analyses', [])
     verdicts = classification.get('verdicts', {})
-    if (causal.get('status') != 'completed' or len(reviews) != 3
-            or {r.get('role') for r in reviews} != {'director', 'engineer', 'scout'}
+    from . import independent_full_review as full
+    if (causal.get('status') != 'completed' or not full.members(reviews)
             or not all(r.get('read_receipts') for r in reviews)
             or classification.get('complete_counterfactual') is not True
             or classification.get('checkpoint_restoration_consistent') is not True

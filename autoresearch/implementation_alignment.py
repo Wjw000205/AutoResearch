@@ -362,12 +362,43 @@ def required_review_ids(context, role=None):
     needed for this explicitly code-only closure is narrowed.
     """
     expected=acceptance_ids(context)
+    from .code_review_partition import FIELD as partition_field
+    scope = context.get(partition_field)
+    if scope is not None:
+        if (scope.get('version') != 1 or scope.get('role') != role
+                or not set(scope['checks']) <= set(expected or ())):
+            _fail('代码评审验收项没有绑定该角色的冻结范围。')
+        return list(scope['checks'])
+    work=context.get('implementation_evidence_work_item')
+    if isinstance(work,dict) and work.get('review_target_version')==1:
+        from . import code_repair_contract as repair
+        from .code_repair_clarification import FIELD,enabled as clarification_enabled
+        body=work.get('evidence',{});binding=body.get('binding',{})
+        original=context.get(FIELD,{});policy=context.get(repair.FIELD,{})
+        targets=work.get('active_review_issue_ids')
+        issues=policy.get('issues',[]);by_id={i['issue_id']:i for i in issues}
+        if (role not in repair.ROLES or not clarification_enabled(context)
+                or policy.get('version')!=repair.VERSION or policy.get('spec_hash')!=context.get('spec_hash')
+                or not isinstance(targets,list) or len(targets)!=len(set(targets)) or not set(targets)<=set(by_id)
+                or work.get('id')!=body.get('task_id') or work.get('sha256')!=repair.sha(body)
+                or binding.get('workflow_id')!=original.get('workflow_id')
+                or binding.get('original_source_sha256')!=original.get('source_sha256')
+                or any(binding.get(k)!=context.get(k) for k in ('spec_hash','delivery_hash'))):
+            _fail('定向补证验收没有绑定原任务、角色与同版本交付。')
+        selected=[by_id[key] for key in targets]
+        if any(i.get('requirement_id')!=binding.get('requirement_id') for i in selected):
+            _fail('定向补证验收超出已冻结任务组。')
+        own={i['requirement_id'] for i in selected if i.get('role')==role}
+        if own:
+            if not expected or not own<=set(expected):_fail('定向补证引用未批准的验收 ID。')
+            return [key for key in expected if key in own]
     scope=context.get('definition_execution_acceptance')
     if not scope:return expected
     from .definition_execution_followup import validate_acceptance_scope
     from . import code_repair_contract as repair
     validate_acceptance_scope(scope,context)
-    if role not in repair.ROLES or context.get('code_repair_clarification',{}).get('version')!=1:
+    from .code_repair_clarification import enabled as clarification_enabled
+    if role not in repair.ROLES or not clarification_enabled(context):
         _fail('定向代码验收缺少原角色和原问题范围。')
     policy=context.get(repair.FIELD,{})
     if policy.get('version')!=repair.VERSION or policy.get('spec_hash')!=context.get('spec_hash'):

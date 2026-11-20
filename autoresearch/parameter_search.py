@@ -57,6 +57,8 @@ def relative_path_hint(spec, evidence):
 
 
 def propose(spec, evidence):
+    from .combination_validation import validate_search
+    validate_search(spec, evidence)
     if spec.get('scope_sha256'):
         from .tuning_candidates import propose as broad_candidate
         return broad_candidate(spec, evidence)
@@ -166,21 +168,27 @@ def control_records(spec, evidence):
     return controls
 
 
-def _authorized(engine, run_id, record, plan):
-    from .experiment_decisions import DECISIONS, _approved
+def _current_binding(engine, run_id, plan):
     from .python_training import code_hash
     from .training_adjustment import _basis
+    program = _basis(engine, run_id)['program']
+    run = engine.store.get('runs', run_id)
+    return {'cycle': engine.cycle(run_id), 'plan_sha256': sha(plan),
+            'revision': program.get('revision', 0), 'code_sha256': code_hash(program),
+            'config_sha256': sha(run['config'])}
+
+
+def _authorized(engine, run_id, record, binding_now):
+    from .experiment_decisions import DECISIONS, _approved
     body = record['body']
     if record['sha256'] != sha(body):
         raise ValueError('Supplemental search manifest changed')
     binding = body['binding']
-    run = engine.store.get('runs', run_id)
-    basis = _basis(engine, run_id)
-    if (record['run_id'] != run_id or binding['cycle'] != engine.cycle(run_id)
-            or binding['plan_sha256'] != sha(plan) or binding['code_sha256'] != code_hash(basis['program'])
-            or binding['revision'] != basis['program'].get('revision', 0)
-            or binding['config_sha256'] != sha(run['config'])):
+    if record['run_id'] != run_id or any(binding[k] != value for k, value in binding_now.items()):
         raise ValueError('Supplemental search code/plan/configuration binding changed')
+    if 'script_admission' in body:
+        from .bayesian_batch import verify_unit
+        return verify_unit(engine, run_id, body)
     decision = engine.store.get(DECISIONS, body['decision_id']) or {}
     if not _approved(decision) or decision.get('run_id') != run_id or decision['proposal_sha256'] != body['proposal_sha256']:
         raise ValueError('Supplemental search requires three unchanged independent approvals')
@@ -203,22 +211,22 @@ def catalog(engine, run_id, plan=None):
     if not rows:
         return []
     plan = plan or engine.experiment_plan(run_id)
-    from .training_adjustment import _basis
-    from .python_training import code_hash
-    program = _basis(engine, run_id)['program']
-    return [_authorized(engine, run_id, r, plan) for r in rows
-            if r['body']['binding']['cycle'] == engine.cycle(run_id)
-            and r['body']['binding']['plan_sha256'] == sha(plan)
-            and r['body']['binding']['revision'] == program.get('revision', 0)
-            and r['body']['binding']['code_sha256'] == code_hash(program)]
+    current = _current_binding(engine, run_id, plan)
+    return [_authorized(engine, run_id, r, current) for r in rows
+            if all(r['body']['binding'][k] == current[k]
+                   for k in ('cycle', 'plan_sha256', 'revision', 'code_sha256'))]
 
 
 def jobs(engine, run_id, plan=None):
-    return [job for unit in catalog(engine, run_id, plan) for job in unit['jobs']
+    return new_jobs(catalog(engine, run_id, plan))
+
+
+def new_jobs(units):
+    return [job for unit in units for job in unit['jobs']
             if 'new_job_names' not in unit or job[0] in unit['new_job_names']]
 
 
-def register(engine, run_id, decision, evidence):
+def register(engine, run_id, decision, evidence, *, session=None):
     from .dataset_optimization import validate_proposal
     validate_proposal(decision['proposal'], evidence)
     unit = propose(decision['proposal']['parameter_search'], evidence)
@@ -229,14 +237,27 @@ def register(engine, run_id, decision, evidence):
             'proposal_sha256': decision['proposal_sha256']}
     record = {'id': run_id + ':' + unit['id'], 'run_id': run_id, 'body': body,
               'sha256': sha(body), 'created_at': now(), 'scientific_approval': False}
-    _authorized(engine, run_id, record, engine.experiment_plan(run_id))
+    _authorized(engine, run_id, record, _current_binding(engine, run_id, engine.experiment_plan(run_id)))
     from .rapid_experiment_revision import _budget
-    _budget(engine, run_id, len(unit.get('new_job_names', unit['jobs'])))
+    missing = {j['name'] for j in evidence['ledger']['jobs'] if j['state'] == 'missing'}
+    fresh = set(unit.get('new_job_names', [n for n, _ in unit['jobs']]))
+    _budget(engine, run_id, sum(n in fresh or n in missing for n, _ in unit['jobs']))
     def retain(old):
         if old and old['sha256'] != record['sha256']:
             raise ValueError('Existing supplemental batch is immutable')
         return old or record
-    engine.store.mutate(COLLECTION, record['id'], retain)
+    if session is None:
+        engine.store.mutate(COLLECTION, record['id'], retain)
+    else:
+        from .experiment_decisions import SESSIONS, _pending_batch
+        pending = _pending_batch(engine, run_id, unit, decision)
+        old = engine.store.get(COLLECTION, record['id'])
+        next_session = {**session, 'pending': pending, 'last_decision': decision['id']}
+        engine.check_active(run_id)
+        engine.store.batch(puts=[(COLLECTION, record['id'], retain(old)),
+                                 (SESSIONS, session['id'], next_session)],
+                           expected=[(COLLECTION, record['id'], old), (SESSIONS, session['id'], session)])
+        session.update(next_session)
     return unit
 
 
@@ -261,6 +282,15 @@ def display_jobs(store, run_id, plan):
     jobs = []
     for record in rows:
         body = record['body']
+        if 'script_admission' in body:
+            admission = body['script_admission']
+            approval = store.get('combination_validation_plans', admission['plan_id']) or {}
+            script = store.get('dataset_bayesian_scripts', admission['script_id']) or {}
+            if (sha(body) != record['sha256'] or not approval or not script
+                    or sha(approval['body']) != approval['sha256'] or sha(script['body']) != script['sha256']):
+                return [], {'state': 'unavailable', 'message': '贝叶斯脚本批次记录待核验。'}
+            jobs.extend(new_jobs([body['unit']]))
+            continue
         decision = store.get('experiment_decisions', body['decision_id']) or {}
         if (record['sha256'] != sha(body) or not _approved(decision)
                 or decision['proposal_sha256'] != body['proposal_sha256']):

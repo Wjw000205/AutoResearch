@@ -43,6 +43,9 @@ def documents(engine, record, design):
     expected = {'experiment_plan': build_plan(design, run['config']['max_trials']),
         'acceptance': design['acceptance'], 'iteration_policy': design['iteration_policy'],
         'task_primary_threshold': run['config'].get('min_relative_improvement', .01)}
+    from .performance_policy import MODE, classify
+    if _json_section(protocol, protocol_text, 'acceptance').get('policy') == MODE:
+        expected['acceptance'] = classify(design['acceptance'], design['primary_metric'])
     if (digest(design) != record['design_hash']
             or record['proposal_hash'] != digest(engine.store.get('consensus', record['run_id'])['proposal'])
             or digest({'plan': expected['experiment_plan'], **{k: v for k, v in expected.items() if k != 'experiment_plan'}}) != record['revision_hash']

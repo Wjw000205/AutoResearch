@@ -30,7 +30,7 @@ def current(engine, run_id):
     return engine.store.get(COLLECTION, f'{run_id}:{engine.cycle(run_id)}')
 
 
-def begin(engine, run_id, review, step):
+def begin(engine, run_id, review, step, *, stage='tuning'):
     from .experiment_decisions import revision_context
     from .training_investigation import scoped_repair
     decision = revision_context(engine, run_id, review)
@@ -41,20 +41,20 @@ def begin(engine, run_id, review, step):
     if old and old.get('decision_id') == decision['decision_id']:
         return old
     record = {'id': key, 'run_id': run_id, 'cycle': engine.cycle(run_id),
-        'decision_id': decision['decision_id'], 'review': review, 'status': 'running',
+        'decision_id': decision['decision_id'], 'review': review, 'status': 'running', 'stage': stage,
         'created_at': now(), 'scientific_approval': False, 'plan_sha256': sha(engine.experiment_plan(run_id)),
         **({'graph_thread_id': old['graph_thread_id']} if old and old.get('graph_thread_id') else {})}
     archive = key + ':diagnostic-entry:' + sha(step)
     puts = [(COLLECTION, key, record), ('cycle_steps', archive, {**step, 'id': archive}),
-        ('steps', run_id + ':tuning', {**step, 'id': run_id + ':tuning', 'stage': 'tuning',
-            'status': 'running', 'completed_at': None, 'next_node': 'tuning',
+        ('steps', run_id + ':' + stage, {**step, 'id': run_id + ':' + stage, 'stage': stage,
+            'status': 'running', 'completed_at': None, 'next_node': stage,
             'output': {'activity': 'diagnostic_repair', 'decision_id': decision['decision_id'],
                        'semantic_completion': False}})]
     if old:
         archive = key + ':diagnostic-history:' + sha(old)
         puts.append((COLLECTION, archive, {**old, 'id': archive, 'archived': True}))
     engine.store.batch(puts)
-    engine.store.event(run_id, 'tuning.diagnostic_started', '参数微调内诊断补修，尚未完成选参或验证评审',
+    engine.store.event(run_id, stage + '.diagnostic_started', '开始本阶段已批准的诊断补修',
                        {'decision_id': decision['decision_id']})
     return record
 
@@ -64,7 +64,7 @@ def graph_entry(engine, run_id):
     run = engine.store.get('runs', run_id)
     existing = current(engine, run_id)
     if existing and existing.get('graph_thread_id') and existing.get('plan_sha256') == sha(engine.experiment_plan(run_id)):
-        return (existing['graph_thread_id'], 'tuning')
+        return (existing['graph_thread_id'], existing.get('stage', 'tuning'))
     if run.get('stage') != 'revision':
         return None
     review = engine.store.get('research_cycles', f'{run_id}:{engine.cycle(run_id)}') or {}
@@ -93,7 +93,7 @@ def graph_entry(engine, run_id):
 
 
 async def execute(engine, harness, run_id):
-    from .bounded_diagnostics import execute as bounded_diagnostic
+    from .bounded_host_repair import dispatch as bounded_diagnostic
     bounded = await bounded_diagnostic(engine, harness, run_id)
     if bounded:
         return bounded
@@ -109,15 +109,22 @@ async def execute(engine, harness, run_id):
     controlled = await controlled_checks(engine, harness, run_id)
     if controlled:
         return controlled
+    return await execute_scoped(engine, harness, run_id, 'tuning')
+
+
+async def execute_scoped(engine, harness, run_id, stage):
     record = current(engine, run_id)
-    if not record or record['status'] != 'running':
+    if not record or record['status'] != 'running' or record.get('stage', 'tuning') != stage:
         return None
-    step = engine.store.get('steps', run_id + ':tuning') or {}
-    engine.store.put('steps', run_id + ':tuning', {**step, 'output': {
+    step = engine.store.get('steps', run_id + ':' + stage) or {}
+    engine.store.put('steps', run_id + ':' + stage, {**step, 'output': {
         'activity': 'diagnostic_repair', 'semantic_completion': False, 'decision_id': record['decision_id']}})
     from .rapid_experiment_revision import run
     result = await run(engine, harness, run_id, record['review'])
+    result = {**result, 'next_node': stage, 'activity': 'diagnostic_repair'}
+    if stage == 'architecture_tuning':
+        result.pop('tuning_pending', None)
+        result['optimization_pending'] = True
     record.update(status='finished', result=result, completed_at=now())
     engine.store.put(COLLECTION, record['id'], record)
-    # No stage completion event: CPU checking is not parameter search completion.
-    return {**result, 'next_node': 'tuning', 'tuning_pending': True, 'activity': 'diagnostic_repair'}
+    return result

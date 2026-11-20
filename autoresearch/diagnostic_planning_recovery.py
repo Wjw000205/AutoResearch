@@ -15,6 +15,7 @@ from .experiment_workflow import sha
 KEY = 'diagnostic_planning_recovery'
 ERROR = 'A new architecture/diagnostic needs concrete reviewed changes'
 ROLES = ('director', 'engineer', 'scout')
+from . import independent_full_review as full
 
 
 def is_hold(proposal):
@@ -40,6 +41,10 @@ def authenticate(engine, run_id, role, purpose, payload, answer):
     """Require the completed original answer, exact request, and owner hashes."""
     from .engine import Harness, digest
     hid = Harness.decision_key(run_id, role, purpose, **payload)
+    if full.KEY in payload.get('context', {}):
+        vote = full.stamp_vote(role, answer, hid, payload['context'][full.KEY])
+        full.authenticate(engine.store, run_id, vote)
+        full.validate_delivery(engine.store, run_id, vote, engine=engine)
     handoff = engine.store.get('handoffs', hid) or {}
     inputs = engine.store.get('handoff_inputs', hid) or {}
     decision = engine.store.get('decisions', hid) or {}
@@ -159,9 +164,12 @@ async def advance(engine, harness, run_id, record, evidence, context, instructio
                               + ', '.join(k for k, v in bindings.items() if not v))
     digest = saved['source_proposal_sha256']
     reads = copy.deepcopy(saved['initial_reads'])
-    if len(reads) != 3 or {r.get('role') for r in reads} != set(ROLES):
+    source_roles = full.reviewers(record.get('analyses', []))
+    if len(reads) != len(source_roles) or {r.get('role') for r in reads} != set(source_roles):
         raise ResearchBlocked('Diagnostic planning requires the original three independent analyses')
-    for role in ROLES:
+    review_roles, review_binding = full.prepare_assignments(saved, 'assignments', full.make_binding({
+        'source_proposal_sha256': digest, 'evidence': saved['evidence']}, 'diagnostic_planning'))
+    for role in review_roles:
         assignment = saved['assignments'].get(role)
         if not assignment:
             request = copy.deepcopy(context)
@@ -183,10 +191,11 @@ async def advance(engine, harness, run_id, record, evidence, context, instructio
                     '明确保留阻塞，不为推进而声称稳定或要求重复检查。suggested_action=diagnose。',
                 'context': request, 'schema': analysis_schema(request)}
             saved['assignments'][role] = assignment
+            if review_binding:
+                assignment['context'] = full.bind(assignment['context'], review_binding)
             await checkpoint(**{KEY: saved}, status='planning_diagnostic')
         if 'answer' not in assignment:
-            assignment['answer'] = await harness.ask(run_id, role, assignment['purpose'],
-                assignment['instruction'], assignment['context'], assignment['schema'])
+            assignment['answer'] = await full.ask_assignment(harness, run_id, role, assignment)
             # Persist before validation: a bad or inconclusive answer is not retried forever.
             await checkpoint(**{KEY: saved}, status='planning_diagnostic')
         answer = assignment['answer']

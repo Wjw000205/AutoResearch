@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 from .storage import now, redact
@@ -54,6 +55,53 @@ def validate_commit(store, run_id, role, marker):
 def marker(run_id, role, key, progress):
     return {'version': 3, 'handoff_id': key, 'role': role,
             'commit_id': progress.get('working_context_commit')}
+
+
+def validate_first_turn(store, run_id, role, key, prepared, result, progress, *, response_id):
+    """Authenticate a first-turn closeout without granting save/read credit.
+
+    This narrow compatibility check does not admit a previous commit, output
+    recovery or additional state. Later turns continue through their own gates.
+    Return all external records so the caller can guard them at publication.
+    """
+    from .prose_schema import relax, POLICY
+    from jsonschema import Draft202012Validator
+    saved = validate_commit(store, run_id, role, marker(run_id, role, key, progress))
+    if not saved:
+        raise ValueError('Missing first-turn working context commit')
+    payload = saved['payload']
+    context = prepared['context']
+    if ('_working_set' in context
+            and context['_working_set'] != marker(run_id, role, key, {})):
+        raise ValueError('First-turn working context marker version or identity mismatch')
+    schema = prepared['schema']
+    effective = relax(schema)
+    Draft202012Validator(effective).validate(result)
+    validation = ({'output_validation': {'prose_policy': POLICY,
+        'original_schema_sha256': sha(schema), 'effective_schema_sha256': sha(effective)}}
+        if effective != schema else {})
+    source = payload['state_source']
+    # Goal and stage are the original host snapshot, not today's mutable run
+    # stage. The output-derived state and request-owned values must be exact.
+    expected_source = {'research_goal': source['research_goal'], 'stage': source['stage'],
+        'research_cycle': context.get('research_cycle', 0),
+        'outputs': {'turn_' + sha(result): result},
+        'execution_constraints': context.get('execution_constraints', {}),
+        'provenance': 'schema_validated_model_turn_not_scientific_verification'}
+    rows = context.get('tool_results', [])
+    expected = {'run_id': run_id, 'role': role, 'handoff_id': key,
+        'prepared_sha256': sha(prepared), 'response_id': response_id,
+        **validation, 'output': result, 'state_source': expected_source,
+        'state': payload['state'], 'receipt_ids': [receipt_id(run_id, row) for row in rows],
+        'previous_commit': None}
+    if (progress.get('turn') != 0 or prepared.get('role') != role
+            or rows != progress.get('tool_results', []) or payload != expected
+            or set(saved) != {'id', 'run_id', 'role', 'handoff_id', 'sha256', 'payload', 'created_at'}
+            or saved.get('id') != progress.get('working_context_commit')
+            or saved['id'] != f'{run_id}:context-commit:{sha(payload)}'):
+        raise ValueError('Working context closeout differs from its original request/output/receipts')
+    return [('context_commits', saved['id'], saved), *[
+        ('context_receipts', rid, store.get('context_receipts', rid)) for rid in payload['receipt_ids']]]
 
 
 def commit(store, run_id, role, key, prepared, result, progress, *, response_id=None):
@@ -258,6 +306,69 @@ This view describes historical records, never a new reading certificate.
         'coverage': 'Only selected stored records; undisplayed excerpt text is retrievable, not a new reading.'}
 
 
+def completed_note_indexes(store, run_id, rows, consumed):
+    """Historical save indexes only; these do not revalidate or approve notes."""
+    if store.get('runs', run_id, {}).get('config', {}).get('completed_literature_context_policy') != 'index':
+        return {}
+    from .literature_notes import NOTE_FIELDS, _digest
+    indexes = {}
+    for row in rows:
+        if (receipt_id(run_id, row) not in consumed
+                or row.get('call', {}).get('name') != 'literature.record_notes'):
+            continue
+        result = row.get('result', {})
+        if not isinstance(result, dict) or result.get('error') or not isinstance(result.get('notes'), list):
+            continue
+        for candidate in result['notes']:
+            if not isinstance(candidate, dict) or not candidate.get('id'):
+                continue
+            note = store.get('literature_notes', candidate['id'])
+            if (not isinstance(note, dict) or not all(key in note for key in NOTE_FIELDS)
+                    or note.get('run_id') != run_id or note.get('generation') != 'ai_extraction'
+                    or note.get('note_sha256') != _digest([run_id, {k: note[k] for k in NOTE_FIELDS}])
+                    or note.get('id') != f"{run_id}:literature-note:{note.get('note_sha256')}"
+                    or any(note.get(key) != value for key,value in candidate.items())):
+                continue
+            indexes[note['id']] = {'note_id': note['id'], **{key: copy.deepcopy(note[key]) for key in (
+                'paper_id', 'source_id', 'text_sha256', 'note_sha256', 'reading_scope', 'generation')},
+                'saved': True, 'new_reading_credit': False, 'scientific_claims_verified': False}
+    return indexes
+
+
+def saved_analysis_index(document, page):
+    """Index a hash-verified, consumed RAG analysis in the existing L4 view.
+
+    The full L2 record and L0 receipt remain in context_documents/receipts and
+    PaperRAG. An index is historical navigation, never displayed support.
+    """
+    analysis, paper = document.get('analysis'), document.get('paper')
+    if (not isinstance(analysis, dict) or not isinstance(paper, dict)
+            or not all(isinstance(analysis.get(key), str) and analysis[key]
+                       for key in ('id', 'text_sha256', 'generation'))
+            or not page.get('rag_version_id')):
+        return None
+    return {'record': {
+        'paper': {key: copy.deepcopy(paper[key]) for key in ('id', 'title', 'year', 'verified') if key in paper},
+        'rag_version_id': page['rag_version_id'],
+        'analysis_index': {key: copy.deepcopy(analysis[key]) for key in (
+            'id', 'note_sha256', 'source_id', 'text_sha256', 'reading_scope', 'generation',
+            'paper_identity_verified', 'document_identity_verified', 'source_text_truncated') if key in analysis},
+        'origin_run_id': document.get('origin_run_id'),
+        'provenance': document.get('provenance'),
+        'analysis_created_at': document.get('analysis_created_at'),
+        'new_reading_credit': False, 'scientific_claims_verified': False},
+        'record_sha256': sha(document), 'completed_reading_directory': True,
+        'primary_source_reading': False, 'scientific_claims_verified': False,
+        'archived_fields': [{'path': '/' + key.replace('~', '~0').replace('/', '~1'),
+                            'sha256': sha(value), 'chars': len(encoded(value))}
+                           for key,value in document.items()],
+        'coverage': 'Index of an already saved and consumed RAG analysis, per user policy. '
+            'No analysis prose, measurements or contrary findings are displayed by this index. '
+            'Use the version-bound context.expand paths (for example /analysis/limitations) '
+            'before a judgment requiring those details. Historical reading scope and provenance '
+            'remain authoritative; this does not grant new reading or scientific approval.'}
+
+
 def prepare(store, run_id, role, context, *, enabled=False, task=''):
     """Read-only and deterministic; cache parents only within this compilation."""
     mark = context.get('_working_set', {})
@@ -267,6 +378,14 @@ def prepare(store, run_id, role, context, *, enabled=False, task=''):
         raise ValueError('Working context belongs to another role')
     saved = validate_commit(store, run_id, role, mark)
     consumed = set(saved['payload']['receipt_ids']) if saved else set()
+    if saved:
+        # An explicit reread can be byte-identical to its old receipt. Hash-set
+        # membership alone incorrectly compressed that new delivery again.
+        previous_counts = Counter(saved['payload']['receipt_ids'])
+        current_counts = Counter(receipt_id(run_id, row) for row in context.get('tool_results', [])
+                                 if isinstance(row, dict))
+        consumed -= {rid for rid,count in current_counts.items() if count > previous_counts[rid]}
+    indexes = completed_note_indexes(store, run_id, context.get('tool_results', []), consumed)
     views, parents = {}, {}
     for row in context.get('tool_results', []):
         if not isinstance(row, dict):
@@ -288,6 +407,18 @@ def prepare(store, run_id, role, context, *, enabled=False, task=''):
         if not isinstance(page, dict) or page.get('error'):
             continue
         call = resolved.get('call', {})
+        if (rid in consumed and call.get('name') in {
+                'pdf.analyze_figure', 'literature.record_notes',
+                'literature.record_protocol', 'literature.protocols'}):
+            # These results are already immutable, role-bound receipts. They
+            # are historical structured records just like consumed RAG pages;
+            # retaining every complete result bypassed the working-set budget.
+            # Fresh tool results and errors remain exact. guard_view keeps
+            # contrary facts and indexes undisplayed fields for exact expansion.
+            views[rid] = {**structured_view(page), 'archived_fields': [
+                {'path': '/' + key.replace('~', '~0').replace('/', '~1'),
+                 'sha256': sha(value), 'chars': len(encoded(value))} for key,value in page.items()]}
+            continue
         identity = (call.get('name'), page.get('artifact_id', page.get('rag_version_id')),
                     page.get('sha256'), page.get('section'))
         try:
@@ -302,10 +433,18 @@ def prepare(store, run_id, role, context, *, enabled=False, task=''):
                 if (call.get('name') == 'artifacts.read' and call.get('arguments', {}).get('id') != page.get('artifact_id')
                         or call.get('name') == 'literature.rag_read' and call.get('arguments', {}).get('version_id') != page.get('rag_version_id')):
                     continue
+                if (rid in consumed and call.get('name') == 'literature.rag_read'
+                        and store.get('runs', run_id, {}).get('config', {}).get(
+                            'completed_literature_context_policy') == 'index'):
+                    directory = saved_analysis_index(doc, page)
+                    if directory is not None:
+                        views[rid] = directory
+                        continue
                 views[rid] = structured_view(doc)
         except (ValueError, KeyError, TypeError, OSError):
             continue  # Unknown/tampered parents keep their exact original pages.
     return {'views': views, 'consumed': consumed, 'commit': saved,
+            'completed_notes': indexes,
             'marker': mark, 'enabled': True, 'query': '\n'.join(str(v) for v in (
                 store.get('runs', run_id, {}).get('objective', ''), context.get('selected_idea', ''),
                 context.get('proposal', ''), context.get('unresolved_issues', ''), task.split('FINAL OUTPUT CONTRACT')[0]))}
@@ -317,6 +456,8 @@ def guard_view(view):
     Other archived facts are deliberately not represented as displayed support.
     All source material and schema extensions remain in the immutable archive.
     """
+    if view.get('completed_reading_directory') is True:
+        return copy.deepcopy(view)  # Already an index; retain every version/locator.
     from .compression_safety import ADVERSE_FIELDS, ADVERSE_KINDS, DECISIVE_CAVEAT
     fields = ADVERSE_FIELDS | {'remaining_gaps', 'issues', 'warnings', 'errors', 'retrieval_errors',
         'scope_notice', 'scope_note', 'scientific_claims_verified',
@@ -422,6 +563,32 @@ def select(run_id, rows, working, evidence_memory, valid_page, *, estimate=None,
             actions.append({'receipt_index': index, 'action': 'duplicate_receipt', 'receipt_id': rid})
             continue
         seen.add(rid)
+        completed = working.get('completed_notes', {})
+        value, call = row.get('result'), row.get('call', {})
+        relevant = []
+        if rid in working['consumed'] and isinstance(value, dict) and not value.get('error'):
+            source = value.get('source_id')
+            if source and call.get('name') in {'sources.read', 'pdf.read', 'sources.fetch', 'sources.open_reference'}:
+                relevant = [note for note in completed.values()
+                            if note['source_id'] == source and note['text_sha256'] == value.get('text_sha256')]
+            elif call.get('name') == 'literature.record_notes' and isinstance(value.get('notes'), list):
+                ids = [note.get('id') for note in value['notes'] if isinstance(note, dict)]
+                if ids and all(nid in completed for nid in ids):
+                    relevant = [completed[nid] for nid in ids]
+            elif call.get('name') == 'literature.record_protocol' and value.get('note_id') in completed:
+                relevant = [completed[value['note_id']]]
+        if relevant:
+            packed.append({'call': {'name': call.get('name'), 'arguments_archived': True}, 'result': {
+                'completed_reading_directory': True, 'notes': copy.deepcopy(relevant),
+                **{key: copy.deepcopy(value[key]) for key in ('id', 'protocol_sha256') if key in value},
+                'receipt_id': rid, 'receipt_sha256': sha(row), 'original_call_sha256': sha(call),
+                'expand': {'tool': 'context.expand', 'arguments': {'receipt_id': rid, 'expected_sha256': sha(row)}},
+                'primary_text_displayed': False, 'new_reading_credit': False, 'scientific_claims_verified': False,
+                'policy': 'Completed and saved literature: index only, per user policy. Original notes, submitted arguments '
+                    'and source receipts remain immutable. Expand before a new judgment requiring their details. '
+                    'A historical save is not current source validation, scientific approval or a new reading receipt.'}})
+            actions.append({'receipt_index': index, 'action': 'completed_reading_index', 'receipt_id': rid})
+            continue
         if (rid in working['consumed'] and isinstance(row.get('result'), dict)
                 and row.get('call', {}).get('name') == 'evidence.search'
                 and row['result'].get('primary_source_reading') is False):
@@ -558,6 +725,7 @@ async def expand(harness, run_id, role, args):
         return await harness.execute_controller_tool(run_id, role, row['call']['name'], original_args,
             purpose=f'context-reopen:{rid}:{record["sha256"]}')
     return {'original_tool': row.get('call', {}).get('name'),
+            'original_call': copy.deepcopy(row.get('call')),
             'receipt_id': rid, 'receipt_sha256': record['sha256'],
             'result': copy.deepcopy(row.get('result')), 'untrusted': True,
             'provenance': 'exact_committed_tool_receipt_expansion', 'primary_source_reading': False}

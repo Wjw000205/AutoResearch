@@ -83,54 +83,6 @@ def original_issues(engine, run_id, parent, state):
             for item in p['result']['checks'] if item['status'] != 'accept']
 
 
-def prepare(engine, run_id, *, record_id, expected_sha256, replacements):
-    """Explicit operator action; save one new candidate and four scoped queues."""
-    from .config import get_settings
-    from .intelligence import Intelligence
-    from .implementation_documents import _save
-    run = engine.store.get('runs', run_id, {})
-    parent = engine.store.get(review.COLLECTION, record_id, {})
-    if (run.get('status') not in {'blocked', 'paused'} or run.get('mode') != 'live'
-            or parent.get('run_id') != run_id or parent.get('sha256') != expected_sha256
-            or parent.get('status') != 'changes_required' or parent.get('payload', {}).get('repair')):
-        raise ResearchBlocked('仅能定向修订已完成审核且仍有意见的原补充候选。')
-    state = engine.store.get('codex_workflows', parent['payload']['workflow_id'])
-    issues = original_issues(engine, run_id, parent, state)
-    if not issues:
-        raise ResearchBlocked('没有待修订的补充意见。')
-    old_doc = parent['payload']['context']['source_supplement']['document']
-    _, old_text = document_index.load(engine, run_id, old_doc['document_id'], old_doc['sha256'])
-    new_text = patched_text(old_text, replacements, {i['id'] for i in issues})
-    binding = {'version': 1, 'parent_id': parent['id'], 'parent_sha256': parent['sha256'],
-        'parent_votes_sha256': digest(parent['votes']), 'replacements': copy.deepcopy(replacements),
-        'issues': issues, 'author_provenance': 'operator_requested_targeted_revision', 'recheck_limit': 1}
-    candidate = _save(engine, SimpleNamespace(intelligence=Intelligence(engine.store, get_settings(engine.store))),
-        run_id, 'cycle-' + str(engine.cycle(run_id)) + '/supplements/repairs/' + digest(binding) + '.md',
-        new_text, 'scientific_supplement_candidate')
-    payload = copy.deepcopy(parent['payload'])
-    payload['repair'] = binding
-    context = payload['context']
-    context['indexed_documents'] = [*context['indexed_documents'], candidate]
-    context['source_supplement']['document'] = candidate
-    key = run_id + ':source-supplement:' + digest(payload)
-    existing = engine.store.get(review.COLLECTION, key)
-    pointer = engine.store.get('stage_contexts', run_id + review.POINTER, {})
-    if pointer.get('record_id') not in {parent['id'], key}:
-        raise ResearchBlocked('补充审核当前指针已改变，未替换其他任务。')
-    row = existing or {'id': key, 'run_id': run_id, 'payload': payload, 'sha256': digest(payload),
-        'status': 'prepared', 'votes': [], 'rechecks': {}, 'issues': issues, 'created_at': now(),
-        'adopted': False, 'scientific_approval': False, 'execution_authorized': False}
-    if row['payload'] != payload or row['sha256'] != digest(payload):
-        raise ResearchBlocked('定向修订已有不同的冻结记录。')
-    engine.store.batch([(review.COLLECTION, key, row), ('stage_contexts', run_id + review.POINTER,
-        {'id': run_id + review.POINTER, 'run_id': run_id, 'record_id': key})])
-    engine.store.event(run_id, 'implementation.supplement_repair_prepared',
-        '补充候选已按原意见保存新版本；仅由原提出者复核修改项，已接受内容和原回执保留。',
-        {'record_id': key, 'parent_id': parent['id'], 'document': candidate,
-         'targets': [{'role':i['role'], 'unit':i['id']} for i in issues]})
-    return row
-
-
 @operation
 def checked(engine, run_id, row, state):
     payload = review.checked(engine, run_id, row, state)
@@ -259,36 +211,3 @@ def author_plan(engine, run_id, state, row):
         'run_guard': {k: engine.store.get('runs', run_id).get(k) for k in ('status', 'config', 'state')}}
 
 
-async def continue_repair(engine, h, run_id, state, row):
-    checked(engine, run_id, row, state)
-    validate_rechecks(engine, run_id, row, complete=False)
-    for issue in row['payload']['repair']['issues']:
-        key = issue['role'] + ':' + issue['id']
-        if key in row['rechecks']:
-            continue
-        engine.check_active(run_id)
-        row.update(status='reviewing', active_role=issue['role'])
-        engine.store.put(review.COLLECTION, row['id'], row)
-        schema = copy.deepcopy(review.SCHEMA)
-        schema['properties']['checks']['minItems'] = schema['properties']['checks']['maxItems'] = 1
-        schema['properties']['checks']['items']['properties']['id'] = {'enum': [issue['id']]}
-        packet = await flow.ask(engine, h, run_id, state,
-            'implementation_source_supplement_recheck:' + row['sha256'] + ':' + key, issue['role'],
-            '复核你上一轮提出的这一条修改意见。读取新候选对应条款及必要原依据，'
-            '仅按 previous_issue.required_change 验收，不重开发现阶段，不增加新标准或重审其他项。'
-            '若原要求已落实，应接受该候选供作者采用；不要求现在运行效果实验或资源探针。'
-            '只返回本条，当前候选和原依据必须有本交接真实读取证据。',
-            recheck_context(row, issue), schema)
-        row['rechecks'][key] = packet
-        validate_rechecks(engine, run_id, row, complete=False)
-        engine.store.put(review.COLLECTION, row['id'], row)
-    validate_rechecks(engine, run_id, row, complete=True)
-    issues = [{'role':p['role'], **p['result']['checks'][0]} for p in row['rechecks'].values()
-              if p['result']['checks'][0]['status'] != 'accept']
-    row.update(status='changes_required' if issues else 'reviewed', issues=issues,
-        active_role=None, completed_at=row.get('completed_at') or now())
-    engine.store.put(review.COLLECTION, row['id'], row)
-    if issues:
-        raise ResearchBlocked('补充候选定向复核仍需修订：' + '；'.join(
-            i['role'] + ' ' + i['id'] + '：' + i['required_change'] for i in issues))
-    return await engine._read_consensus_check(run_id, author_plan, engine, run_id, state, row)

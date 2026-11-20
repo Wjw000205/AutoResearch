@@ -44,8 +44,9 @@ def register(engine, run_id, parent_id, instruction):
     prior_reviews=[]
     from .diagnostic_planning_recovery import authenticate
     from .engine import Harness
-    old_assignment=review['assignment']
+    from . import artifact_review_pages as pages
     for role in ('director','engineer','scout'):
+        old_assignment=pages.assignment(review, role)
         key=Harness.decision_key(run_id,role,old_assignment['purpose'],old_assignment['instruction'],
                                 old_assignment['context'],old_assignment['schema'])
         prior=engine.store.get('handoffs',key) or {}

@@ -37,7 +37,7 @@ EDGES = [
     ('implementation', 'experiments', '代码审查通过'), ('experiments', 'tuning', '验证集测量'),
     ('tuning', 'architecture_tuning', '评估局部架构调整与收敛条件'),
     ('architecture_tuning', 'experiments', '新架构通过独立复审与检查后验证'),
-    ('architecture_tuning', 'tuning', '保留具体异议，继续有界优化'),
+    ('architecture_tuning', 'tuning', '架构评估通过后进入参数微调'),
     ('architecture_tuning', 'validation_review', '验证齐备且三方同意结束本轮调整'),
     ('tuning', 'validation_review', '兼容旧已完成的参数微调检查点'), ('validation_review', 'revision', '未达标或有异议'),
     ('experiments', 'architecture_tuning', '三方批准局部架构微调'),
@@ -83,7 +83,7 @@ def build_graph(engine, harness, saver, *, entry='intake'):
                 return await engine.graph_node(name, state, harness)
             return execute
         builder.add_node(stage, make_node(stage))
-    if entry not in {'intake', 'design', 'implementation', 'experiments', 'tuning', 'architecture_tuning'}:
+    if entry not in {'intake', 'related_work', 'design', 'implementation', 'experiments', 'tuning', 'architecture_tuning'}:
         raise ValueError('Unsupported research graph entry')
     builder.add_edge(START, entry)
     for stage in STAGES:
@@ -104,7 +104,8 @@ async def execute_graph(engine, run_id, harness):
     if transition and not adaptation:
         raise ValueError('数据集切换需要数据适配入口，不能重新进入想法共识。')
     from .implementation_restart import graph_identity
-    thread_id = await asyncio.to_thread(graph_identity, engine, run_id)
+    implementation_thread = await asyncio.to_thread(graph_identity, engine, run_id)
+    thread_id = implementation_thread
     from .rapid_continuation import graph_entry
     continuation = await asyncio.to_thread(graph_entry, engine, run_id)
     if continuation:
@@ -139,8 +140,15 @@ async def execute_graph(engine, run_id, harness):
     host_check = await asyncio.to_thread(host_check_entry, engine, run_id)
     if host_check:
         thread_id = host_check[0]
+    from .related_work_restart import graph_entry as related_restart_entry
+    # A verified implementation restart supersedes earlier related-work routing.
+    related_restart = (await asyncio.to_thread(related_restart_entry, engine, run_id)
+                       if implementation_thread == run_id else None)
+    if related_restart:
+        thread_id = related_restart[0]
     config = {'configurable': {'thread_id': thread_id},
-              'recursion_limit': inf if (cycle_limit(engine.store, run_id) is None or run['config'].get('implementation_indexed_review_protocol') == 1
+              'recursion_limit': inf if (cycle_limit(engine.store, run_id) is None or run['config'].get('implementation_review_strategy') == 'document_code'
+                                        or run['config'].get('implementation_indexed_review_protocol') == 1
                                         or run['config'].get('architecture_progress_protocol') == 1
                                         or run['config'].get('discussion_mode', 'until_stalled') == 'until_stalled')
               else 40 + 20 * cycle_limit(engine.store, run_id)}
@@ -152,7 +160,7 @@ async def execute_graph(engine, run_id, harness):
         if queued:
             entry = 'tuning'
         if diagnostic:
-            entry = 'tuning'
+            entry = diagnostic[1]
         if optimization:
             entry = optimization[1]
         if iteration:
@@ -161,6 +169,8 @@ async def execute_graph(engine, run_id, harness):
             entry = delivery[1]
         if host_check:
             entry = host_check[1]
+        if related_restart:
+            entry = related_restart[1]
         graph = build_graph(engine, harness, saver, entry=entry)
         snapshot = await graph.aget_state(config)
         initial = None if snapshot.next else {'run_id': run_id, 'cycle': engine.cycle(run_id), 'next_node': entry}

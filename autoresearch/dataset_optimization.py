@@ -54,7 +54,10 @@ complete_optimization 此时仅形成验证阶段报告，不开放正式验收�
 
 
 def enabled(store, run_id):
-    run = store.get('runs', run_id) or {}
+    return enabled_for(store.get('runs', run_id) or {})
+
+
+def enabled_for(run):
     return run.get('mode') == 'live' and (
         run.get('config', {}).get(PROTOCOL) == 1 or run.get('state', {}).get(PROTOCOL) == 1)
 
@@ -128,6 +131,12 @@ def validate_proposal(proposal, evidence):
         raise ValueError('Architecture must pass independent assessment before parameter tuning')
     if scope['architecture_frozen'] and action == 'revise_architecture':
         raise ValueError('First-dataset architecture is frozen; later datasets cannot silently change it')
+    combo = evidence.get('combination_validation', {})
+    if action in ('search_parameters', 'grid_search') and combo.get('version') == 3:
+        raise ValueError('Only the independently approved Bayesian batch may schedule tuning points')
+    if action == 'grid_search' and combo.get('version') == 2 and combo.get('status') in (
+            'waiting_single_factor', 'validating_combinations', 'waiting_measured_batch', 'waiting_trial_budget'):
+        raise ValueError('Use the frozen script-selected point for this tuning batch')
     if action == 'review':
         raise ValueError('Use complete_optimization before formal validation review')
     if action not in {'accept_architecture', 'complete_optimization'}:
@@ -140,7 +149,8 @@ def validate_proposal(proposal, evidence):
         raise ValueError('Resolve failed execution/integrity before architecture acceptance')
     criteria = value['criteria']
     ref = evidence['comparisons'].get(criteria['reference_unit_id'], {})
-    if not ref.get('comparable') or not math.isfinite(ref.get('proposed_score', float('nan'))):
+    from .paper_baselines import control_available
+    if not control_available(ref) or not math.isfinite(ref.get('proposed_score', float('nan'))):
         raise ValueError('Optimization criteria require a finite, complete paired reference')
     if action == 'accept_architecture':
         if scope['phase'] != 'architecture' or value['selected_unit_id'] is not None:
@@ -148,6 +158,8 @@ def validate_proposal(proposal, evidence):
         return
     from .tuning_scope import require_complete as require_tuning_coverage
     require_tuning_coverage(evidence, proposal)
+    from .combination_validation import require_complete as require_combinations
+    require_combinations(evidence)
     approved = scope.get('architecture_certificate') or {}
     frozen = approved.get('body', {}).get('assessment', {}).get('criteria')
     if criteria != frozen:
@@ -161,7 +173,7 @@ def validate_proposal(proposal, evidence):
     if len(searches) < criteria['minimum_search_batches'] or not evidence['ledger']['complete']:
         raise ValueError('Coverage alone is insufficient: completed real parameter search and frozen coverage are required')
     selected = evidence['comparisons'].get(value['selected_unit_id'], {})
-    if (not selected.get('comparable') or selected.get('task_id') != ref.get('task_id')
+    if (not control_available(selected) or selected.get('task_id') != ref.get('task_id')
             or selected.get('metric') != ref.get('metric') or selected.get('direction') != ref.get('direction')):
         raise ValueError('Selected result must be a complete comparable validation batch of the same task')
     score, base = selected.get('proposed_score'), ref['proposed_score']
@@ -176,7 +188,7 @@ def validate_proposal(proposal, evidence):
         raise ValueError('Selected parameters violate the pre-reviewed validation stability bound')
     if not paired:
         scores = [v['proposed_score'] for v in evidence['comparisons'].values()
-                  if v.get('comparable') and v.get('task_id') == ref.get('task_id')]
+                  if control_available(v) and v.get('task_id') == ref.get('task_id')]
         best = min(scores) if ref['direction'] == 'minimize' else max(scores)
         if score != best:
             raise ValueError('Stable selection must use the best measured comparable candidate, not a worse configuration')
@@ -227,7 +239,12 @@ def check_frozen(engine, run_id, bundle, program):
     if not enabled(engine.store, run_id) or not frozen:
         return
     body = frozen['body']
-    certificate(engine.store, run_id, body['binding'], 'complete_optimization')
+    kind = body.get('certificate_kind', 'complete_optimization')
+    if kind not in ('accept_architecture', 'complete_optimization'):
+        raise ValueError('Unknown frozen architecture certificate')
+    approved = certificate(engine.store, run_id, body['binding'], kind)
+    if not approved or approved['id'] != body['certificate_id']:
+        raise ValueError('Frozen architecture approval is missing or changed')
     if frozen['sha256'] != sha(body) or core_files(bundle, program, include_configs=body.get('core_contract_version', 1) >= 2) != body['core_files']:
         raise ValueError('Frozen first-dataset model/runtime source changed; later dataset training is blocked')
 

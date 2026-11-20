@@ -55,9 +55,13 @@ def _patch_object(shape):
     return result
 
 
-def schema():
+def schema(base=None):
     from .engine import DESIGN, STR, STRS, obj
-    patch = _patch_object(DESIGN)
+    shape = DESIGN
+    if base and base.get('dataset_catalog'):
+        from .dataset_contract import bind_request
+        _, _, shape = bind_request('', {'dataset_catalog': base['dataset_catalog']}, DESIGN)
+    patch = _patch_object(shape)
     patch['minProperties'] = 1
     return obj({'design': patch, 'unset_paths': STRS, 'integration_base_hash': STR,
         'proposal_hash': STR, 'parent_design_hash': STR, 'resolved_issue_ids': STRS,
@@ -74,13 +78,27 @@ def _merge(base, patch):
     return result
 
 
-def apply(base, result, *, expected_hash):
+def apply(base, result, *, expected_hash, dataset_catalog=None):
     from .engine import DESIGN, ResearchBlocked, digest
     from .intelligence import parse_json
-    parse_json(json.dumps(result, ensure_ascii=False, allow_nan=False), schema())
+    frozen = dataset_catalog or base.get('dataset_catalog')
+    parse_json(json.dumps(result, ensure_ascii=False, allow_nan=False),
+               schema({**base, 'dataset_catalog': frozen} if frozen else base))
     if result.get('integration_base_hash') != expected_hash or digest(base) != expected_hash:
         raise ResearchBlocked('架构整合修改未绑定实际保存的原作者草稿。')
-    candidate = _merge(base, result['design'])
+    patch = result['design']
+    if frozen:
+        from .dataset_contract import materialize_patch
+        try:
+            patch = materialize_patch(patch, frozen)
+        except ValueError as exc:
+            raise ResearchBlocked('架构整合数据集绑定校验未通过：' + str(exc)) from exc
+    candidate = _merge(base, patch)
+    if frozen:
+        candidate.setdefault('dataset_description', base.get('dataset', ''))
+        candidate.update(dataset=', '.join(row['dataset_name'] for row in frozen['datasets']),
+                         dataset_catalog=copy.deepcopy(frozen), dataset_catalog_sha256=frozen['sha256'],
+                         dataset_request_protocol=2)
     deleted = set()
     for pointer in result.get('unset_paths', []):
         if (not isinstance(pointer, str) or not pointer.startswith('/')
@@ -334,8 +352,19 @@ async def activate(engine, h, run_id, revision):
         if section['title'] in {'execution_constraints', 'current_call_budget', 'operator_authorization', 'resource_admission'}
         for call in _missing_reads(authority, section['start'], section['end'], [])]
     purpose = payload['pending']['purpose'] + ':integration-v1'
-    shape = schema()
+    from .dataset_contract import from_design
+    request_catalog = from_design(payload['base_design'])
+    shape = schema({**payload['base_design'], 'dataset_catalog': request_catalog} if request_catalog else payload['base_design'])
     instruction = INSTRUCTION + AUTHOR
+    if request_catalog:
+        from .dataset_contract import GUIDANCE as dataset_guidance, to_request
+        context['dataset_catalog'] = copy.deepcopy(request_catalog)
+        context['dataset_request_protocol'] = 2
+        wire = to_request(payload['base_design'], context['dataset_catalog'])
+        context['integration_base_parameters'] = {k: v for k, v in wire.items()
+            if k in shape['properties']['design']['properties'] and k not in {
+                'architecture', 'dataset_description', 'evaluation', 'limitations'}}
+        instruction += '\n' + dataset_guidance
     hid = h._handoff(run_id, 'engineer', purpose, instruction, context, shape)['id']
     revision.update(status='drafting', pending={'purpose': purpose, 'instruction': instruction,
         'context': context, 'schema': shape, 'handoff_id': hid},
@@ -356,7 +385,8 @@ def materialize(engine, run_id, pending, result, *, adoption=None):
     payload = audit['payload']
     if pending['context']['integration_base_hash'] != payload['base_design_hash']:
         raise ResearchBlocked('整合交接的参数基点发生变化。')
-    candidate = apply(payload['base_design'], result, expected_hash=payload['base_design_hash'])
+    candidate = apply(payload['base_design'], result, expected_hash=payload['base_design_hash'],
+                      dataset_catalog=pending['context'].get('dataset_catalog'))
     if pending['context'].get('architecture_delivery_repair_protocol') == 1:
         from .architecture_integration_recovery import preserve_constraints
         candidate = preserve_constraints(engine, run_id, pending, result, candidate)

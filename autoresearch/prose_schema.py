@@ -17,7 +17,10 @@ def relax(schema):
     """Walk schema keywords only; never rewrite const/default/example values."""
     if not isinstance(schema, dict):return copy.deepcopy(schema)
     result=copy.deepcopy(schema)
-    result.pop('maxLength',None)
+    # Explicit owner annotation distinguishes bounded execution controls from
+    # prose. No inference from a field name, and no change to frozen schemas.
+    if result.get('x-autoresearch-control') != 'bounded-string-v1':
+        result.pop('maxLength',None)
     for key in ('properties','patternProperties','$defs','definitions','dependentSchemas'):
         if isinstance(schema.get(key),dict):
             result[key]={name:relax(child) for name,child in schema[key].items()}

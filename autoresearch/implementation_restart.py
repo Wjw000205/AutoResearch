@@ -33,12 +33,14 @@ LEGACY_TARGET_CONFIG = {'implementation_indexed_review_protocol': 1,
     'implementation_review_max_seconds': None,
     'implementation_review_max_calls': None,
     'implementation_review_time_basis': 'per_revision_review'}
-TARGET_CONFIG = {**LEGACY_TARGET_CONFIG, 'implementation_review_strategy': 'acceptance_contract',
+ACCEPTANCE_TARGET_CONFIG = {**LEGACY_TARGET_CONFIG, 'implementation_review_strategy': 'acceptance_contract',
     'implementation_review_max_revisions': 2, 'implementation_review_max_seconds': 14400,
     'implementation_review_max_calls': 240, 'implementation_review_time_basis': 'policy_active_time'}
-WALL_TARGET_CONFIG = {**TARGET_CONFIG, 'implementation_review_time_basis': 'policy_wall_time'}
+TARGET_CONFIG = {**ACCEPTANCE_TARGET_CONFIG, 'implementation_review_strategy': 'document_code'}
+WALL_TARGET_CONFIG = {**ACCEPTANCE_TARGET_CONFIG, 'implementation_review_time_basis': 'policy_wall_time'}
 ARCHIVE_ID_FIELDS = ('archived_implementation_handoff_ids', 'archived_implementation_artifact_ids')
-IMPLEMENTATION_PURPOSES = ('implementation', 'implementation_spec', 'spec_review',
+IMPLEMENTATION_PURPOSES = ('implementation_write','implementation_doc_review','implementation_code_review',
+    'implementation', 'implementation_spec', 'spec_review',
     'implementation_acceptance_contract', 'implementation_acceptance_review',
     'implementation_acceptance_response', 'implementation_acceptance_adjudication',
     'implementation_acceptance_recheck',
@@ -189,7 +191,7 @@ def _native_guard(db, run_id):
             _fail('原实现原生请求仍无确定终态；须先核实原会话，不能清理后另派请求。')
 
 
-def _snapshot(engine, db, run_id):
+def _snapshot(engine, db, run_id, *, cleanup=None):
     run = _get(db, 'runs', run_id, {})
     if run.get('status') not in {'paused', 'blocked', 'failed'}:
         _fail('重开实现文档前须暂停任务并等待工作进程停止。')
@@ -243,7 +245,7 @@ def _snapshot(engine, db, run_id):
         for key, raw in _raw_rows(db, collection, run_id):
             paid.append({'collection': collection, 'key': key,
                 'stored_json_sha256': hashlib.sha256(raw.encode()).hexdigest()})
-    return {'version': 1, 'run_id': run_id, 'cycle': cycle, 'run': run,
+    snapshot = {'version': 1, 'run_id': run_id, 'cycle': cycle, 'run': run,
         'approved': _approved(engine, run_id, db),
         'active_records': original, 'bindings': _bindings(db, run_id),
         'target_config': copy.deepcopy(TARGET_CONFIG),
@@ -253,10 +255,19 @@ def _snapshot(engine, db, run_id):
         'archived_workflow_ids': [row['id'] for row in workflows],
         'workflow_bindings': [{'id': row['key'], 'stored_json_sha256': row['stored_json_sha256']}
             for row in paid if row['collection'] == 'codex_workflows'],
-        'paid_records': paid, 'source_files': _files(engine, db, run_id),
+        'paid_records': paid, 'source_files': [] if cleanup else _files(engine, db, run_id),
         'budget_sha256': _sha(_get(db, 'budgets', run_id)),
         'graph_status': _get(db, 'graph_status', run_id),
         'approved_common_sha256': _sha(_get(db, 'stage_contexts', run_id + ':implementation'))}
+    if cleanup:
+        from .implementation_stage_cleanup import inventory
+        snapshot['stage_cleanup_approval'] = cleanup
+        snapshot['working_data'] = inventory(engine, db, run_id,
+            snapshot['archived_implementation_handoff_ids'], original)
+        artifacts = snapshot['archived_implementation_artifact_ids']
+        artifacts.extend(row['artifact_id'] for row in snapshot['working_data']['files'])
+        snapshot['archived_implementation_artifact_ids'] = sorted(set(artifacts))
+    return snapshot
 
 
 def _approved(engine, run_id, db):
@@ -281,10 +292,23 @@ def _approved(engine, run_id, db):
     return check()
 
 
-def preview(engine, run_id):
+def preview(engine, run_id, *, full_stage_cleanup=False, before_codex=False, before_document=False):
     with engine.store._read_db() as db:
         db.execute('BEGIN')
-        snapshot = _snapshot(engine, db, run_id)
+        if before_codex or before_document:
+            from . import pre_codex_restart
+            mode = pre_codex_restart.AUTHOR_MODE if before_document else pre_codex_restart.MODE
+            snapshot = pre_codex_restart.snapshot(engine, db, run_id, mode=mode)
+            return {'run_id': run_id, 'cycle': snapshot['cycle'], 'expect_sha': _sha(snapshot),
+                    'mode': snapshot['mode'], 'workflow_id': snapshot['source_workflow_id'],
+                    'specification_sha256': snapshot['specification_sha256'],
+                    'working_file_count': len(snapshot['working_data']['files']),
+                    'working_record_count': len(snapshot['working_data']['records']),
+                    'review_handoff_count': len(snapshot['handoffs']),
+                    'unconfirmed_native_turns': len(snapshot['native_checkpoint_hashes'])}
+        from .implementation_stage_cleanup import approval
+        cleanup = approval(engine, db, run_id, required=True) if full_stage_cleanup else None
+        snapshot = _snapshot(engine, db, run_id, cleanup=cleanup)
     return {'run_id': run_id, 'cycle': snapshot['cycle'], 'expect_sha': _sha(snapshot),
         'target_config': snapshot['target_config'],
         'removed_config_fields': snapshot['removed_config_fields'],
@@ -292,7 +316,10 @@ def preview(engine, run_id):
         'approved': snapshot['approved'], 'archived_workflow_ids': snapshot['archived_workflow_ids'],
         'source_file_count': len(snapshot['source_files']),
         'retained_paid_record_count': len(snapshot['paid_records']),
-        'scientific_approval': False, 'execution_authorized': False}
+        'scientific_approval': False, 'execution_authorized': False,
+        **({'stage_cleanup_approval': cleanup,
+            'working_record_count': len(snapshot['working_data']['records']),
+            'working_file_count': len(snapshot['working_data']['files'])} if cleanup else {})}
 
 
 def _put(store, db, collection, key, value):
@@ -310,6 +337,34 @@ def _archive_path(engine, run_id, identity):
     if not path.resolve().is_relative_to(root / 'runs' / run_id):
         _fail('实现重开归档目录不属于本任务。')
     return path.resolve()
+
+
+def pending_cleanup(engine, run_id):
+    """Recognize an on-disk prepared rollback before dispatching a worker."""
+    from .deletion import _plain_path
+    root = Path(engine.data_dir).resolve()
+    directory = root / 'runs' / run_id / 'implementation-restarts'
+    _plain_path(directory, root)
+    if not directory.is_dir():
+        return None
+    for path in directory.glob('*/archive.json'):
+        _plain_path(path, root)
+        snapshot = json.loads(path.read_bytes())
+        if 'working_data' not in snapshot:
+            continue
+        preparation = snapshot.get('rollback_preparation', {})
+        identity = preparation.get('restart_id')
+        if (snapshot.get('run_id') != run_id or not isinstance(identity, str)
+                or _archive_path(engine, run_id, identity) != path):
+            _fail('阶段回退准备记录的身份无效。')
+        if not engine.store.get(COLLECTION, identity):
+            return {'restart_id': identity, 'expect_sha': preparation['expect_sha']}
+    return None
+
+
+def require_no_pending_cleanup(engine, run_id):
+    if pending_cleanup(engine, run_id):
+        raise ValueError('实现阶段回退尚未完成，请使用原预览和幂等标识完成回退。')
 
 
 def _validate(engine, db, run_id, receipt):
@@ -340,17 +395,42 @@ def _validate(engine, db, run_id, receipt):
         if (not isinstance(values, list) or values != sorted(set(item for item in values if isinstance(item, str)))
                 or any(not item for item in values) or archived.get(field) != values):
             _fail('实现归档活动入口清单缺失或绑定已改变；保留原记录。')
-    if (_sha(archived) != receipt.get('expect_sha')
+    preview_snapshot = {key: value for key, value in archived.items()
+                        if key not in {'rollback_preparation', 'native_observations'}}
+    if (_sha(preview_snapshot) != receipt.get('expect_sha')
             or archived.get('bindings') != receipt.get('bindings')
             or archived.get('approved') != receipt.get('approved')
             or archived.get('archived_workflow_ids') != receipt.get('archived_workflow_ids')
             or _bindings(db, run_id) != receipt['bindings']):
         _fail('重开绑定的批准架构、方案或冻结计划发生变化；不得沿用回执。')
+    if 'working_data' in archived:
+        from .implementation_stage_cleanup import stage_archive_path
+        cleanup = receipt.get('stage_cleanup', {})
+        archive = cleanup.get('archive', {})
+        working_path = stage_archive_path(engine, path)
+        if (cleanup.get('status') != 'completed' or archive.get('path') != str(working_path)
+                or archived.get('rollback_preparation') != {'restart_id': receipt['id'], 'expect_sha': receipt['expect_sha']}
+                or not working_path.is_file()):
+            _fail('实现阶段工作数据归档缺失或没有完成回退。')
+        if archived.get('mode') in {'before_codex', 'before_document'}:
+            from .pre_codex_restart import check_observations
+            fields = ('mode', 'source_workflow_id', 'source_workflow_sha256', 'specification_sha256')
+            if any(receipt.get(field) != archived.get(field) for field in fields):
+                _fail('回退前的写码工作流绑定已变化。')
+            check_observations(db, run_id, archived, archived['native_observations'])
+        else:
+            approval = archived['stage_cleanup_approval']
+            if (cleanup.get('work_order_id') != approval['work_order_id']
+                    or not set(approval['request_ids']) <= set(receipt.get('capability_request_ids', []))):
+                _fail('实现阶段归档缺少已批准的清理范围。')
+        with working_path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != archive.get('sha256'):
+                _fail('实现阶段工作数据归档校验失败。')
     run = _get(db, 'runs', run_id, {})
     state = run.get('state', {})
     target = receipt.get('target_config')
     if target is not None:
-        if _sha(target) not in {_sha(TARGET_CONFIG), _sha(WALL_TARGET_CONFIG), _sha(LEGACY_TARGET_CONFIG)} or archived.get('target_config') != target:
+        if _sha(target) not in {_sha(TARGET_CONFIG), _sha(ACCEPTANCE_TARGET_CONFIG), _sha(WALL_TARGET_CONFIG), _sha(LEGACY_TARGET_CONFIG)} or archived.get('target_config') != target:
             _fail('重开后的索引式全文审核协议配置与回执不一致；不得复用旧实现。')
         from .implementation_review_clock import effective_restart_config
         try:
@@ -376,16 +456,19 @@ def _validate(engine, db, run_id, receipt):
     return receipt
 
 
-def restart(engine, run_id, *, expect_sha, idempotency_key):
+def restart(engine, run_id, *, expect_sha, idempotency_key, full_stage_cleanup=False,
+            before_codex=False, before_document=False, native_observations=None):
     """Archive then atomically exit active pointers; never admit new work."""
     if (not isinstance(expect_sha, str) or not re.fullmatch(r'[a-f0-9]{64}', expect_sha)
             or not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128):
         raise ValueError('重开实现需要有效的预览SHA与幂等标识。')
     identity = f'{run_id}:implementation-restart:{_sha(idempotency_key)}'
+    code_cleanup = before_codex or before_document
+    mode = 'before_document' if before_document else 'before_codex' if before_codex else None
     with engine.store._read_db() as db:
         previous = _get(db, COLLECTION, identity)
         if previous:
-            if previous.get('expect_sha') != expect_sha:
+            if previous.get('expect_sha') != expect_sha or previous.get('mode') != mode:
                 _fail('同一幂等标识绑定了其他重开预览；不能重复清理。')
             return copy.deepcopy(_validate(engine, db, run_id, previous))
     with engine.store._db() as db:
@@ -393,11 +476,68 @@ def restart(engine, run_id, *, expect_sha, idempotency_key):
         engine.store._guard_run(db, run_id)
         if _get(db, COLLECTION, identity):
             _fail('重开请求在准备期间已由另一操作提交；请重读已有回执。')
-        snapshot = _snapshot(engine, db, run_id)
-        if _sha(snapshot) != expect_sha:
-            _fail('任务、原请求或文件在重开预览后发生变化；须重新核对。')
         path = _archive_path(engine, run_id, identity)
+        pending = pending_cleanup(engine, run_id)
+        working_cleanup = full_stage_cleanup or code_cleanup
+        if pending and (not working_cleanup or pending != {'restart_id': identity, 'expect_sha': expect_sha}):
+            _fail('已有同一任务的阶段回退准备记录，请继续原请求。')
+        if working_cleanup:
+            from .implementation_stage_cleanup import archive_working_data, apply, settlement_guard
+        resolve_file = None
+        cleanup = None
+        if code_cleanup:
+            from . import pre_codex_restart as code_restart
+            _, source = code_restart.workflow(engine, db, run_id)
+            from functools import partial
+            resolve_file = partial(code_restart.resolve_file, engine, run_id, source)
+        elif full_stage_cleanup:
+            from .implementation_stage_cleanup import approval
+            cleanup = approval(engine, db, run_id, required=True)
+        working_archive = None
+        if working_cleanup and path.exists():
+            snapshot = json.loads(path.read_bytes())
+            if (snapshot.get('stage_cleanup_approval') != cleanup
+                    or snapshot.get('run') != _get(db, 'runs', run_id)
+                    or snapshot.get('budget_sha256') != _sha(_get(db, 'budgets', run_id))
+                    or snapshot.get('bindings') != _bindings(db, run_id)
+                    or snapshot.get('graph_status') != _get(db, 'graph_status', run_id)):
+                _fail('未完成的阶段回退归档与当前任务不一致。')
+            if (_get(db, 'runtime', 'worker', {}).get('held')
+                    or any(not task.done() for task in getattr(engine, 'tasks', {}).values())):
+                _fail('工作进程仍未停止，不能继续阶段回退。')
+            if code_cleanup:
+                if (snapshot.get('mode') != mode
+                        or snapshot.get('source_workflow_sha256') != _sha(source)
+                        or snapshot.get('handoffs') != code_restart.review_handoffs(db, run_id, source, mode=mode)):
+                    _fail('未完成的写码回退与原工作流不同。')
+                observed_set = code_restart.unsettled(db, run_id, snapshot['handoffs'])
+                if {key: _sha(checkpoint) for key, checkpoint in observed_set.items()} != snapshot['native_checkpoint_hashes']:
+                    _fail('原生请求集合在回退准备后发生变化，已停止清理。')
+            else:
+                _native_guard(db, run_id)
+                settlement_guard(db, run_id, snapshot['working_data']['archived_handoff_ids'])
+            working_archive = archive_working_data(engine, db, path, snapshot['working_data'], replay=True,
+                                                  resolve_file=resolve_file)
+        elif code_cleanup:
+            snapshot = code_restart.snapshot(engine, db, run_id, mode=mode)
+        else:
+            snapshot = _snapshot(engine, db, run_id, cleanup=cleanup)
+        preview_snapshot = {key: value for key, value in snapshot.items()
+                            if key not in {'rollback_preparation', 'native_observations'}}
+        if _sha(preview_snapshot) != expect_sha:
+            _fail('任务、原请求或文件在重开预览后发生变化；须重新核对。')
+        if code_cleanup:
+            observations = snapshot.get('native_observations', native_observations or {})
+            code_restart.check_observations(db, run_id, snapshot, observations)
+            snapshot['native_observations'] = observations
+        if working_cleanup:
+            preparation = {'restart_id': identity, 'expect_sha': expect_sha}
+            if snapshot.get('rollback_preparation', preparation) != preparation:
+                _fail('阶段回退准备记录与本次请求不一致。')
+            snapshot['rollback_preparation'] = preparation
         path.parent.mkdir(parents=True, exist_ok=True)
+        if working_cleanup and working_archive is None:
+            working_archive = archive_working_data(engine, db, path, snapshot['working_data'], resolve_file=resolve_file)
         content = json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
                              allow_nan=False, indent=2).encode()
         if path.exists():
@@ -410,11 +550,15 @@ def restart(engine, run_id, *, expect_sha, idempotency_key):
                 import os
                 os.fsync(stream.fileno())
         else:
-            with path.open('xb') as stream:
+            temporary = path.with_suffix('.pending')
+            from .deletion import _plain_path
+            _plain_path(temporary, Path(engine.data_dir).resolve())
+            with temporary.open('wb') as stream:
                 stream.write(content)
                 stream.flush()
                 import os
                 os.fsync(stream.fileno())
+            temporary.replace(path)
         generation = _sha({'id': identity, 'expect_sha': expect_sha})
         receipt = {'id': identity, 'run_id': run_id, 'version': 1,
             'cycle': snapshot['cycle'], 'source': 'explicit_user_request',
@@ -422,36 +566,52 @@ def restart(engine, run_id, *, expect_sha, idempotency_key):
             'expect_sha': expect_sha, 'archive_path': str(path),
             'archive_sha256': hashlib.sha256(content).hexdigest(),
             'bindings': snapshot['bindings'], 'approved': snapshot['approved'],
-            'target_config': snapshot['target_config'],
-            'removed_config_fields': snapshot['removed_config_fields'],
             **{key: snapshot[key] for key in ARCHIVE_ID_FIELDS},
             'archived_workflow_ids': snapshot['archived_workflow_ids'],
             'created_at': now(), 'scientific_approval': False, 'execution_authorized': False,
             'paid_evidence_retained': True}
+        if code_cleanup:
+            receipt.update({field: snapshot[field] for field in
+                            ('mode', 'source_workflow_id', 'source_workflow_sha256', 'specification_sha256')})
+        else:
+            receipt.update(target_config=snapshot['target_config'], removed_config_fields=snapshot['removed_config_fields'])
+        if working_cleanup:
+            prior = _get(db, COLLECTION, snapshot['run'].get('state', {}).get(MARKER), {})
+            receipt['capability_request_ids'] = sorted(set(prior.get('capability_request_ids', []))
+                                                       | set((cleanup or {}).get('request_ids', [])))
+            receipt['stage_cleanup'] = apply(engine, db, run_id, path, working_archive, snapshot['working_data'],
+                                             resolve_file=resolve_file)
+            if cleanup:
+                receipt['stage_cleanup']['work_order_id'] = cleanup['work_order_id']
         receipt['sha256'] = _sha(receipt)
         run = snapshot['run']
         state = {k: v for k, v in run.get('state', {}).items() if k not in {
             'resume_generation', 'implementation_specification_return',
-            'protocol_review_return', 'research_brief_restart'}}
+            'protocol_review_return', 'research_brief_restart', 'code_review_redispatch',
+            'implementation_code_recovery'}}
+        if working_cleanup:
+            state.pop('interruption', None)
         state.update({MARKER: identity, GENERATION: generation, GRAPH_THREAD: receipt['graph_thread_id']})
         from .orchestration import STAGES
         current = {k: v for k, v in run.items() if k not in {'owner_pid', 'owner_started', 'owner_instance'}}
         current.update(status='paused', stage='implementation', error=None,
             progress=round(STAGES.index('implementation') / len(STAGES) * 100),
-            config={**{k: v for k, v in run['config'].items()
+            config=run['config'] if code_cleanup else {**{k: v for k, v in run['config'].items()
                 if k not in RETIRED_IMPLEMENTATION_REVIEW_FIELDS}, **snapshot['target_config']},
             state=state, updated_at=now())
         _put(engine.store, db, COLLECTION, identity, receipt)
         _put(engine.store, db, 'runs', run_id, current)
-        for row in snapshot['active_records']:
-            db.execute('DELETE FROM records WHERE collection=? AND key=?',
-                       (row['collection'], row['key']))
+        if not working_cleanup:
+            for row in snapshot['active_records']:
+                db.execute('DELETE FROM records WHERE collection=? AND key=?',
+                           (row['collection'], row['key']))
         _put(engine.store, db, 'graph_status', run_id, {'id': run_id, 'run_id': run_id,
             'cycle': snapshot['cycle'], 'node': 'implementation', 'status': 'waiting',
             'waiting_for': 'implementation_restart', 'restart_id': identity,
             'generation': generation, 'updated_at': now()})
         db.execute('INSERT INTO events(run_id,kind,message,data,created_at) VALUES(?,?,?,?,?)',
-            (run_id, 'implementation.restarted', '原实现文档及付费证据已归档；准备从已批准架构重新编写实现文档，尚未派发代码。',
+            (run_id, 'implementation.restarted', ('旧写码工作数据已归档清理；准备按批准规范重新生成写码范围。'
+                if before_codex else '原实现文档及付费证据已归档；准备从已批准架构重新划分职责并编写实现文档。'),
              json.dumps({'restart_id': identity, 'generation': generation,
                 'scientific_approval': False, 'execution_authorized': False}), now()))
         return copy.deepcopy(receipt)

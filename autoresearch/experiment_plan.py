@@ -19,6 +19,10 @@ PLANNER_VALIDATION_VERSION = 'named-ablation-v1'
 
 def build_for_engine(engine, run_id, design, max_trials):
     from .experiment_protocols import resolve_design
+    if design.get('baseline_mode') == 'paper_reported':
+        from .experiment_attempt_policy import unlimited
+        if unlimited(engine.store,run_id):
+            max_trials=None
     return build_plan(design, max_trials, protocols=resolve_design(engine, run_id, design))
 
 
@@ -113,7 +117,9 @@ def build_plan(design, max_trials, *, protocols=None):
             seen.add(encoded)
             points.append(copy.deepcopy(point))
     ablation_grid = design.get('ablation_search_space', [points[0]])
-    if not isinstance(ablation_grid, list) or not ablation_grid:
+    empty_condition = (design.get('condition_ablation_protocol') == 1
+                       and design.get('baseline_mode') == 'paper_reported')
+    if not isinstance(ablation_grid, list) or not ablation_grid and not empty_condition:
         raise ValueError('ablation_search_space must be a nonempty list of concrete hyperparameter objects')
     named_ablations = {}
     for index, point in enumerate(ablation_grid):
@@ -145,14 +151,16 @@ def build_plan(design, max_trials, *, protocols=None):
     if seeded:
         pairs = [{**copy.deepcopy(pair), 'seed': seed} for pair in pairs for seed in seeds]
         ablations = [{**copy.deepcopy(params), 'seed': seed} for params in ablations for seed in seeds]
-    minimum = 2 * len(pairs) + len(ablations) + 2 * (len(finals) if finals is not None else 1)
+    published = design.get('baseline_mode') == 'paper_reported'
+    branches = 1 if published else 2
+    minimum = branches * len(pairs) + len(ablations) + branches * (len(finals) if finals is not None else 1)
     if max_trials is None and finals is None:
         raise ValueError('An uncapped plan requires explicit final_test_seeds; experiment count is not a seed-selection rule')
     if max_trials is not None and max_trials < minimum:
         raise ValueError(f'Approved grid needs at least {minimum} trials ({len(pairs)} validation calls per method, {len(ablations)} ablation calls and final pairs); max_trials={max_trials}. Increase the limit or obtain an explicitly revised design; no grid points or seeds were discarded.')
-    final_pairs = len(finals) if finals is not None else min(10, (max_trials - 2 * len(pairs) - len(ablations)) // 2)
+    final_pairs = len(finals) if finals is not None else min(10, (max_trials - branches * len(pairs) - len(ablations)) // branches)
     plan = {'version': 2 if seeded else 1, 'grid': points, 'validation_pairs': pairs,
-            'ablation_candidates': ablations, 'ablation_params': copy.deepcopy(ablations[0]),
+            'ablation_candidates': ablations, 'ablation_params': copy.deepcopy(ablations[0]) if ablations else {},
             'final_pairs': final_pairs,
             'selection_seed': seeds[0], 'validation_trials_per_method': len(pairs),
             'protocol': 'Apply every shared grid point to both methods and execute every ablation_candidates entry; one invocation uses the exact recorded params. No inner grid search, implicit parameter selection or test-based tuning. Freeze the best validation configuration separately for each method before paired final tests.'}
@@ -171,11 +179,17 @@ def build_plan(design, max_trials, *, protocols=None):
             'arrays and scalars replace whole values and null is not deletion. The invocation has variant=ablation and '
             'ablation_configuration records the original selector. Run exactly its algorithm once; the other configurations are not execution parameters. '
             'No unresolved references are expanded or guessed by the planner.')
+    if empty_condition:
+        plan['condition_ablation_protocol'] = 1
+        plan['protocol'] += ' This source-bound matrix condition explicitly schedules no ablation; other conditions retain their reviewed ablations.'
     if seeded:
         plan.update(validation_seeds=seeds, final_test_seeds=finals if finals is not None else [101 * (i + 1) for i in range(final_pairs)],
-            planned_trials=2 * len(pairs) + len(ablations) + 2 * final_pairs,
+            planned_trials=branches * len(pairs) + len(ablations) + branches * final_pairs,
             protocol=plan['protocol'] + ' Replicate every validation and ablation configuration across every declared validation model seed. '
                 'Select configurations by all declared validation seeds, never the most favorable seed. Final tests use only the frozen final_test_seeds list.')
+    if published:
+        plan.update(baseline_mode='paper_reported', paper_reference=copy.deepcopy(design['paper_reference']),
+                    protocol='Train only the proposed model and declared own ablations on frozen validation seeds. Select using own validation, then run only the frozen proposed selection on final test. External scores are source-attributed paper results.')
     from .fair_comparison import validate_plan
     validate_plan(plan, design=design)
     return plan

@@ -30,7 +30,7 @@ def _yaml_read(context, row):
 
 def windows(context, rows):
     purpose = str(context.get('_purpose', '')).split(':', 1)[0]
-    planning = purpose in {'dataset_work_order', 'dataset_plan_review'} and context.get('dataset_planning')
+    planning = purpose in {'dataset_work_order', 'dataset_plan_review', 'dataset_project_protocol'} and context.get('dataset_planning')
     if purpose not in {'experiment_decide', 'experiment_vote'} and not planning:
         return set()
     groups = {}
@@ -48,7 +48,8 @@ def windows(context, rows):
                 or path == '/yaml_candidate_audit' or path.startswith('/yaml_candidate_audit/')
                 or planning and any(path == p or path.startswith(p + '/') for p in (
                     '/task_requirements', '/dataset_binding', '/dataset_configuration', '/source_design',
-                    '/dataset_budget', '/configuration_repair', '/previous_delivery', '/proposal'))):
+                    '/dataset_budget', '/configuration_repair', '/previous_delivery', '/proposal', '/project_protocol',
+                    '/prior_profiles', '/matrix_contract', '/paper'))):
             kind, identity = 'parameters', path
         elif call['name'] == 'experiments.analyze':
             kind, identity = 'statistics', (args.get('kind'), args.get('trial_id'), args.get('unit_id'))

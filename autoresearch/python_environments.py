@@ -50,6 +50,37 @@ def _probe(executable: str, code: str, timeout: int = 5) -> dict:
     return json.loads(result.stdout.splitlines()[-1])
 
 
+def confirm_cuda_device(executable: str, device_uuid: str, memory_mb: int) -> dict:
+    """Confirm a negative discovery probe once, in the intended trial interpreter and GPU."""
+    env = interpreter_environment(executable)
+    env.update(CUDA_VISIBLE_DEVICES=device_uuid, PYTORCH_NVML_BASED_CUDA_CHECK='0')
+    code = """import json, sys, torch
+device = torch.device('cuda:0')
+capacity = torch.cuda.get_device_properties(device).total_memory
+torch.cuda.set_per_process_memory_fraction(min(1.0, int(sys.argv[1]) * 2**20 / capacity), device)
+value = torch.tensor([2., 3.], device=device).sum().item()
+print(json.dumps({'sum': value, 'version': torch.__version__, 'cuda_build': torch.version.cuda}))
+"""
+    result = {'python_executable': executable, 'gpu_uuid': device_uuid, 'checked_at': now(),
+              'probe_timeout_seconds': 30, 'cuda_available': False}
+    try:
+        process = subprocess.run([executable, '-I', '-X', 'utf8', '-c', code, str(memory_mb)],
+            env=env, capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        observed = json.loads(process.stdout.splitlines()[-1])
+        if observed['sum'] != 5 or not observed['cuda_build']:
+            raise ValueError('Unexpected CUDA arithmetic result')
+        result.update(cuda_available=True, probe_status='verified_device_execution',
+                      version=observed['version'], cuda_build=observed['cuda_build'])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError, KeyError, TypeError) as exc:
+        detail = getattr(exc, 'stderr', '') or ''
+        if isinstance(detail, bytes):
+            detail = detail.decode('utf-8', errors='replace')
+        result.update(probe_status='unavailable', error=type(exc).__name__,
+                      exit_code=getattr(exc, 'returncode', None), error_tail=redact(detail[-600:]))
+    return result
+
+
 _IDENTITY = "import json,sys,platform; print(json.dumps({'python_version':platform.python_version(),'python_prefix':sys.prefix,'is_virtualenv':sys.prefix!=sys.base_prefix}))"
 
 

@@ -3,6 +3,8 @@ import hashlib
 import json
 from datetime import datetime
 
+from . import implementation_whole_progress
+
 
 ROLES = ('director', 'engineer', 'scout')
 
@@ -13,8 +15,9 @@ def _latest(store, collection, run_id, cycle, fields, *, generation=None):
         if collection == 'codex_workflows' and generation is not None else '')
     candidates = ("SELECT key,data,updated_at FROM records WHERE collection=? "
         "AND json_extract(data,'$.run_id')=? AND json_extract(data,'$.cycle')=? "
-        + generation_filter + ("AND json_type(data,'$.implementation_indexed_review_protocol')='integer' "
-        "AND json_extract(data,'$.implementation_indexed_review_protocol')=1 " if collection == 'codex_workflows' else '')
+        + generation_filter + ("AND (json_extract(data,'$.implementation_review_strategy')='document_code' OR "
+        "(json_type(data,'$.implementation_indexed_review_protocol')='integer' "
+        "AND json_extract(data,'$.implementation_indexed_review_protocol')=1)) " if collection == 'codex_workflows' else '')
         + "ORDER BY updated_at DESC,key DESC LIMIT 1")
     if collection == 'codex_workflows':
         # Select the document revision once. Repeating json_each for every
@@ -23,14 +26,18 @@ def _latest(store, collection, run_id, cycle, fields, *, generation=None):
             current_spec AS MATERIALIZED (
                 SELECT s.key,s.value FROM candidate records,
                     json_each(records.data,'$.specifications') s
-                WHERE json_type(s.value,'$.implementation_indexed_review_protocol')='integer'
-                    AND json_extract(s.value,'$.implementation_indexed_review_protocol')=1
+                WHERE (json_extract(s.value,'$.implementation_review_strategy')='document_code' OR
+                    (json_type(s.value,'$.implementation_indexed_review_protocol')='integer'
+                    AND json_extract(s.value,'$.implementation_indexed_review_protocol')=1))
                     AND (json_extract(records.data,'$.current_revision') IS NULL
                     OR json_extract(records.data,'$.status') NOT IN ('specification','spec_review','blocked')
                     OR coalesce(json_array_length(records.data,'$.attempts'),0)>0
                     OR coalesce(json_extract(s.value,'$.index'),CAST(s.key AS INTEGER))
                         =json_extract(records.data,'$.current_revision'))
-                ORDER BY CAST(s.key AS INTEGER) DESC LIMIT 1)
+                ORDER BY CAST(s.key AS INTEGER) DESC LIMIT 1),
+            whole_round AS MATERIALIZED (
+                SELECT json_extract(data,'$.acceptance_review.implementation_whole_document_review.rounds[#-1]') value
+                FROM candidate)
             SELECT json_object({columns}) FROM candidate records"""
     else:
         query = f"SELECT json_object({columns}) FROM records WHERE collection=? " \
@@ -140,21 +147,29 @@ def view(store, run):
     cycle = run.get('state', {}).get('research_cycle', 1)
     workflow = _latest(store, 'codex_workflows', run['id'], cycle, {
         'id': 'key', 'status': _field('status'), 'reason': "substr(json_extract(data,'$.reason'),1,600)",
+        'model': _field('model'), 'reasoning_effort': _field('reasoning_effort'),
         'blocked_kind': _field('blocked_kind'),
         'definition_repair': "json_object('id',json_extract(data,'$.implementation_definition_repair.id'),"
-            "'status',json_extract(data,'$.implementation_definition_repair.status'))",
+            "'status',json_extract(data,'$.implementation_definition_repair.status'),"
+            "'kind',json_extract(data,'$.implementation_definition_repair.kind'))",
         'specification_progress': _specification_progress(),
         'updated_at': 'updated_at', 'revision': _field('current_revision'),
+        'strategy': _field('implementation_review_strategy'),
         'document_id': _current_spec("json_extract(s.value,'$.document.document_id')"),
         'document_sha256': _current_spec("json_extract(s.value,'$.document.sha256')"),
         'document_revision': _current_spec("coalesce(json_extract(s.value,'$.index'),CAST(s.key AS INTEGER))"),
         'spec_hash': _current_spec("json_extract(s.value,'$.spec_hash')"),
         '_indexed_review': _current_spec(_indexed_review_json('s.value')),
+        '_whole_review': implementation_whole_progress.sql(),
         'acceptance': "json_object('version',json_extract(data,'$.implementation_acceptance_protocol'),"
             "'phase',json_extract(data,'$.acceptance_review.phase'),'outcome',json_extract(data,'$.acceptance_review.outcome'),"
             "'contract',json_extract(data,'$.acceptance_review.contract'),'binding',json_extract(data,'$.acceptance_review.binding'),"
             "'coverage',json_extract(data,'$.acceptance_review.coverage'),'issues',json_extract(data,'$.acceptance_review.issues'),"
-            "'round_count',coalesce(json_array_length(data,'$.acceptance_review.rounds'),0))",
+            "'round_count',coalesce(json_array_length(data,'$.acceptance_review.rounds'),0),"
+            "'whole_document',json_object('version',json_extract(data,'$.acceptance_review.implementation_whole_document_review.version'),"
+            "'round',json_extract(data,'$.acceptance_review.implementation_whole_document_review.rounds[#-1].ordinal'),"
+            "'director_handoff_id',json_extract(data,'$.acceptance_review.implementation_whole_document_review.rounds[#-1].reports.director.handoff_id'),"
+            "'scout_handoff_id',json_extract(data,'$.acceptance_review.implementation_whole_document_review.rounds[#-1].reports.scout.handoff_id')))",
         'attempt_count': "coalesce(json_array_length(data,'$.attempts'),0)",
         'request_dispatched': "EXISTS(SELECT 1 FROM json_each(records.data,'$.attempts') "
             "WHERE json_extract(value,'$.checkpoint.turn_dispatched_at') IS NOT NULL "
@@ -164,9 +179,17 @@ def view(store, run):
         'last_activity_at': _field('attempts[#-1].checkpoint.last_event_at')},
         generation=run.get('state', {}).get('implementation_generation'))
     if workflow:
+        from .code_model_migration import projection as worker_model_projection
+        workflow.update(worker_model_projection(store, run, workflow))
         workflow['review_mode'] = ('acceptance_contract' if (workflow.get('acceptance') or {}).get('version') == 1 else 'indexed_review')
+        if type((workflow.get('acceptance') or {}).get('whole_document', {}).get('version')) is int and workflow['acceptance']['whole_document']['version'] == 1:
+            workflow['review_mode'] = 'whole_document'
+            workflow['whole_review'] = implementation_whole_progress.summary(run['id'], workflow)
+        workflow.pop('_whole_review', None)
         if (workflow.get('definition_repair') or {}).get('id'):
             workflow['review_mode'] = 'definition_repair'
+        if workflow.get('strategy') == 'document_code':
+            workflow['review_mode'] = 'document_code'
         if workflow['review_mode'] == 'indexed_review':
             workflow.pop('acceptance', None)
     if run['stage'] != 'implementation' and not workflow:
@@ -194,7 +217,7 @@ def view(store, run):
                 '实际交付文件保存后，进行本地验收。'),
             'acceptance': ('本地交付验收', '正在核验实际文件、语法及有界开发检查。',
                 '本地验收完成后，进行三方实际代码评审。'),
-            'code_review': ('三方实际代码评审', '独立角色正在审查实际磁盘产物与验收记录。',
+            'code_review': ('独立代码审核', '独立角色正在审查实际磁盘产物与验收记录。',
                 '实际代码评审通过后，进入实验验证。'),
             'completed': ('实现交付已完成', '本轮实现流程已保存完成记录，正式实验结果另行记录。',
                 '进入实验验证，按批准计划执行。')}
@@ -236,7 +259,7 @@ def view(store, run):
         result['block_reason'] = run['error']
     elif workflow and workflow.get('reason'):
         result['block_reason'] = workflow['reason']
-    if workflow and workflow['review_mode'] == 'acceptance_contract':
+    if workflow and workflow['review_mode'] in {'acceptance_contract', 'whole_document'}:
         value = workflow['acceptance']
         from .implementation_acceptance import TERMINAL, APPROVED
         value['scientific_approval'] = False
@@ -250,11 +273,32 @@ def view(store, run):
                 next_action=('文档验收通过后进入代码实现；代码与实验结论继续独立验收。' if outcome in APPROVED else
                     '审核已结束，处理阻断证据、执行有预算的验证任务或明确重新规划后再提交。' if outcome in TERMINAL else
                     '完成必要验收项覆盖，独立验证阻断问题的关闭条件。'))
+            if (value.get('whole_document') or {}).get('version') == 1:
+                result.update(label='总监与研究员整篇独立审核' if result['phase'] != 'document_authoring' else '工程师统一修订文档',
+                    message='两位审核者分别对照批准架构阅读全文，按具体问题给出修改意见与位置；通过票绑定同一版本。',
+                    next_action='收齐两份意见后由工程师统一修改并重新提交，两位均通过后进入下一阶段。')
+                whole = workflow.get('whole_review') or {}
+                if result['phase'] == 'document_authoring' and whole.get('complete') and whole.get('outcome') == 'REPAIR':
+                    authoring = result.get('authoring')
+                    result.update(label=('修订文档已保存，等待提交' if (authoring or {}).get('document_saved') else
+                            '工程师正在修订文档' if authoring else '审核意见已收齐，等待文档修订'),
+                        message=('工程师修订请求已建立，读取与写入活动见下方。' if result.get('authoring') else
+                            '正在准备下一版文档修订；尚未派发工程师修订请求。'),
+                        next_action='工程师按两份意见修改并提交新版本，再由总监和研究员分别审核全文。')
     definition = (workflow or {}).get('definition_repair') or {}
-    if definition.get('status') in {'authoring','reviewing'}:
-        result.update(label='补齐资源估算定义' if definition['status']=='authoring' else '独立审核补充定义',
+    if (workflow or {}).get('review_mode') == 'document_code':
+        result.update(next_action={'document_authoring':'保存文档后交给总监和研究员独立审核。',
+            'document_review':'收齐意见后修订文档，通过后开始写代码。','acceptance':'检查通过后交给两位评审。',
+            'code_review':'收齐意见后修订代码，通过后进入实验验证。'}.get(result['phase'],result['next_action']))
+    elif definition.get('status') in {'authoring','author_validation','reviewing'}:
+        author_label = '补齐工程定义' if definition.get('kind')=='engineering_definition' else '补齐资源估算定义'
+        result.update(label=(author_label if definition['status']=='authoring' else
+            '核验已保存定义' if definition['status']=='author_validation' else '独立审核补充定义'),
             message='原批准正文与已完成进度保留；仅处理代码审查指出的定义缺口。',
-            next_action='作者定向补充 → 三方审核；未通过交回作者，通过后交给 Codex 修改。')
+            next_action=('复用已保存文档与回执，补齐缺失读取后进入三方审核。' if definition['status']=='author_validation' else
+                '作者定向补充 → 三方审核；未通过交回作者，通过后交给 Codex 修改。'))
+    from .harness_activity import view as harness_activity
+    result['harness_activity'] = harness_activity(store, run)
     return result
 
 
@@ -268,7 +312,9 @@ def _review_json(value):
     fields = ('role', 'approve', 'rationale', 'proposal_hash', 'spec_hash', 'document_sha256',
               'code_sha256', 'delivery_hash', 'handoff_id', 'issues', 'required_changes',
               'review_routing', 'issue_confirmations', 'fix_locations', 'reading_proof')
-    columns = ','.join(f"'{field}',json_extract({value},'$.{field}')" for field in fields)
+    columns = ','.join((f"'{field}',coalesce(json_extract({value},'$.handoff_id'),"
+        f"json_extract({value},'$.independent_full_review.handoff_id'))") if field == 'handoff_id' else
+        f"'{field}',json_extract({value},'$.{field}')" for field in fields)
     return f"""json_object({columns},'fixes',
         (SELECT json_group_array(json_object('issue_index',json_extract(f.value,'$.issue_index'),
             'location',json_extract(f.value,'$.location'),'change',json_extract(f.value,'$.change'),
@@ -375,7 +421,7 @@ def _review_delivery_json(value):
     return f"CASE WHEN json_type({value})='object' THEN json_object({columns}) END"
 
 
-def _specifications(store, workflow_id, *, revision=None):
+def _specifications(store, workflow_id, *, revision=None, latest=False):
     document = _document_json("json_extract(s.value,'$.document')")
     review = _review_json('r.value')
     delivery = _review_delivery_json("json_extract(s.value,'$.review_delivery')")
@@ -384,6 +430,7 @@ def _specifications(store, workflow_id, *, revision=None):
         'index',coalesce(json_extract(s.value,'$.index'),CAST(s.key AS INTEGER)),
         'spec_hash',json_extract(s.value,'$.spec_hash'),'document',{document},
         'document_protocol',json_extract(s.value,'$.document_protocol'),
+        'implementation_review_strategy',json_extract(s.value,'$.implementation_review_strategy'),
         'implementation_spec_progress_protocol',json_extract(s.value,'$.implementation_spec_progress_protocol'),
         'implementation_issue_response_protocol',json_extract(s.value,'$.implementation_issue_response_protocol'),
         'implementation_indexed_review_protocol',{_strict_protocol('s.value', 'implementation_indexed_review_protocol')},
@@ -400,9 +447,11 @@ def _specifications(store, workflow_id, *, revision=None):
             FROM json_each(s.value,'$.spec.implementation_map') m))
         FROM records w,json_each(w.data,'$.specifications') s
         WHERE w.collection='codex_workflows' AND w.key=?
-            AND json_type(s.value,'$.implementation_indexed_review_protocol')='integer'
-            AND json_extract(s.value,'$.implementation_indexed_review_protocol')=1
-        {revision_filter} ORDER BY CAST(s.key AS INTEGER)""", (workflow_id,revision) if revision is not None else (workflow_id,))
+            AND (json_extract(s.value,'$.implementation_review_strategy')='document_code' OR
+                (json_type(s.value,'$.implementation_indexed_review_protocol')='integer'
+                AND json_extract(s.value,'$.implementation_indexed_review_protocol')=1))
+        {revision_filter} ORDER BY CAST(s.key AS INTEGER) {'DESC LIMIT 1' if latest else 'ASC'}""",
+        (workflow_id,revision) if revision is not None else (workflow_id,))
 
 
 def _draft(store, workflow_id, revision):
@@ -450,9 +499,11 @@ def _authoring_detail(store, activity):
             'save_mode': 'complete_document_atomic_save'}
 
 
-def _handoff_reviews(store, run_id, purpose):
+def _handoff_reviews(store, run_id, purpose, *, prefix=False):
     review = _review_json("json_extract(d.data,'$.result')")
     rows = _project(store, f"""SELECT json_object('handoff_id',h.key,
+        'purpose',json_extract(h.data,'$.purpose'),
+        'parent_handoff_id',json_extract(i.data,'$.context.independent_full_review_reading.parent_handoff_id'),
         'role',json_extract(h.data,'$.to_role'),'status',json_extract(h.data,'$.status'),
         'error',substr(json_extract(h.data,'$.error'),1,2000),'updated_at',h.updated_at,
         'context_binding',json_object('proposal_hash',json_extract(i.data,'$.context.proposal_hash'),
@@ -463,7 +514,8 @@ def _handoff_reviews(store, run_id, purpose):
         LEFT JOIN records d ON d.collection='decisions' AND d.key=h.key
             AND json_extract(d.data,'$.run_id')=? AND json_extract(d.data,'$.role')=json_extract(h.data,'$.to_role')
         WHERE h.collection='handoffs' AND json_extract(h.data,'$.run_id')=?
-            AND json_extract(h.data,'$.purpose')=? ORDER BY h.updated_at,h.key""", (run_id,run_id,purpose))
+            AND json_extract(h.data,'$.purpose') {'LIKE' if prefix else '='} ? ORDER BY h.updated_at,h.key""",
+            (run_id,run_id,purpose))
     for row in rows:
         if row['result']:
             row['result'].update(role=row['role'],handoff_id=row['handoff_id'])
@@ -514,6 +566,7 @@ def _reviewer(role, reviews, expected, handoffs=()):
             'binding_valid': bool(candidate and status not in {'binding_mismatch', 'conflicting_records'}),
             'handoff_id': (candidate or {}).get('handoff_id') or (current or {}).get('handoff_id'),
             'handoff_status': (current or {}).get('status'),
+            'handoff_purpose': (current or {}).get('purpose'),
             'error': (current or {}).get('error'),
             'issues': (candidate or {}).get('issues') or [], 'fixes': (candidate or {}).get('fixes') or [],
             'required_changes': (candidate or {}).get('required_changes') or []}
@@ -532,6 +585,13 @@ def _workflow_meta(store, workflow_id):
 
 
 def _document_audit(store, run, workflow, spec, meta, specifications=()):
+    if workflow.get('review_mode') == 'whole_document':
+        value = workflow['whole_review']
+        return {'mode': 'whole_document', 'run_id': run['id'], 'workflow_id': workflow['id'],
+            **{key: value.get(key) for key in ('revision', 'document_id', 'document_sha256', 'spec_hash', 'binding_valid')},
+            'status': value.get('outcome') if value.get('complete') else 'pending',
+            'whole_review': value, 'scope': 'implementation_document_only',
+            'scientific_approval': False, 'projection_only': True}
     if not spec or spec.get('implementation_indexed_review_protocol') != 1:
         return None
     if spec.get('definition_review_purpose'):
@@ -588,6 +648,8 @@ def previous_code_attempt(store, workflow_id, index):
 def _attempt(store, workflow_id):
     review = _review_json('r.value')
     rows = _project(store, f"""SELECT json_object('index',json_extract(a.value,'$.index'),
+        'whole_code_review_version',json_extract(a.value,'$.whole_code_review.version'),
+        'code_revision_review_version',json_extract(a.value,'$.code_revision_review.version'),
         'status',json_extract(a.value,'$.status'),'code_sha256',json_extract(a.value,'$.code_sha256'),
         'delivery_hash',json_extract(a.value,'$.delivery_hash'),
         'review_purpose',json_extract(a.value,'$.review_purpose'),
@@ -901,10 +963,19 @@ def _code_delivery(store, run, workflow, spec, meta):
     expected = {'proposal_hash': meta.get('proposal_hash'), 'spec_hash': meta.get('spec_hash') or (spec or {}).get('spec_hash'),
                 'code_sha256': attempt['code_sha256'], 'delivery_hash': attempt['delivery_hash']}
     token = hashlib.sha256(json.dumps(workflow['id'], ensure_ascii=False).encode()).hexdigest()
-    handoffs = _handoff_reviews(store, run['id'],
-        attempt.get('clarification_purpose') or attempt.get('review_purpose') or f"code_review:{token}:{attempt['index']}")
+    revised = attempt.get('code_revision_review_version') == 1
+    whole = revised or attempt.get('whole_code_review_version') == 1
+    purpose = attempt.get('clarification_purpose') or attempt.get('review_purpose') or f"code_review:{token}:{attempt['index']}"
+    suffix = ':changes-v1:%' if revised else ':whole-v1:%'
+    handoffs = _handoff_reviews(store, run['id'], purpose + suffix if whole else purpose, prefix=whole)
+    if revised:
+        # A response correction or missing-page continuation supersedes its
+        # own parent's answer on the live card. Both remain in the history.
+        parents = {(h['role'], h['parent_handoff_id']) for h in handoffs if h.get('parent_handoff_id')}
+        handoffs = [h for h in handoffs if (h['role'], h['handoff_id']) not in parents]
     votes = [*attempt.pop('reviews'), *(h['result'] for h in handoffs if h['result'])]
-    reviewers = [_reviewer(role, votes, expected, handoffs) for role in ROLES]
+    reviewer_roles = ('director', 'scout') if whole else ROLES
+    reviewers = [_reviewer(role, votes, expected, handoffs) for role in reviewer_roles]
     status = ('changes_required' if any(r['status'] == 'changes_required' for r in reviewers) else
               'binding_mismatch' if any(r['status'] in {'binding_mismatch', 'conflicting_records'} for r in reviewers) else
               'passed' if all(r['status'] == 'passed' for r in reviewers) else 'pending')
@@ -939,12 +1010,71 @@ def _functions(spec, delivery):
             'planned_implementation': planned, 'declared_locations': locations,
             'declared_verification': declaration.get('verification'), 'mapping_status': mapping,
             'acceptance_status': acceptance.get('status', 'pending'), 'acceptance_scope': 'whole_delivery',
-            'code_review_status': ('outside_current_scope' if (delivery or {}).get('review_scope') == 'definition_followup'
+            'code_review_status': ('outside_current_scope' if (delivery or {}).get('review_scope') in {'definition_followup','code_changes'}
                 and check['id'] not in ((delivery or {}).get('review_requirement_ids') or [])
                 else (delivery or {}).get('review_status', 'not_started')),
             'code_review_scope': (delivery or {}).get('review_scope') or 'whole_delivery', 'specific_verification_status': 'not_recorded',
             'function_completed': None})
     return rows
+
+
+def _cycle_detail(store, run, result):
+    """Project the saved document, local checks and both independent decisions."""
+    workflow = result['workflow']
+    with store._read_db() as db:
+        def latest(collection, fields):
+            path = '$.' + collection + '[#-1]'
+            columns = ','.join("json_extract(data,?)" for _ in fields)
+            row = db.execute("SELECT "+columns+" FROM records WHERE collection='codex_workflows' AND key=?",
+                             (*(path+'.'+key for key in fields),workflow['id'])).fetchone()
+            return dict(zip(fields,row)) if row and row[0] is not None else {}
+        doc = latest('specifications',('index','document','spec_hash','review_votes','approved'))
+        attempt = latest('attempts',('index','status','code_sha256','delivery_hash','checkpoint.turn_id','review_votes',
+                                     'acceptance.approved','acceptance.issues'))
+        def opinions(owner, expected):
+            values = json.loads(owner.get('review_votes') or '[]')
+            answers = []
+            for role in ('director','scout'):
+                vote = next((v for v in values if v.get('role') == role),{})
+                hid = vote.get('handoff_id') or (vote.get('independent_full_review') or {}).get('handoff_id')
+                record = db.execute("""SELECT json_extract(d.data,'$.result'),json_extract(d.data,'$.role'),
+                    json_extract(i.data,'$.context.implementation_work.materials.identity'),
+                    json_extract(d.data,'$.run_id'),json_extract(d.data,'$.purpose') FROM records d JOIN records i ON i.key=d.key
+                    AND i.collection='handoff_inputs' WHERE d.collection='decisions' AND d.key=?""",(hid,)).fetchone()
+                answer = vote.get('result',{})
+                bound = bool(record and record[1] == role and record[3] == run['id'] and record[2]
+                    and json.loads(record[0]) == answer and all(json.loads(record[2]).get(k) == v for k,v in expected.items()))
+                if record and not record[2] and record[1]==role and record[3]==run['id']:
+                    saved = json.loads(record[0])
+                    fields = ('code_sha256','delivery_hash') if expected['action']=='implementation_code_review' else ('spec_hash','document_sha256')
+                    bound = (all(saved.get(k)==expected[k] for k in fields) and isinstance(saved.get('approve'),bool)
+                             and all(vote.get(k)==v for k,v in saved.items()))
+                    if bound:
+                        answer = saved
+                status = ('passed' if answer.get('approve') else 'changes_required') if bound else 'binding_mismatch' if vote else 'pending'
+                answers.append({'role':role,'handoff_id':hid,'status':status,
+                    'approve':answer.get('approve') if bound else None,
+                    'issues':(answer.get('issues') or [f['location']+' '+f['change']
+                             for f in answer.get('findings',[])]) if bound else []})
+            status = ('binding_mismatch' if any(a['status']=='binding_mismatch' for a in answers) else
+                      'changes_required' if any(a['status']=='changes_required' for a in answers) else
+                      'passed' if all(a['status']=='passed' for a in answers) else 'pending')
+            return answers,status
+        document = json.loads(doc.get('document') or '{}')
+        expected = {'workflow_id':workflow['id'],'spec_hash':doc.get('spec_hash'),'document_sha256':document.get('sha256')}
+        doc_votes,doc_status = opinions(doc,{**expected,'action':'implementation_doc_review'})
+        code_votes,code_status = opinions(attempt,{**expected,'action':'implementation_code_review',
+                            'code_sha256':attempt.get('code_sha256'),'delivery_hash':attempt.get('delivery_hash')})
+    result['details'] = {'document':{**document,'status':'submitted' if doc else 'not_saved',
+                          'revision':doc.get('index'),'spec_hash':doc.get('spec_hash')},
+        'document_audit':{'mode':'document_code','roles':doc_votes,'status':doc_status},
+        'review_delivery':{'complete':all(v['approve'] is not None for v in doc_votes),'projection_only':True},
+        'code_delivery':{'index':attempt.get('index'),'status':attempt.get('status'),'reviews':code_votes,
+            'review_status':code_status,'dispatched':bool(attempt.get('checkpoint.turn_id')),
+            'acceptance':{'approved':attempt.get('acceptance.approved'),'issues':json.loads(attempt.get('acceptance.issues') or '[]')}},
+        'identity':{'workflow_id':workflow['id'],'document_revision':doc.get('index'),'document_sha256':document.get('sha256'),
+                    'spec_hash':doc.get('spec_hash')},'projection_only':True,'scientific_approval':False}
+    return result
 
 
 def detail(store, run):
@@ -953,6 +1083,8 @@ def detail(store, run):
     if not result or not result['workflow']:
         return result
     workflow = result['workflow']
+    if workflow['review_mode'] == 'document_code':
+        return _cycle_detail(store,run,result)
     specifications = _specifications(store, workflow['id'])
     meta = _workflow_meta(store, workflow['id'])
     if result['phase'] in {'document_authoring', 'document_review'} and type(workflow['revision']) is int:

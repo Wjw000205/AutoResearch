@@ -149,8 +149,20 @@ def _hash(value):
 def search_scope(store, run_id):
     """Exact executed scope, including bounded failures; no inferred exhaustiveness."""
     records = store.list('literature_inputs', run_id)
-    plans = {r.get('plan_id'): r for r in records if r.get('kind') == 'survey_plan'
-             and isinstance(r.get('query_plan'), dict) and r.get('plan_id') == _hash(r['query_plan'])}
+    plans = {r.get('plan_id'): r for r in records if r.get('kind') == 'survey_plan' and r.get('run_id') == run_id
+             and isinstance(r.get('query_plan'), dict) and r['query_plan'].get('run_id') == run_id
+             and r.get('plan_id') == _hash(r['query_plan'])}
+    completed_plans = {}
+    for stage, phases in {'literature': {'idea', None}, 'related_work': {'related_work'}}.items():
+        step_id = f'{run_id}:{stage}'
+        step = store.get('steps', step_id, {})
+        if (step.get('id') != step_id or step.get('stage') != stage
+                or step.get('status') != 'completed' or step.get('run_id') != run_id):
+            continue
+        plan_id = ((step.get('output') or {}).get('coverage') or {}).get('plan_id')
+        plan = plans.get(plan_id)
+        if plan and plan['query_plan'].get('phase') in phases:
+            completed_plans[plan_id] = step_id
     headers = [e['id'] for e in store.role_tool_events(run_id, 'scout')
                if e.get('kind') == 'tool.completed' and e.get('message') == 'literature.survey']
     scout_plans = {e.get('data', {}).get('result', {}).get('coverage', {}).get('plan_id')
@@ -161,8 +173,10 @@ def search_scope(store, run_id):
     for row in records:
         plan = plans.get(row.get('plan_id'))
         item = row.get('query_plan_item')
-        if (row.get('kind') != 'survey_query' or not plan or row.get('status') != 'completed'
+        if (row.get('kind') != 'survey_query' or row.get('run_id') != run_id
+                or not plan or row.get('status') != 'completed'
                 or not isinstance(item, dict) or item not in plan['query_plan'].get('batches', [])
+                or row.get('id') != f'{run_id}:survey:{row["plan_id"]}:query:{item.get("index")}'
                 or row.get('result_sha256') != _hash([row.get('papers'), row.get('diagnostics')])):
             continue
         diagnostic = row.get('diagnostics') or {}
@@ -173,6 +187,8 @@ def search_scope(store, run_id):
         successful = any(isinstance(s, dict) and s.get('status') in {'ok', 'success', 'completed'}
                          for s in diagnostic.get('sources', {}).values())
         queries.append({'receipt_id': row['id'], 'plan_id': row['plan_id'],
+            'result_sha256': row['result_sha256'],
+            'completed_stage_id': completed_plans.get(row['plan_id']),
             'as_of_date': plan['query_plan']['as_of_date'],
             'query': item.get('query'), 'base_query': item.get('base_query'), 'facet': item.get('facet'),
             'sort': item.get('sort'), 'year_from': item.get('year_from'), 'year_to': item.get('year_to'),
@@ -316,11 +332,25 @@ def assess(store, run_id, proposal, *, document_loader=None, reading_note_ids=No
             or not any(q['sort'] == 'recent' for q in selected)
             or not any(q['facet'] == 'foundational_baselines' for q in selected)):
         issues.append('尚缺文献研究员至少两种查询表达、近期工作和基线检索的真实回执；仍需反向检索与独立审查')
-    retrieved = {p for q in selected for p in q['paper_ids']}
-    if any(item['paper_id'] not in retrieved for item in novelty['closest_work']):
+    closest = {item['paper_id'] for item in novelty['closest_work']} & papers.keys()
+    bindings = {}
+    identities = {}
+    eligible = (q for q in scope['queries'] if q['successful'] and q['as_of_date'] == novelty['search_cutoff']
+                and (q['scout_requested'] or q['completed_stage_id']))
+    for query in sorted(eligible, key=lambda q: (not q['scout_requested'], q['receipt_id'])):
+        for identifier in query['paper_ids']:
+            if identifier not in identities:
+                identities[identifier] = owned(identifier)
+            paper_id = identities[identifier]
+            if paper_id in closest and paper_id not in bindings:
+                bindings[paper_id] = {k: query[k] for k in ('plan_id', 'receipt_id', 'result_sha256',
+                    'as_of_date', 'scout_requested', 'completed_stage_id')}
+    unbound = sorted({item['paper_id'] for item in novelty['closest_work']} - bindings.keys())
+    if unbound:
         issues.append('最相近工作未关联到所声明截止日期的实际检索范围')
     return {'approved': not issues, 'protocol': VERSION, 'issues': issues,
             'unverified_paper_ids': missing, 'search_scope': scope,
+            'closest_work_query_bindings': bindings, 'unbound_closest_work_ids': unbound,
             'scientific_claims_verified': False, 'novelty_proven': False,
             **({'novelty_policy_version': innovation_policy.VERSION,
                 'novelty_policy': '已检索范围内未发现高度相似完整机制即可继续；覆盖与能力局限仍保留。'}

@@ -33,9 +33,9 @@ def review_turn_capacity(context):
     return 8 + 2 * pages
 
 
-def read_file(root, name):
+def read_file(root, name, *, archived_input=False):
     from .code_bundle import relative_file
-    relative_file(name)
+    relative_file(name, archived_input=archived_input)
     root, path = io_path(Path(root)), io_path(Path(root) / name)
     if not path.resolve().is_relative_to(root.resolve()):
         raise ValueError('Candidate repair file escaped its workspace')
@@ -73,6 +73,8 @@ def _native_delivery(engine, run_id, previous, control):
     job = previous.get('codex_work_item') or {}
     if not job or current(job).get('checkpoint', {}).get('status') != 'completed':
         return None
+    from .code_model_migration import job_profile
+    job_profile(engine, run_id, job, work=current(job))
     root = job['workspace']
     order = read_file(root, 'work_order.json')
     if hashlib.sha256(order).hexdigest() != job['input_sha256']:

@@ -1,4 +1,6 @@
 """One explicitly requested, independently planned single-seed causal contrast."""
+
+from .async_ownership import gather as gather_owned
 import copy
 import hashlib
 import json
@@ -127,17 +129,19 @@ def _build(engine, record):
 
 
 def _plan_reads(engine, record, answer, context, purpose):
+    from . import independent_full_review as full_review
     from .engine import Harness
     from .experiment_tools import compare
-    key = Harness.decision_key(record['run_id'], answer['role'], purpose, DESIGN, context, SUGGEST)
+    key = full_review.decision_key(engine, record['run_id'], answer, purpose, DESIGN, context, SUGGEST)
     frozen = engine.store.get('handoff_inputs', key) or {}
     owner = engine.store.get('handoffs', key) or {}
     saved = (engine.store.get('decisions', key) or {}).get('result')
-    if (frozen.get('context') != context or owner.get('to_role') != answer['role']
-            or owner.get('run_id') != record['run_id'] or saved != {k:v for k,v in answer.items() if k != 'role'}):
+    if (full_review.source_context(frozen.get('context',{})) != full_review.source_context(context) or owner.get('to_role') != answer['role']
+            or owner.get('run_id') != record['run_id'] or saved != full_review.answer(answer)):
         raise ValueError('Plan must belong to the exact role and frozen request')
     refs = set(answer['read_receipts']); valid = set(); windows = []
-    for row in (engine.store.get('handoff_progress', key) or {}).get('tool_results', []):
+    ids=full_review.reading_handoffs(engine.store,record['run_id'],answer) if full_review.KEY in answer else [key]
+    for row in [r for own in ids for r in engine.store.get('handoff_progress',own,{}).get('tool_results',[])]:
         call, result = row.get('call', {}), row.get('result', {})
         receipt = result.get('receipt_sha256'); body = {k:v for k,v in result.items() if k != 'receipt_sha256'}
         if receipt not in refs or receipt != sha({'call':call,'result':body}): continue
@@ -205,7 +209,14 @@ async def execute(engine, harness, run_id):
         context = _basis_context(engine,record)
         purpose = 'experiment_diagnose:causal-plan:' + context['evidence_sha256']
         if not record.get('suggestions'):
-            answers = await _group(harness,run_id,purpose,DESIGN,context,SUGGEST)
+            from . import independent_full_review as full
+            def verify(vote):
+                try:return _plan_reads(engine,record,vote,context,purpose)
+                except ValueError as exc:
+                    exc.covered_chars=full.read_progress(engine.store,run_id,vote,{'experiments.compare'})
+                    exc.missing_read_targets=[{'path':'/causal_basis','instruction':'完整读取冻结因果设计依据并引用真实回执。'}]
+                    raise
+            answers = await full.group(harness,run_id,purpose,DESIGN,context,SUGGEST,validator=verify)
             reads = [_plan_reads(engine,record,a,context,purpose) for a in answers]
             save(suggestions=answers,planning_reads=reads,planning_context=context)
         # The engineer consolidates independent predictions; nobody's plan authorizes execution.
@@ -234,16 +245,9 @@ async def _execute_reviewed(engine, harness, run_id, record, save):
     context=review_context(engine,record)
     purpose=record['review_purpose']
     if not record['votes']:
-        if record.get('prior_review'):
-            import asyncio
-            from .causal_review_repair import context_for
-            contexts={role:context_for(engine,record,context,role) for role in ('director','engineer','scout')}
-            save(review_contexts=contexts)
-            async def ask(role):
-                return {'role':role,**await harness.ask(run_id,role,purpose,record['review_instruction'],contexts[role],VOTE)}
-            votes=await asyncio.gather(*(ask(role) for role in contexts))
-        else:
-            votes=await _group(harness,run_id,purpose,record['review_instruction'],context,VOTE)
+        votes=await _group(harness,run_id,purpose,record['review_instruction'],context,VOTE)
+        from .independent_full_review import reviewers
+        save(review_contexts={r:copy.deepcopy(context) for r in reviewers(votes)})
         save(votes=votes)
     from .controlled_review_completion import complete
     reads=await complete(engine,harness,record,context,save)
@@ -292,8 +296,8 @@ async def _execute_reviewed(engine, harness, run_id, record, save):
     save(status='reviewing_results',outcome=outcome)
     result_context=review_context(engine,record,outcome)
     if not record.get('analyses'):
-        analyses=await _group(harness,run_id,'experiment_diagnose:controlled-result:'+result_context['evidence_sha256'],
-                              AFTER_INSTRUCTION,result_context,AFTER)
+        from .controlled_training_checks import result_reviews
+        analyses=await result_reviews(engine,harness,run_id,record,result_context)
         result_reads=[verify_result_reads(engine,record,a,result_context) for a in analyses]
         save(analyses=analyses,result_reads=result_reads)
     save(status='completed',completed_at=now())

@@ -15,12 +15,18 @@ MARKER = '_indexed_review_closeout'
 
 def enabled(context):
     from .implementation_indexed_review import CONTRACT, PROTOCOL
+    from .full_review_closeout import enabled as full_enabled
+    if full_enabled(context):
+        return True
     return (type(context.get(PROTOCOL)) is int and context[PROTOCOL] == VERSION
             and isinstance(context.get(CONTRACT), dict)
             and context.get('indexed_document_review') is True)
 
 
 def _identity(h, run_id, role, key, context):
+    from .full_review_closeout import enabled as full_enabled, contract as full_contract
+    if full_enabled(context):
+        return full_contract(h, run_id, role, key, context)
     from .engine import ResearchBlocked, digest
     from .implementation_indexed_review import CONTRACT
     contract = context[CONTRACT]
@@ -94,23 +100,45 @@ def plan_advance(h, run_id, role, key, context, progress):
             return False
     elif _protected(progress):
         return False
+    from . import implementation_definition_review_scope as definitions
+    scoped_definition = definitions.enabled(context)
     from .evidence_delivery import tracking_required
     if not tracking_required(h.engine.store, run_id, key):
-        if previous is not None:
+        if previous is not None or scoped_definition and progress.get('turn', 0) > 0:
             raise ResearchBlocked('索引审核收尾的真实交付记录已缺失；未提交最终审核请求。')
         return False  # Legacy reads do not become invented Delivered credit.
+    from .full_review_closeout import READING, enabled as full_enabled, potentially_complete, reading_proof
+    is_full = full_enabled(context)
+    scheduled = scoped_definition and READING in progress
+    if scheduled and definitions.await_scheduled_delivery(progress):
+        return False
+    if is_full and previous is None and not potentially_complete(h.engine.store, key, context, progress):
+        return False
     from .implementation_indexed_review import _reading
     try:
         # Revalidate at each of the at most three unsent closeout boundaries.
         # A cached "100%" must not survive changed source bytes or manifests.
-        proof = _reading(h.engine, run_id, context, key)
+        proof = reading_proof(h, run_id, role, key, context) if is_full else _reading(h.engine, run_id, context, key)
+        if proof is None:
+            return False
+    except ValueError as exc:
+        if is_full and previous is None and any(hasattr(exc, field) for field in
+                ('missing_offset', 'missing_documents', 'missing_materials', 'missing_read_targets')):
+            from .full_review_closeout import missing_plan
+            if scheduled:
+                raise ResearchBlocked('工程定义复审的定向额度已用完，但回执仍有必读缺口；原交接已保存。') from exc
+            reading = missing_plan(exc, run_id, role, key, contract, progress)
+            if scoped_definition:
+                reading = definitions.schedule(reading, progress.get('turn', 0))
+            return {'reading': reading, 'expected': copy.deepcopy(progress)}
+        raise
     except ResearchBlocked as exc:
         if previous is None and hasattr(exc, 'indexed_review_missing_ranges'):
             return False
         raise
     if previous is None:
         started = progress.get('turn', 0)
-        deadline = max(started, min(started + EXTRA_TOOL_TURNS,
+        deadline = started if scheduled else started + EXTRA_TOOL_TURNS if is_full else max(started, min(started + EXTRA_TOOL_TURNS,
                                    h._base_tool_turn_limit('', context, progress)))
         state = {'version': VERSION, 'phase': 'consolidating', 'run_id': run_id,
             'role': role, 'handoff_id': key, 'contract_sha256': contract['sha256'],
@@ -132,6 +160,17 @@ def commit_advance(h, run_id, role, key, progress, pending, *, guard=None):
     from .engine import ResearchBlocked, now
     if guard is not None:
         guard()
+    if 'reading' in pending:
+        from .full_review_closeout import READING
+        if progress.get(READING) != pending['reading']:
+            def save_reading(current):
+                if guard is not None:
+                    guard()
+                if current != pending['expected']:
+                    raise ResearchBlocked('全文审核定向缺口核验期间检查点已变化；原回执保留。')
+                return {**current, READING: pending['reading']}
+            progress.update(h.engine.store.mutate('handoff_progress', key, save_reading))
+        return False
     state, previous, expected = pending['state'], pending['previous'], pending['expected']
     if state != previous:
         def claim(current):
@@ -144,8 +183,13 @@ def commit_advance(h, run_id, role, key, progress, pending, *, guard=None):
                     or {k: v for k, v in current.items() if k not in {'id', 'run_id'}} != {
                     k: v for k, v in expected.items() if k not in {'id', 'run_id'}}):
                 raise ResearchBlocked('索引审核收尾期间交接状态已变化；请恢复当前请求。')
-            return {**current, STATE: state}
+            from .full_review_closeout import READING
+            result = {**current, STATE: state}
+            result.pop(READING, None)
+            return result
         progress.update(h.engine.store.mutate('handoff_progress', key, claim))
+        from .full_review_closeout import READING
+        progress.pop(READING, None)
         if previous is None or previous['phase'] != state['phase']:
             h.engine.store.event(run_id, 'handoff.indexed_review_closeout',
                 '全文证据已实际交付，开始有界整合审核。' if state['phase'] == 'consolidating'
@@ -159,18 +203,37 @@ def commit_advance(h, run_id, role, key, progress, pending, *, guard=None):
 
 def prepare(run_id, role, key, progress, prepared):
     """Annotate only a newly compiled request, before notes are projected."""
-    if not enabled(prepared['context']) or STATE not in progress:
+    from .independent_full_review import KEY
+    from .full_review_closeout import READING
+    # Full-review projection deliberately removes source bodies and domain
+    # markers. A host checkpoint bound to the surviving policy still applies.
+    projected_full = KEY in prepared['context'] and (STATE in progress or READING in progress)
+    if not enabled(prepared['context']) and not projected_full:
+        return prepared
+    from .full_review_closeout import enabled as full_enabled, prepare_missing
+    if full_enabled(prepared['context']) or projected_full:
+        prepared = prepare_missing(run_id, role, key, progress, prepared)
+    if STATE not in progress:
         return prepared
     from .implementation_indexed_review import CONTRACT
-    state = _checked(progress[STATE], run_id, role, key, prepared['context'][CONTRACT])
-    prepared['context'][MARKER] = copy.deepcopy(state)
+    from .full_review_closeout import enabled as full_enabled
+    is_full = full_enabled(prepared['context']) or projected_full
+    contract = {'sha256': prepared['context']['independent_full_review']['sha256']} if is_full else prepared['context'][CONTRACT]
+    state = _checked(progress[STATE], run_id, role, key, contract)
+    from .full_review_closeout import MARKER as FULL_MARKER
+    prepared['context'][FULL_MARKER if is_full else MARKER] = copy.deepcopy(state)
     if state['phase'] == 'consolidating':
+        from . import implementation_definition_review_scope as definitions
+        if definitions.enabled(prepared['context']):
+            prepared = definitions.limit_tool_batch(prepared, definitions.OPTIONAL_BATCH)
         for branch in prepared['schema'].get('anyOf', []):
             names = (branch.get('properties', {}).get('tool_calls', {}).get('items', {})
                      .get('properties', {}).get('name', {}).get('enum'))
             if isinstance(names, list):
-                names[:] = [name for name in names if name in {
-                    'documents.list', 'documents.search', 'documents.read'}]
+                names[:] = [name for name in names if name in ({
+                    'documents.list', 'documents.search', 'documents.read', 'reviews.read_material',
+                    'reviews.record_notes', 'code.read', 'artifacts.read', 'materials.request_read'} if is_full else {
+                    'documents.list', 'documents.search', 'documents.read'})]
         prepared['task'] += ('\nCONTROLLER REVIEW CLOSEOUT: all frozen required documents have been fully '
             'delivered to this exact review handoff. Consolidate all of your saved observations and open issues '
             'into one complete independent review. Return the final stage schema now if possible. '

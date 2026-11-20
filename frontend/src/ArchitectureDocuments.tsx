@@ -107,15 +107,18 @@ export function ArchitectureDocuments({ runId, value, datasetAdaptation = false,
       <p><ReferenceText value={reading.handoff_status === 'completed' ? '本轮作者交付已经结束，阅读记录与工作笔记可用于复核。读取范围与作者笔记不代表评议通过。' : '下一步：作者提交新 Markdown，再由两位角色独立评议。读取范围与作者笔记不代表评议通过。'} /></p>
       {reading.working_notes_document && <IndexedDocument key={reading.working_notes_document.sha256} runId={runId} document={reading.working_notes_document} label="架构阅读工作笔记" />}
     </div>}
-    <p><ReferenceText value={current.status === 'approved' ? '两位独立评议者已通过同一文档版本，准备推进代码实现。接下来先编写实现 Markdown、按索引评议，再交给本机 Codex。' : current.status === 'rejected' ? '存在未解决的修改意见，代码实现与实验暂不推进。' : current.status === 'pending' ? 'Markdown 已保存并索引，等待进入文档评议。' : '已保存 Markdown，正在逐段评议并汇总跨章节意见。'} /></p>
+    <p><ReferenceText value={current.status === 'approved' ? '两位独立评议者已通过同一文档版本，准备推进代码实现。接下来先编写实现 Markdown、按索引评议，再交给本机 Codex。' : current.status === 'rejected' ? '存在未解决的修改意见，代码实现与实验暂不推进。' : current.status === 'pending' ? 'Markdown 已保存并索引，等待进入文档评议。' : current.io_template_review === 1 ? `正在独立审核一份完整模板和 ${current.combination_count} 个输入输出组合。` : '已保存 Markdown，正在逐段评议并汇总跨章节意见。'} /></p>
     {current.provenance === 'demo' && <p className="inline-info">演示评议记录，不构成真实智能体或科学批准。</p>}
     <p className="muted">文档：<ReferenceText value={doc.title || '架构设计文档'} /><ReferenceText value={current.version != null && ` · 第 ${current.version} 版`} /></p>
     <IndexedDocument key={doc.sha256} runId={runId} document={doc} label="架构" versions={architectureDocumentVersions(value)} />
     <div className="architecture-review-roles">{Object.entries(roles).map(([role, label]) => {
       const review = (current.effective_reviews ?? current.reviews ?? []).find((v: Json) => v.role === role);
       const sections = (current.effective_unit_reviews ?? current.unit_reviews ?? []).filter((v: Json) => v.role === role);
+      const inherited = (current.inherited_unit_reviews ?? []).filter((v: Json) => v.role === role);
       const roleApproved = review?.approve && !review.issues?.length && sections.every((v: Json) => v.approve && !v.issues?.length);
-      return <details key={role} open={Boolean(review && !roleApproved || sections.some((v: Json) => v.disposition === 'needs_evidence'))}><summary>{label} · {review ? roleApproved ? '已通过' : review.disposition === 'needs_evidence' ? '等待同版本补证据' : '需要修改' : `已评议 ${sections.length} / ${current.unit_count ?? '待计算'} 组片段 · 等待最终意见`}</summary>
+      return <details key={role} open={Boolean(review && !roleApproved || sections.some((v: Json) => v.disposition === 'needs_evidence'))}><summary>{label} · {review ? roleApproved ? '已通过' : review.disposition === 'needs_evidence' ? '等待同版本补证据' : '需要修改' : current.io_template_review === 1 ? '等待提交整批意见' : `已评议 ${sections.length} / ${current.unit_count ?? '待计算'} 组片段 · 等待最终意见`}</summary>
+        {current.architecture_review_read_budget && <p className="muted">大窗口阅读：本版 {current.architecture_review_read_budget.reading_groups} 个批次，每批约 {Math.ceil(current.architecture_review_read_budget.unit_chars / 1000)} 千字符，终审单独进行。</p>}
+        {inherited.length > 0 && <details><summary>已保留本角色原分组的 {inherited.length} 段有效意见</summary><p className="muted">原文版本与原始回执保持不变；这些意见作为本轮依据，不冒充新批次的批准。</p>{inherited.map((v: Json) => <p key={v.handoff_id}><ReferenceText value={v.rationale} /></p>)}</details>}
         {review && <p><ReferenceText value={review.rationale} /></p>}{review?.issues?.length > 0 && <ul>{review.issues.map((issue: string, i: number) => <li key={i}><ReferenceText value={issue} /></li>)}</ul>}
         {review && <ReviewAdvice review={review} />}
         {sections.map((v: Json) => <div key={v.unit_id}><strong>第 {v.unit_number} 组 · {v.approve && !v.issues?.length ? '通过' : v.disposition === 'needs_evidence' ? '待补证据' : '待修改'}</strong><p><ReferenceText value={v.rationale} /></p>{v.issues?.length > 0 && <ul>{v.issues.map((issue: string, i: number) => <li key={i}><ReferenceText value={issue} /></li>)}</ul>}<ReviewAdvice review={v} /></div>)}

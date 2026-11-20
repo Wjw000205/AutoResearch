@@ -78,15 +78,23 @@ def _archive_saved_edits(context):
             rows[i] = replacement
 
 _FIELDS = frozenset({
-    'implementation_definition_repair_protocol', 'definition_repair', 'definition_review_feedback', 'definition_addition', 'definition_code_sources',
+    'experiment_materials',
+    'task_document_projection_protocol', 'task_document_briefs', 'task_document_definitions',
+    'document_read_convergence_protocol', 'document_efficiency_recovery',
+    'deferred_code_repair',
+    'implementation_definition_repair_protocol', 'definition_repair', 'definition_review_feedback', 'definition_addition', 'definition_additions', 'definition_addition_instruction', 'definition_code_sources',
+    'host_asset_definition_evidence', 'host_asset_author_correction',
     'implementation_acceptance_author_protocol', 'implementation_acceptance_author_continuation',
     'acceptance_author_pending', 'acceptance_author_checkpoint', 'acceptance_author_saved_progress',
     'source_supplement_adoption', 'supplement_resolved_source_gaps',
-    'acceptance_author_patch_manifest',
+    'acceptance_author_patch_manifest', 'acceptance_author_patch_scope',
     'acceptance_author_save_retry',
     'implementation_author_self_check',
     'implementation_revision_memory',
     'implementation_acceptance_protocol', 'acceptance_contract', 'acceptance_budget', 'acceptance_issues',
+    'implementation_whole_document_review_protocol', 'implementation_whole_review_author_policy',
+    'implementation_architecture_scope', 'implementation_document_review_scope',
+    'implementation_revision_read_batch',
     'objective', 'research_cycle', 'proposal_hash', 'design_hash', 'experiment_plan_hash',
     'document_index_protocol', 'indexed_document_context', 'source_tool_protocol',
     'document_input_protocol', 'document_read_window_protocol', 'document_read_budget', 'document_policy',
@@ -104,12 +112,17 @@ _FIELDS = frozenset({
     'implementation_document_delivery',
     'implementation_document_completion', 'predecessor_document_notes',
     'document_working_notes_protocol', 'document_working_notes_required', 'document_working_notes',
-    '_purpose', '_output_token_limit', '_harness_control', '_tool_contract_version', 'current_date',
+    '_purpose', '_output_token_limit', '_harness_control', '_tool_contract_version', '_context_assembly', 'current_date',
+    # _document_prepare adds these authenticated host controls between the
+    # first phase projection and _working_request's second projection.
+    '_task_reasoning_version', '_task_route', 'tool_call_limit_policy',
     'tool_results', 'document_read_window',
     'output_schema_repair',
     'implementation_author_revision_contract', 'implementation_author_revision_pending',
 })
 _PROJECTED = frozenset({
+    'implementation_acceptance_author_submission_protocol',
+    'implementation_inventory_output_protocol',
     PROTOCOL, CONTRACT, 'indexed_documents', 'architecture_document', 'approved_proposal_document',
     'frozen_experiment_plan_document', 'approved_definition_document', 'protocol_document',
     'implementation_capability_document', 'implementation_capability_evidence',
@@ -199,6 +212,8 @@ def project_author(value):
     """Pure projection; never rewrite a frozen handoff or its original journal."""
     if not author(value):
         return copy.deepcopy(value)
+    from .implementation_protocol_contracts import _author_protocols
+    versions = _author_protocols(value)
     from . import implementation_review_compaction as reviews
     source_certificate = reviews.assert_projection(value)
     if source_certificate is not None:
@@ -228,12 +243,33 @@ def project_author(value):
         if previous is None:
             docs.append(copy.deepcopy(document))
 
+    materials = value.get('experiment_materials')
     for field, document in selected:
-        if not revision or field == 'architecture_document':
+        if field == 'architecture_document' or not (revision or materials):
             add(document)
         else:
             on_demand.append(copy.deepcopy(document))
         result[field] = copy.deepcopy(document)
+    if materials:
+        catalog = {document['document_id']: document for document in available}
+        document = catalog.get(materials['document_id'])
+        if (not document or document.get('sha256') != materials['document_sha256']
+                or document.get('kind') != 'experiment_materials'):
+            _fail('精简实验计划缺少冻结索引。')
+        on_demand.append(document)
+        for key in materials['protocol_document_ids']:
+            protocol = catalog.get(key)
+            if not protocol or protocol.get('kind') != 'experiment_source_protocol':
+                _fail('精简实验计划的论文协议缺少冻结索引。')
+            on_demand.append(protocol)
+    if value.get('task_document_projection_protocol') == 1:
+        sources = {document['document_id']: document for document in available}
+        for document in [*value.get('task_document_briefs', []), *value.get('task_document_definitions', [])]:
+            if sources.get(document.get('document_id')) != document:
+                _fail('任务资料视图不属于冻结授权目录。')
+        for document in value.get('task_document_briefs', []):
+            add(document)
+        on_demand.extend(copy.deepcopy(value.get('task_document_definitions', [])))
     capability = value.get('implementation_capability_document')
     if capability:
         if capability.get('kind') != 'host_implementation_contract':
@@ -318,6 +354,8 @@ def project_author(value):
         'source_response_contract_sha256': (value.get(CONTRACT) or {}).get('source_response_contract_sha256')
             or (value.get('implementation_issue_response_contract') or {}).get('sha256')}
     result[PROTOCOL] = VERSION
+    if versions:
+        phase['author_protocols'] = versions
     result[CONTRACT] = {**phase, 'sha256': digest(phase)}
     _archive_saved_edits(result)
     from .implementation_processed_context import project as project_processed
@@ -329,6 +367,8 @@ def project_author(value):
 def assert_context(context):
     if not enabled(context):
         return None
+    from .implementation_protocol_contracts import _author_protocols
+    _author_protocols(context)
     from .implementation_revision_memory import validate as validate_memory
     validate_memory(context)
     contract = context.get(CONTRACT)
@@ -393,6 +433,10 @@ def assert_input(context, instruction):
             '$record': active.get('shared_context_records', {})}
 
         def expand(value, seen=frozenset()):
+            from .context_records import text_slice
+            sliced = text_slice(value, active)
+            if sliced is not None:
+                return sliced
             if isinstance(value, dict) and len(value) == 1 and next(iter(value)) in tables:
                 kind, reference = next(iter(value.items()))
                 table = tables[kind]

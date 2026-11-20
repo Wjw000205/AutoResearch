@@ -116,6 +116,9 @@ changed_fields 可填章节字段名或该版本实际修改单元的 JSON Point
 本协议取代旧提示中的三方全文重审/三票通过要求；代码交付后的独立代码审查仍按原合同执行。
 '''
 AUTHOR_GUIDANCE += '''
+混合职责段落保留稳定的字段/验收项/计划路径标识与 review-role 标记；接口用精确路径:符号标明两端。
+不要用段落编号代替原始验收项身份。现有冻结作者输入由宿主兼容适配，不追溯改写。
+
 修订先看完全部 acceptance_issues 和 close_when，集中列出全部修改位置，再一次批量保存全部相关索引单元。
 允许先落地已完成部分，保存失败仅重试对应位置，遗漏项继续补写；全部意见完成后才提交下一轮审核。
 acceptance_completion 逐条件标 complete/incomplete/blocked 并提供真实当前稿原文自检。
@@ -133,6 +136,14 @@ def fail(message):
     raise ResearchBlocked('实现文档验收：' + message)
 
 
+def delivery_error(message, **details):
+    """A model can correct this authenticated delivery within the same scope."""
+    from .engine import ResearchBlocked
+    error = ResearchBlocked('实现文档验收：' + message)
+    error.acceptance_delivery_error = {'version': 1, 'reason': message, **details}
+    raise error
+
+
 def sealed(value):
     return {**value, 'sha256': digest(value)}
 
@@ -144,9 +155,9 @@ def check_seal(value):
 
 def contract(result, state, source, version=1, *, reason='initial', previous_sha256=None):
     from .prose_schema import validate
-    validate(result, CONTRACT_SCHEMA)
+    validate(result, contract_schema(state, source))
     if sorted(c['id'] for c in result['criteria']) != [c['id'] for c in CRITERIA]:
-        fail('合同必须唯一覆盖 C01 至 C06。')
+        delivery_error('合同必须唯一覆盖 C01 至 C06。')
     by_id = {c['id']: c for c in result['criteria']}
     return sealed({'version': version, 'phase': 'implementation_document',
         'goal': result['goal'], 'scope': result['scope'], 'non_goals': result['non_goals'],
@@ -157,6 +168,31 @@ def contract(result, state, source, version=1, *, reason='initial', previous_sha
         'source_sha256': source['sha256'], 'source_refs': result['source_refs'],
         'budget': copy.deepcopy(state[FIELD]['budget']), 'change_reason': reason,
         'previous_sha256': previous_sha256, 'affected_criteria': [c['id'] for c in CRITERIA]})
+
+
+def contract_schema(state, source):
+    """New source-location contracts retain every approved field obligation.
+
+    Citations authenticate locations only. The Director and downstream semantic
+    reviewers still determine whether the task requirements were preserved.
+    """
+    value = copy.deepcopy(CONTRACT_SCHEMA)
+    scope = state.get('implementation_architecture_scope', {})
+    if scope.get('source_mapping_protocol') != 1:
+        return value
+    mapping = scope['field_sources']
+    if mapping.get('unresolved') or mapping['document_sha256'] != source['sha256']:
+        delivery_error('Architecture field sources require clarification before the acceptance contract')
+    required = sorted({sid for item in mapping['fields'].values()
+                       for sid in item.get('section_ids', [item['section_id']])})
+    refs = value['properties']['source_refs']
+    refs.pop('maxItems', None)  # Final source inventory, not a per-call read batch.
+    refs['allOf'] = [{'contains': {'type': 'object', 'properties': {
+        'document_id': {'const': source['document_id']}, 'document_sha256': {'const': source['sha256']},
+        'section_id': {'const': sid}}, 'required': ['document_id', 'document_sha256', 'section_id']}}
+        for sid in required]
+    refs['description'] = '覆盖冻结 field_sources 的全部批准义务位置；引用不等于科学语义已核实。'
+    return value
 
 
 def criterion_fields(contract, criterion_id):
@@ -222,19 +258,19 @@ def bind_document(ledger, row):
 def propose(ledger, workflow_id, row, role, report, hid):
     ids = []
     if len({item['local_id'] for item in report['issues']}) != len(report['issues']):
-        fail('问题 local_id 重复。')
+        delivery_error('问题 local_id 重复。')
     for item in report['issues']:
         prior_id = item['reopen_issue_id']
         equivalent = [old for old in ledger['issues'].values() if old['criterion_id'] == item['criterion_id']
             and old['claim'].strip().casefold() == item['claim'].strip().casefold()
             and old['close_when'] == item['close_when']]
         if not prior_id and any(old['status'] == 'CLOSED' for old in equivalent):
-            fail('已关闭原问题须引用原 issue_id 及新的反例，不能改用新编号重开。')
+            delivery_error('已关闭原问题须引用原 issue_id 及新的反例，不能改用新编号重开。')
         if prior_id:
             prior = ledger['issues'].get(prior_id)
             if (not prior or prior['status'] != 'CLOSED' or not item['new_evidence_reason'].strip()
                     or item['evidence'] == prior['evidence']):
-                fail('重开必须引用已关闭原问题及新的有效证据。')
+                delivery_error('重开必须引用已关闭原问题及新的有效证据。')
             iid = prior_id
             prior['reopen_proposal'] = copy.deepcopy(item)
             transition(ledger, prior, 'PROPOSED', actor=role, evidence=item['evidence'], reason=item['new_evidence_reason'])
@@ -256,34 +292,34 @@ def propose(ledger, workflow_id, row, role, report, hid):
 
 def adjudicate(ledger, decisions, proposed_ids, hid):
     if len(decisions) != len(proposed_ids) or {d['issue_id'] for d in decisions} != set(proposed_ids):
-        fail('总监裁决必须唯一覆盖全部提议问题。')
+        delivery_error('总监裁决必须唯一覆盖全部提议问题。')
     for decision in decisions:
         issue = ledger['issues'][decision['issue_id']]
         action = decision['action']
         if issue['confirmed'] and issue['severity'] in {'P0', 'P1'} and action in {'REJECTED', 'DEFERRED'}:
-            fail('已确认阻断问题不能通过裁决豁免。')
+            delivery_error('已确认阻断问题不能通过裁决豁免。')
         if action == 'DEFERRED' and issue['severity'] != 'P2':
-            fail('只有非阻断 P2 可以进入待办。')
+            delivery_error('只有非阻断 P2 可以进入待办。')
         if action == 'DUPLICATE':
             target = ledger['issues'].get(decision['duplicate_of'])
             if (not target or target is issue or target['status'] in {'REJECTED', 'DEFERRED', 'DUPLICATE'}
                     or target['criterion_id'] != issue['criterion_id']
                     or target['status'] == 'CLOSED' or target['severity'] > issue['severity']):
-                fail('重复问题必须指向同验收项且仍待解决的同等或更高等级原问题。')
+                delivery_error('重复问题必须指向同验收项且仍待解决的同等或更高等级原问题。')
             issue['duplicate_of'] = target['issue_id']
         elif decision['duplicate_of'] is not None:
-            fail('非重复裁决不能指定 duplicate_of。')
+            delivery_error('非重复裁决不能指定 duplicate_of。')
         if action in {'OPEN', 'NEEDS_PROBE', 'NEEDS_REPLAN'}:
             issue['confirmed'] = True
         if action == 'NEEDS_PROBE':
             if decision.get('probe_plan') is None:
-                fail('验证出口必须包含输入、预算、通过条件、失败条件和产物要求。')
+                delivery_error('验证出口必须包含输入、预算、通过条件、失败条件和产物要求。')
             issue['needs'] = 'PROBE'
             issue['probe_task'] = {'status': 'AWAITING_EXECUTION', 'plan': copy.deepcopy(decision['probe_plan']),
                 'attempts': 0, 'max_attempts': ledger['budget']['max_probe_attempts_per_issue'],
                 'project_budget_continues': True, 'execution_authorized': False}
         elif decision.get('probe_plan') is not None:
-            fail('只有 NEEDS_PROBE 可创建验证任务。')
+            delivery_error('只有 NEEDS_PROBE 可创建验证任务。')
         if action == 'NEEDS_REPLAN':
             issue['needs'] = 'REPLAN'
         issue['adjudication'] = {**copy.deepcopy(decision), 'handoff_id': hid}
@@ -296,29 +332,29 @@ def apply_report(ledger, row, role, report, hid, *, self_check=False):
         fail('审查结果没有绑定当前合同与文档。')
     if self_check:
         if report['verifications'] or report['consistency']:
-            fail('作者自检不能替代问题验证或独立发布检查。')
+            delivery_error('作者自检不能替代问题验证或独立发布检查。')
         return
     for check in report['checks']:
         cid = check['criterion_id']
         if next((c['reviewer'] for c in ledger['contract']['criteria'] if c['id'] == cid), None) != role:
-            fail('验收覆盖超出角色职责。')
+            delivery_error('验收覆盖超出角色职责。')
         if check['status'] == 'PASS' and not check['evidence']:
-            fail('PASS 必须有证据。')
+            delivery_error('PASS 必须有证据。')
         if check['status'] == 'FAIL' and not check['issue_ids']:
-            fail('FAIL 必须关联具体问题。')
+            delivery_error('FAIL 必须关联具体问题。')
         if check['status'] == 'UNKNOWN' and not check['missing_information'].strip():
-            fail('UNKNOWN 必须说明缺失信息。')
+            delivery_error('UNKNOWN 必须说明缺失信息。')
         ledger['coverage'][cid] = {**copy.deepcopy(check), 'role': role, 'handoff_id': hid,
             'fingerprint': fingerprint(ledger['contract'], row['spec'], cid), 'spec_hash': row['spec_hash']}
     for verification in report['verifications']:
         issue = ledger['issues'].get(verification['issue_id'])
         if not issue or issue['verifier'] != role or issue['status'] != 'PATCHED':
-            fail('只有独立指定核验者可以验证 PATCHED 问题。')
+            delivery_error('只有独立指定核验者可以验证 PATCHED 问题。')
         conditions = verification['conditions']
         if len(conditions) != len(issue['close_when']) or {v['index'] for v in conditions} != set(range(len(issue['close_when']))):
-            fail('须逐项覆盖原关闭条件，不能缩减。')
+            delivery_error('须逐项覆盖原关闭条件，不能缩减。')
         if any(v['status'] == 'PASS' and not v['evidence'] for v in conditions):
-            fail('关闭条件通过缺少原文证据。')
+            delivery_error('关闭条件通过缺少原文证据。')
         issue['verification'] = {'handoff_id': hid, 'conditions': copy.deepcopy(conditions),
             'fingerprint': fingerprint(ledger['contract'], row['spec'], issue['criterion_id']),
             'document_sha256': row['document']['sha256']}
@@ -333,6 +369,10 @@ def apply_report(ledger, row, role, report, hid, *, self_check=False):
 
 
 def outcome(ledger, row):
+    from .implementation_whole_review import KEY, PROTOCOL
+    if KEY in ledger and row.get(PROTOCOL) == 1:
+        slots = [s for s in ledger[KEY]['rounds'] if s['revision'] == row['index'] and s['complete']]
+        return slots[0]['outcome'] if len(slots) == 1 else 'WHOLE_REVIEW'
     contract = ledger['contract']
     blockers = [i for i in ledger['issues'].values() if i['severity'] in {'P0', 'P1'} and i['status'] in ACTIVE_ISSUES]
     coverage = all((entry := ledger['coverage'].get(c['id'], {})).get('status') == 'PASS'
@@ -350,6 +390,11 @@ def outcome(ledger, row):
     if row['index'] >= ledger['budget']['max_repair_verify_cycles']:
         return 'BLOCKED'
     # Evidence gaps cannot be repaired by forcing prose edits or invented votes.
+    from .implementation_endpoint_gap import WORK
+    work = next((s.get('scoped_supplement', {}).get(WORK) for s in ledger.get('rounds', [])
+                 if s['revision'] == row['index']), None)
+    if not blockers and work and work['document'] == row['document']:
+        return 'REPAIR'  # Authenticated pending evidence; never a scientific issue.
     if not blockers or any(i['status'] == 'PROPOSED' for i in blockers):
         return 'BLOCKED'
     return 'REPAIR'
@@ -369,12 +414,12 @@ def initial_ledger(config):
             'contracts': [], 'issues': {}, 'coverage': {}, 'events': [], 'rounds': [], 'consistency': [], 'decision_records': []}
 
 
-def budget_guard(store, run_id, context, *, consume=False):
+def budget_guard(store, run_id, context, *, consume=False, operation_id=None):
     """Project-level monotone counters survive workflow and contract restarts."""
     if not enabled(context):
         return
     from .implementation_review_clock import charge
-    exhausted = charge(store, run_id, context['acceptance_budget'], consume=consume, at=now())
+    exhausted = charge(store, run_id, context['acceptance_budget'], consume=consume, at=now(), operation_id=operation_id)
     if exhausted:
         workflow_id = context.get('acceptance_workflow_id') or context.get('implementation_document_authoring', {}).get('workflow_id')
         if workflow_id:
@@ -396,22 +441,38 @@ def assert_compiled(context, active):
     tables = {'$text': active.get('shared_context_text', {}),
               '$catalog_record': active.get('shared_context_catalog_records', {}),
               '$record': active.get('shared_context_records', {})}
-    def expand(value, seen=frozenset()):
+    absent = object()
+    def expand(value, expected=absent, seen=frozenset()):
+        if value == expected:
+            return value
+        from .context_records import text_slice
+        sliced = text_slice(value, active)
+        if sliced is not None:
+            return sliced
         if isinstance(value, dict) and len(value) == 1 and next(iter(value)) in tables:
             kind, reference = next(iter(value.items()))
             if not isinstance(reference, str) or reference not in tables[kind] or (kind, reference) in seen:
                 fail('编译输入的合同引用缺失或循环。')
-            return expand(tables[kind][reference], seen | {(kind, reference)})
+            return expand(tables[kind][reference],expected,seen | {(kind, reference)})
         if isinstance(value, dict):
-            return {k: expand(v, seen) for k, v in value.items()}
+            return {k: expand(v,expected.get(k,absent) if isinstance(expected,dict) else absent,seen)
+                    for k,v in value.items()}
         if isinstance(value, list):
-            return [expand(v, seen) for v in value]
+            return [expand(v,expected[i] if isinstance(expected,list) and i<len(expected) else absent,seen)
+                    for i,v in enumerate(value)]
         return value
-    source = expand(active.get('context', {}))
-    for key in (PROTOCOL, CONTEXT, 'acceptance_workflow_id', 'acceptance_contract', 'acceptance_budget', 'acceptance_issues',
+    source = expand(active.get('context', {}),context)
+    for key in (PROTOCOL, CONTEXT, 'implementation_work', 'acceptance_workflow_id', 'acceptance_contract', 'acceptance_budget', 'acceptance_issues',
+                'implementation_architecture_scope', 'implementation_document_review_scope', 'implementation_scope_review', 'rejected_scope_reviews',
+                'rejected_scope_revision',
                 'implementation_document_delivery', 'implementation_delivery_correction', 'implementation_adjudication_intake',
+                'implementation_acceptance_delivery_repair',
+                'implementation_review_read_batch', 'implementation_revision_read_batch',
                 'implementation_read_window_recovery', 'document_read_window_protocol',
                 'implementation_acceptance_citation_correction',
+                'implementation_report_amendment',
+                'implementation_whole_document_review_protocol', 'implementation_whole_document_review',
+                'implementation_whole_review_author_policy',
                 'implementation_acceptance_read_recovery', 'implementation_acceptance_read_plan',
                 'acceptance_criteria', 'non_waivable',
                 'proposed_issues', 'existing_issues', 'author_response', 'prior_contract', 'decision_records', 'indexed_documents'):

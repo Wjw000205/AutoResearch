@@ -40,8 +40,11 @@ paths 指向该方法实际使用的参数。
 每项 value 是具体冻结 JSON 值，paths 是该方法实际参数的精确 JSON pointer；不同方法可用不同
 字段名，但维度名与值必须相同。也声明目标、数据划分、信息权限与评价口径的实际参数路径。
 不要指向声明自身或只写说明文字，不能把算法特有学习率/隐藏维度当作共同任务条件。
-命名消融必须检查合并后的每个配置；共享搜索不能悄悄覆盖这些条件。不同任务规格在
-benchmark_tasks 中分别提供完整三分支参数、搜索网格及验证/测试种子列表，绑定
+命名消融必须检查合并后的每个配置；共享搜索不能悄悄覆盖这些条件。
+仅输入输出有差异时，所有领域均优先提交一份完整根级模板与 benchmark_io_matrix。
+在 combinations 每行给出 task_id、inputs、outputs，维度名对应 comparison_task 的实际参数路径；
+仅列实际协议组合。矩阵共享 protocol_id/protocol_sha256、数据、分支配置、搜索网格及种子。
+存在独立的模型或协议差异时，在 benchmark_tasks 中分别提供完整三分支参数、搜索网格及验证/测试种子列表，绑定
 literature.record_protocol 已保存的 protocol_id/protocol_sha256，并声明 dataset 和 task_dimensions。
 每个任务分别选优和报告；根级参数不代替各任务参数。
 模型不支持批准规格时，明确不兼容及适配办法并交审查，不得自行改变任务条件。
@@ -54,7 +57,8 @@ REVIEW_GUIDANCE = '''
 也不能把未报告值/自选默认值说成论文规定。正文与官方配置冲突须列出来源与解决办法。
 逐项核对任务协议声明的各数据集与任务规格、来源记录及完成范围，
 允许有来源的不同标准，但不能把资源缩水 pilot 当作完整标准复现。
-独立核对公平比较的共同任务条件：逐一展开 baseline、proposed、全部命名消融和搜索点，
+宿主已逐字段核验的输入输出矩阵只审一份完整模板和全部组合，每个独立角色一次给出整批意见。
+贝叶斯脚本及搜索计划在参数微调阶段审核。独立核对公平比较的共同任务条件：检查 baseline、proposed、全部命名消融和搜索点，
 对照批准架构/冻结计划的外部输入、目标规格、预处理、评价成员、
 数据划分、信息权限及指标归约/尺度。共同 comparison_task 的每个参数路径须指向真实配置。
 分段审查仅核对本组相关条件及决定性来源，复用同版本有效读取与意见；终审汇总全部组以
@@ -71,6 +75,12 @@ REVIEW_GUIDANCE = '''
 
 DESIGN_GUIDANCE += SEED_GUIDANCE
 REVIEW_GUIDANCE += SEED_GUIDANCE
+from .experiment_configuration import DESIGN_GUIDANCE as YAML_DESIGN_GUIDANCE
+DESIGN_GUIDANCE += YAML_DESIGN_GUIDANCE
+REVIEW_GUIDANCE += YAML_DESIGN_GUIDANCE
+from .metric_contract import GUIDANCE as METRIC_GUIDANCE
+DESIGN_GUIDANCE += '\n' + METRIC_GUIDANCE
+REVIEW_GUIDANCE += '\n' + METRIC_GUIDANCE
 
 
 def assignment(engine, run_id, role, purpose, instruction, context, schema, guidance):
@@ -103,7 +113,11 @@ def assignment(engine, run_id, role, purpose, instruction, context, schema, guid
         raise ResearchBlocked('同一公平比较范围存在多个冻结交接，不能任意选择或重发。')
     if matches:
         return matches[0]
+    instruction += '\n' + guidance
     if purpose == 'design':
         from .experiment_requirements import new_design_schema
         schema = new_design_schema(schema)
-    return instruction + '\n' + guidance, {**context, 'comparison_task_review_protocol': 1}, schema
+        if context.get('dataset_selection'):
+            from .design_delivery import assignment as paper_assignment
+            instruction, context, schema = paper_assignment(engine, run_id, instruction, context, schema)
+    return instruction, {**context, 'comparison_task_review_protocol': 1}, schema

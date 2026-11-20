@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import unicodedata
+from .disk_usage import tree_bytes
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -291,6 +292,9 @@ def hardware_profile() -> dict:
     return result
 
 
+TORCH_CUDA_REASON = "PyTorch CUDA execution is not available or could not be verified in this interpreter; use CPU or prepare a CUDA-capable runtime"
+
+
 def assess_resources(plan: dict, hardware: dict, *, require_complete: bool = False) -> dict:
     """Conservative admission estimate. GPU memory is never summed across devices.
 
@@ -415,8 +419,8 @@ def assess_resources(plan: dict, hardware: dict, *, require_complete: bool = Fal
     if gpu_required and "torch" in required_names:
         torch_runtime = software.get("gpu_runtime", {}).get("torch", {})
         if torch_runtime.get("cuda_available") is not True:
-            reasons.append("PyTorch CUDA execution is not available or could not be verified in this interpreter; use CPU or prepare a CUDA-capable runtime")
-    declared_vram = number("estimated_vram_gb", number("vram_gb", 0))
+            reasons.append(TORCH_CUDA_REASON)
+    declared_vram = max(number("estimated_vram_gb", 0), number("estimated_peak_vram_gb", 0), number("vram_gb", 0))
     estimated_vram = declared_vram
     estimated_cpu_memory = 0.0
     if is_llm and not billions:
@@ -480,7 +484,7 @@ def assess_resources(plan: dict, hardware: dict, *, require_complete: bool = Fal
     if gpu_required and preferences.get("execution_mode") == "docker":
         reasons.append("Docker GPU passthrough is not configured")
     if (gpu_required or estimated_vram > 0) and estimated_vram > gpu_budget:
-        reasons.append(f"VRAM estimate {estimated_vram:.2f} GiB exceeds a single GPU safe free budget of {gpu_budget:.2f} GiB")
+        reasons.append(f"VRAM estimate {estimated_vram:.3f} GiB exceeds a single GPU safe free budget of {gpu_budget:.3f} GiB")
     return {
         "approved": not reasons, "reasons": reasons, "assumptions": assumptions,
         "estimated_vram_gb": round(estimated_vram, 3),
@@ -793,10 +797,21 @@ class LiteratureService:
                 headers = {key: value for key, value in response.headers.items() if key.lower() not in {"content-encoding", "content-length"}}
                 return httpx.Response(response.status_code, headers=headers, content=b"".join(chunks), request=response.request)
 
-    async def search(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False) -> list[dict]:
-        return (await self.search_with_report(query, limit, sort=sort, year_from=year_from, year_to=year_to, date_from=date_from, date_to=date_to, ccf_ab_only=ccf_ab_only))["papers"]
+    async def search(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False, discovery_policy: str | None = None) -> list[dict]:
+        return (await self.search_with_report(query, limit, sort=sort, year_from=year_from, year_to=year_to, date_from=date_from, date_to=date_to, ccf_ab_only=ccf_ab_only,
+            **({'discovery_policy': discovery_policy} if discovery_policy else {})))["papers"]
 
-    async def search_with_report(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False) -> dict:
+    async def search_with_report(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False, discovery_policy: str | None = None) -> dict:
+        from .literature_discovery import POLICY, selection_metadata
+        if discovery_policy is not None:
+            if discovery_policy != POLICY:
+                raise ValueError('Unknown literature discovery policy')
+            report = await self._network_search_with_report(query, limit, sort=sort,
+                year_from=year_from, year_to=year_to, date_from=date_from, date_to=date_to,
+                ccf_ab_only=ccf_ab_only, refresh=True)
+            return {**report, 'papers': [selection_metadata(p) for p in report['papers']],
+                'diagnostics': {**report['diagnostics'], 'network_searched': bool(str(query).strip()),
+                    'discovery_policy': POLICY, 'rag': {'used': False, 'scope': 'Match notes only after paper selection'}}}
         rag = getattr(self, 'paper_rag', None)
         options = dict(sort=sort, year_from=year_from, year_to=year_to, date_from=date_from, date_to=date_to, ccf_ab_only=ccf_ab_only)
         # Reuse validated local evidence before consulting any network cache/provider.
@@ -878,7 +893,7 @@ class LiteratureService:
                 'network_searched': not report['diagnostics'].get('cache_hit', False)}}
         return await self._network_search_with_report(query, limit, **options)
 
-    async def _network_search_with_report(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False) -> dict:
+    async def _network_search_with_report(self, query: str, limit: int = 5, *, sort: str = "relevance", year_from: int | None = None, year_to: int | None = None, date_from: str | None = None, date_to: str | None = None, ccf_ab_only: bool = False, refresh: bool = False) -> dict:
         """Return source diagnostics with this exact query, including cached errors."""
         query, limit = str(query).strip()[:500], max(1, min(int(limit), 120))
         if not query:
@@ -899,7 +914,7 @@ class LiteratureService:
             raise ValueError('date_from must not exceed date_to')
         search_settings = {"query": query, "sort": sort, "year_from": year_from, "year_to": year_to, "date_from": date_from, "date_to": date_to, "ccf_ab_only": ccf_ab_only}
         cache_key = "literature:search:v12:" + _digest([query.casefold(), limit, sort, year_from, year_to, date_from, date_to, ccf_ab_only])
-        cached = self._cached(cache_key, 3600)
+        cached = None if refresh else self._cached(cache_key, 3600)
         if cached is not None:
             self.last_errors = cached["diagnostics"]["errors"]
             return {"papers": [{**p, "cache_hit": True, "provenance": "live_metadata_cached"} for p in cached["papers"]],
@@ -953,7 +968,8 @@ class LiteratureService:
             originals = candidate_pool[offset:offset + batch_size]
             batch = []
             for start in range(0, len(originals), 6):
-                batch.extend(await asyncio.gather(*(self.verify(p) for p in originals[start:start + 6])))
+                from .async_ownership import gather as gather_owned
+                batch.extend(await gather_owned(*(self.verify(p) for p in originals[start:start + 6])))
             for original, checked in zip(originals, batch):
                 if checked.get('verified') is True:
                     # These locations came from actual source adapters, not a
@@ -1276,6 +1292,7 @@ class LiteratureService:
         is_article_xml = False
         pages_total, pages_extracted = None, None
         raw_pages = []
+        unicode_repairs = []
         if is_pdf:
             try:
                 from pypdf import PdfReader
@@ -1283,9 +1300,18 @@ class LiteratureService:
                 raise ValueError("PDF extraction requires pypdf; install the project dependencies") from exc
             reader = PdfReader(io.BytesIO(content))
             pages_total, pages_extracted = len(reader.pages), min(100, len(reader.pages))
-            raw_pages = [(page.extract_text() or '').replace('\r\n', '\n').replace('\r', '\n') for page in reader.pages[:100]]
+            from .pdf_text_encoding import normalize as normalize_pdf_text
+            for number, page in enumerate(reader.pages[:100], 1):
+                page_text, code_units, replacements = normalize_pdf_text(page.extract_text() or '')
+                raw_pages.append(page_text.replace('\r\n', '\n').replace('\r', '\n'))
+                if code_units:
+                    unicode_repairs.append({'page': number, 'surrogate_code_units': code_units,
+                                            'replacement_characters_added': replacements})
             text = "\n".join(raw_pages)
-            title = str((reader.metadata or {}).get("/Title") or name)
+            title, title_units, title_replacements = normalize_pdf_text(str((reader.metadata or {}).get("/Title") or name))
+            if title_units:
+                unicode_repairs.append({'field': 'title', 'surrogate_code_units': title_units,
+                                        'replacement_characters_added': title_replacements})
         else:
             decoded = content.decode("utf-8", errors="replace")
             match = re.search(r"<title[^>]*>(.*?)</title>", decoded, re.I | re.S)
@@ -1321,14 +1347,17 @@ class LiteratureService:
                           'text_truncated': len(visible) < len(page_text), 'empty': not page_text.strip()})
             cursor += len(page_text) + 1
         empty_pages = [page['page'] for page in pages if page['empty']]
+        unicode_loss = any(row['replacement_characters_added'] for row in unicode_repairs)
         return {"id": hashlib.sha256(content).hexdigest()[:24], "title": title[:500], "text": retained,
             "text_truncated": len(text) > 150000 or bool(pages_total and pages_total > pages_extracted),
             "extracted_chars_before_limit": len(text),
             "extracted_text_sha256": hashlib.sha256(text.encode('utf-8')).hexdigest(),
             "text_sha256": hashlib.sha256(retained.encode('utf-8')).hexdigest(),
-            "extraction_note": "Text hash covers extracted text only; PDF pages and retained characters may be limited. Content hash covers all fetched bytes.",
+            "extraction_note": "Text hash covers extracted text only; PDF pages and retained characters may be limited. Content hash covers all fetched bytes." +
+                (" PDF extraction contained UTF-16 surrogate code units: valid pairs were combined and invalid units replaced with U+FFFD. Inspect affected passages against the original PDF." if unicode_repairs else ''),
+            **({'pdf_unicode_normalization': unicode_repairs} if unicode_repairs else {}),
             "pages": pages, "empty_text_pages": empty_pages, "ocr_performed": False,
-            "extraction_status": "no_text_requires_ocr" if is_pdf and not text.strip() else "partial_text" if empty_pages or len(text) > 150000 or bool(pages_total and pages_total > pages_extracted) else "text_extracted",
+            "extraction_status": "no_text_requires_ocr" if is_pdf and not text.strip() else "partial_text" if unicode_loss or empty_pages or len(text) > 150000 or bool(pages_total and pages_total > pages_extracted) else "text_extracted",
             "format": "pdf" if is_pdf else "xml" if is_article_xml else "html" if 'html' in content_type.lower() else "text",
             "fulltext_xml": is_article_xml,
             "pages_total": pages_total, "pages_extracted": pages_extracted, "verified": False,
@@ -1426,7 +1455,7 @@ runpy.run_path(config["code_file"], run_name="__main__")
 
 class _WindowsJob:
     """A Windows job kills descendants on parent exit and enforces aggregate limits."""
-    def __init__(self, pid: int, memory_mb: int, cpu_seconds: int | None, cpu_cores: int, process_limit: int = 32):
+    def __init__(self, pid: int, memory_mb: int, cpu_seconds: int | None, cpu_cores: int, process_limit: int = 32, *, tree_affinity=False):
         import ctypes
         from ctypes import wintypes
 
@@ -1456,28 +1485,102 @@ class _WindowsJob:
             info.BasicLimitInformation.PerJobUserTimeLimit = cpu_seconds * 10_000_000
         info.BasicLimitInformation.ActiveProcessLimit = process_limit
         info.JobMemoryLimit = memory_mb * 1024 * 1024
-        process = None
         try:
+            if tree_affinity:
+                cpus = psutil.Process(pid).cpu_affinity()[:cpu_cores]
+                if not cpus or max(cpus) >= ctypes.sizeof(ctypes.c_size_t) * 8:
+                    raise ValueError('No representable diagnostic Job affinity mask')
+                info.BasicLimitInformation.LimitFlags |= 0x10  # JOB_OBJECT_LIMIT_AFFINITY
+                info.BasicLimitInformation.Affinity = sum(1 << cpu for cpu in cpus)
             if not kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
                 raise OSError(ctypes.get_last_error(), "Setting Windows job limits failed")
-            process = kernel.OpenProcess(0x100 | 0x1 | 0x400, False, pid)
-            if not process or not kernel.AssignProcessToJobObject(self.handle, process):
-                raise OSError(ctypes.get_last_error(), "Assigning experiment to Windows job failed")
-            try:
-                psutil.Process(pid).cpu_affinity(psutil.Process().cpu_affinity()[:cpu_cores])
-            except (psutil.Error, AttributeError):
-                pass
+            self.attach(pid, cpu_cores)
+            if tree_affinity:
+                actual = Extended()
+                if not kernel.QueryInformationJobObject(ctypes.c_void_p(self.handle), 9, ctypes.byref(actual),
+                                                        ctypes.sizeof(actual), None):
+                    raise OSError(ctypes.get_last_error(), 'Reading admitted Windows Job limits failed')
+                basic = actual.BasicLimitInformation
+                requested = info.BasicLimitInformation
+                if (basic.LimitFlags & requested.LimitFlags != requested.LimitFlags or basic.Affinity != requested.Affinity
+                        or actual.JobMemoryLimit != info.JobMemoryLimit
+                        or basic.PerJobUserTimeLimit != requested.PerJobUserTimeLimit):
+                    raise ValueError('Effective Windows Job limits differ from diagnostic admission')
+                self.verified_limits = {'affinity_mask': basic.Affinity, 'cpu_cores': basic.Affinity.bit_count(),
+                    'memory_bytes': actual.JobMemoryLimit, 'user_time_100ns': basic.PerJobUserTimeLimit}
         except BaseException:
             self.close()
             raise
+
+    def attach(self, pid, cpu_cores):
+        import ctypes
+        process = self.kernel.OpenProcess(0x100 | 0x1 | 0x400, False, pid)
+        try:
+            if not process or not self.kernel.AssignProcessToJobObject(self.handle, process):
+                raise OSError(ctypes.get_last_error(), "Assigning process to Windows job failed")
+            proc = psutil.Process(pid)
+            proc.cpu_affinity(proc.cpu_affinity()[:cpu_cores])
+            if not 0 < len(proc.cpu_affinity()) <= cpu_cores:
+                raise RuntimeError("Assigned process CPU affinity exceeds job admission")
         finally:
             if process:
-                kernel.CloseHandle(process)
+                self.kernel.CloseHandle(process)
+
+    def total_cpu_seconds(self):
+        """Job accounting includes terminated descendants and kernel time."""
+        if not self.handle:
+            raise RuntimeError("Windows job accounting handle is closed")
+        return self.query_cpu_seconds(self.kernel, self.handle)
+
+    @staticmethod
+    def query_cpu_seconds(kernel, handle):
+        import ctypes
+        from ctypes import wintypes
+        class Accounting(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_longlong) for name in (
+                'user', 'kernel', 'period_user', 'period_kernel')] + [(name, wintypes.DWORD)
+                for name in ('faults', 'processes', 'active', 'terminated')]
+        data = Accounting()
+        if not kernel.QueryInformationJobObject(ctypes.c_void_p(handle), 1, ctypes.byref(data),
+                                                     ctypes.sizeof(data), None):
+            raise OSError(ctypes.get_last_error(), 'Cannot verify Windows job CPU accounting')
+        return (data.user + data.kernel) / 10_000_000
 
     def close(self):
         if self.handle:
             self.kernel.CloseHandle(self.handle)
             self.handle = None
+
+    def close_and_wait(self):
+        """Checker-only barrier: terminate and drain the owned job before cleanup."""
+        if not self.handle:
+            if getattr(self, '_cleanup_unconfirmed', False):
+                raise RuntimeError('Check job handle closed before cleanup was confirmed')
+            return
+        import ctypes
+        from ctypes import wintypes
+        class Accounting(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_longlong) for name in (
+                'user', 'kernel', 'period_user', 'period_kernel')] + [(name, wintypes.DWORD)
+                for name in ('faults', 'processes', 'active', 'terminated')]
+        # On failure retain the handle for the checker's bounded reap retry.
+        # Closing an unconfirmed job never turns a later call into success.
+        self._cleanup_unconfirmed = True
+        if not self.kernel.TerminateJobObject(ctypes.c_void_p(self.handle), 1):
+            raise OSError(ctypes.get_last_error(), 'Terminating check job failed')
+        deadline = time.monotonic() + 5
+        while True:
+            data = Accounting()
+            if not self.kernel.QueryInformationJobObject(ctypes.c_void_p(self.handle), 1,
+                    ctypes.byref(data), ctypes.sizeof(data), None):
+                raise OSError(ctypes.get_last_error(), 'Cannot verify check job cleanup')
+            if data.active == 0:
+                self._cleanup_unconfirmed = False
+                self.close()
+                return (data.user + data.kernel) / 10_000_000
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Owned check job has not exited')
+            time.sleep(.02)
 
 
 class ExperimentRunner:
@@ -1496,6 +1599,10 @@ class ExperimentRunner:
             owner = result.get("owner_pid")
             try:
                 alive = owner and abs(psutil.Process(owner).create_time() - result.get("owner_started", 0)) < 1
+            except psutil.AccessDenied:
+                # Unknown liveness is not an orphan. Do not relabel or signal
+                # another owner's trial when its process cannot be inspected.
+                continue
             except psutil.Error:
                 alive = False
             if not alive:
@@ -1560,7 +1667,10 @@ class ExperimentRunner:
         parent = owned_process(process.pid, active.get("process_started"))
         children = verified_children(parent) if parent else []
         if job:
-            job.close()
+            if active.get('staged_job') and job.handle:
+                active['final_job_cpu_seconds'] = job.close_and_wait()
+            else:
+                job.close()
         try:
             for child in reversed(children):
                 try:
@@ -1591,7 +1701,8 @@ class ExperimentRunner:
                     await self._terminate(active["process"], job=active.get("job"), docker_name=active.get("docker_name"))
 
     async def run(self, run_id: str, code: str, params: dict, trial_id: str, limits: dict,
-                  cancel_event: asyncio.Event | None = None) -> dict:
+                  cancel_event: asyncio.Event | None = None, *, supervised_start=None, computation_stopped=None,
+                  row_identity=None) -> dict:
         async def transport_io_call(function, *args):
             # Cancellation must not release the trial lock while a disk/DB
             # worker is still writing its checkpoint or holding large buffers.
@@ -1612,7 +1723,7 @@ class ExperimentRunner:
                     pass
                 raise
 
-        invocation_started = time.monotonic()
+        invocation_started = time.monotonic() if supervised_start is None else supervised_start
         run_id, trial_id = self._identifier(run_id), self._identifier(trial_id)
         mode = limits.get("execution_mode")
         if mode not in {"local", "docker"}:
@@ -1646,6 +1757,10 @@ class ExperimentRunner:
                 or binding.get('code_sha256') != hashlib.sha256(code.encode('utf-8')).hexdigest()
                 or not re.fullmatch(r'[a-f0-9]{64}', str(binding.get('experiment_plan_sha256', '')))):
             raise ValueError('Invalid host experiment binding')
+        if row_identity is not None and (not binding or row_identity.get('cycle')!=binding['research_cycle']
+                or row_identity.get('plan_sha256')!=binding['experiment_plan_sha256']
+                or row_identity.get('code_sha256')!=binding['code_sha256'] or params.get('phase')!='validation'):
+            raise ValueError('Validation row identity requires the same host experiment binding')
         code_bundle = limits.get('code_bundle')
         if code_bundle:
             from .code_bundle import validate as validate_bundle
@@ -1663,6 +1778,11 @@ class ExperimentRunner:
             numeric_limits += [normalized['timeout_seconds'], normalized['cpu_seconds']]
         if any(not math.isfinite(v) or v <= 0 for v in numeric_limits):
             raise ValueError("All experiment resource limits must be finite and positive")
+        reserve = limits.get('diagnostic_save_reserve_seconds')
+        if reserve is not None and (mode != 'local' or os.name != 'nt' or without_timing
+                or params.get('phase') != 'code_check' or normalized.get('gpu_allowed')
+                or type(reserve) is not int or not 0 < reserve < normalized['timeout_seconds']):
+            raise ValueError('Bounded diagnostic requires finite Windows job limits and a positive saving window')
         if transport_io:
             normalized.update(memory_mb=transport_io['child_memory_mb'], comparison_io=transport_io)
         if mode == "local":
@@ -1673,6 +1793,20 @@ class ExperimentRunner:
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             fingerprint_input = {"code": code, "params": params}
+            yaml_argv=(normalized.get('hyperparameter_yaml') or {}).get('entry_arguments')
+            if yaml_argv is not None:
+                from .hyperparameter_yaml import RUNTIME_FILE,config_path,trial_receipt
+                yaml_contract=normalized['hyperparameter_yaml']
+                filename=config_path(yaml_contract.get('config_file',RUNTIME_FILE))
+                if yaml_argv!=['params.json','--config',filename] or normalized.get('execution_interface'):
+                    raise ValueError('Conflicting or unsupported YAML command-line arguments')
+                fingerprint_input['entry_arguments']=yaml_argv
+                if 'config_file' in yaml_contract:
+                    if hashlib.sha256(yaml_contract['yaml'].encode()).hexdigest()!=yaml_contract['yaml_sha256']:
+                        raise ValueError('Selected task YAML differs from its frozen bytes')
+                    fingerprint_input['hyperparameter_yaml']=trial_receipt(yaml_contract)
+            if row_identity:
+                fingerprint_input['dataset_row_identity'] = row_identity
             if code_bundle:
                 fingerprint_input['code_bundle_sha256'] = code_bundle['sha256']
             fingerprint = (await transport_io_call(_digest, fingerprint_input)
@@ -1690,7 +1824,7 @@ class ExperimentRunner:
             if cancel_event and cancel_event.is_set():
                 raise asyncio.CancelledError("Experiment cancelled before process launch")
             attempt = int((previous or {}).get("attempt", 0)) + 1
-            from .check_workspace import attempt_path
+            from .check_workspace import attempt_path, DiagnosticPreparationTimeout, STAGED_LAYOUT, stage_invocation
             path = attempt_path(self.root,run_id,trial_id,attempt,params,normalized)
             if not path.resolve().is_relative_to(self.root):
                 raise ValueError("Trial path escapes experiment root")
@@ -1722,11 +1856,17 @@ class ExperimentRunner:
                 (path / "params.json").write_text(json.dumps(params, ensure_ascii=False, allow_nan=False, indent=2), encoding="utf-8")
             (path / "bootstrap.py").write_text(_BOOTSTRAP, encoding="utf-8")
             bootstrap = {**normalized, "start_file": ".start", "code_file": "experiment.py", "params_file": "params.json"}
+            compute_deadline = None
+            if reserve is not None:
+                compute_deadline = invocation_started + normalized['timeout_seconds'] - reserve
+                bootstrap['compute_deadline_monotonic'] = compute_deadline
             if normalized.get('execution_interface'):
                 from .experiment_config import INTERFACE, command_arguments
                 if normalized['execution_interface'] != INTERFACE:
                     raise ValueError('Unknown experiment configuration interface')
                 bootstrap['entry_arguments'] = command_arguments(params)
+            elif yaml_argv:
+                bootstrap['entry_arguments']=yaml_argv
             (path / "bootstrap.json").write_text(json.dumps(bootstrap), encoding="utf-8")
             selected = normalized.get("python_executable")
             params_hash = await transport_io_call(_digest, params) if transport_io else _digest(params)
@@ -1738,6 +1878,10 @@ class ExperimentRunner:
                 environment['dataset_assets'] = dataset_evidence
             if yaml_receipt:
                 environment['hyperparameter_yaml'] = yaml_receipt
+            if row_identity:
+                from . import dataset_row_identity
+                environment.update(await transport_io_call(dataset_row_identity.staging_metadata,self.store,
+                    run_id,trial_id,code,params,path,dataset_evidence,yaml_receipt,row_identity))
             (path / "environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
             result = {"id": trial_id, "storage_key": key, "run_id": run_id, "status": "running", "metrics": {},
                 "stdout": "", "stderr": "", "duration_seconds": 0, "artifact_path": str(path), "params": params,
@@ -1761,16 +1905,28 @@ class ExperimentRunner:
             else:
                 self.store.put("experiments", key, result)
             self.store.event(run_id, "experiment.started", f"Starting trial {trial_id}, attempt {attempt}", {"trial_id": trial_id, "mode": mode})
-            started = invocation_started if transport_io or dataset_evidence else time.monotonic()
+            staged_diagnostic = normalized.get('check_workspace_layout') == STAGED_LAYOUT
+            started = invocation_started if transport_io or dataset_evidence or reserve is not None or staged_diagnostic else time.monotonic()
             internal_cancel = asyncio.Event()
             active = {"run_id": run_id, "cancel": internal_cancel}
             self._active[key] = active
             process, job, docker_name, readers = None, None, None, []
+            observations = None
+            from contextlib import ExitStack
+            input_locks = ExitStack()
             try:
                 if cancel_event and cancel_event.is_set():
                     raise asyncio.CancelledError('Comparison preparation cancelled before process launch')
                 if (transport_io or dataset_evidence) and normalized['timeout_seconds'] is not None and time.monotonic() - started > normalized['timeout_seconds']:
                     raise ValueError('Comparison input preparation exceeded the admitted wall time')
+                if staged_diagnostic:
+                    from .diagnostic_observations import Capture
+                    observations = Capture(normalized['required_cpu_observations'])
+                    result['check_input_staging'] = stage_invocation(path, code_bundle, input_locks)
+                    if tree_bytes(path) > normalized['disk_mb'] * 1024**2:
+                        raise ValueError('Staged diagnostic inputs exceed the admitted workspace limit')
+                    if time.monotonic() - invocation_started >= normalized['timeout_seconds']:
+                        raise DiagnosticPreparationTimeout('Diagnostic staging exhausted the wall time before process launch')
                 env = self._environment(path, normalized)
                 if mode == "docker":
                     if not shutil.which("docker"):
@@ -1786,9 +1942,9 @@ class ExperimentRunner:
                         "--mount", f"type=bind,source={path},target=/workspace", "--workdir", "/workspace",
                         "--user", f"{os.getuid()}:{os.getgid()}" if os.name != "nt" else "65534:65534",
                         "--env", f"OMP_NUM_THREADS={normalized['cpu_cores']}", "--env", f"OPENBLAS_NUM_THREADS={normalized['cpu_cores']}",
-                        image, "python", "-I", "-u", "bootstrap.py", "bootstrap.json"]
+                        image, "python", "-I", *(['-B'] if observations is not None else []), "-u", "bootstrap.py", "bootstrap.json"]
                 else:
-                    command = [normalized["python_executable"], "-I", "-X", "utf8", "-u", "bootstrap.py", "bootstrap.json"]
+                    command = [normalized["python_executable"], "-I", *(['-B'] if observations is not None else []), "-X", "utf8", "-u", "bootstrap.py", "bootstrap.json"]
                 launch = asyncio.create_task(asyncio.create_subprocess_exec(*command, cwd=str(path), env=env,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                     **({"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True})))
@@ -1802,8 +1958,12 @@ class ExperimentRunner:
                 active.update(process=process, docker_name=docker_name,
                               process_started=psutil.Process(process.pid).create_time())
                 if os.name == "nt" and mode == "local":
-                    job = _WindowsJob(process.pid, normalized["memory_mb"], normalized["cpu_seconds"], normalized["cpu_cores"])
+                    job = _WindowsJob(process.pid, normalized["memory_mb"], normalized["cpu_seconds"], normalized["cpu_cores"],
+                                      **({'tree_affinity': True} if staged_diagnostic else {}))
                     active["job"] = job
+                    if staged_diagnostic:
+                        active['staged_job'] = True
+                        result['pre_release_job_limits'] = job.verified_limits
                 if os.name != "nt" and mode == "local":
                     try:
                         allowed = psutil.Process().cpu_affinity()
@@ -1814,6 +1974,16 @@ class ExperimentRunner:
                 self.store.put("experiments", key, result)
                 if internal_cancel.is_set() or (cancel_event and cancel_event.is_set()):
                     raise asyncio.CancelledError("Experiment cancelled before releasing startup gate")
+                if compute_deadline is not None:
+                    job.total_cpu_seconds()
+                    if not 0 < len(psutil.Process(process.pid).cpu_affinity()) <= normalized['cpu_cores']:
+                        raise ValueError('Diagnostic CPU affinity is outside the admitted limit')
+                    if tree_bytes(path) > normalized['disk_mb'] * 1024**2:
+                        raise ValueError('Diagnostic staged directory exceeds its disk limit')
+                    if time.monotonic() >= compute_deadline:
+                        raise ValueError('Diagnostic preparation exhausted the compute window')
+                if observations is not None and time.monotonic() - invocation_started >= normalized['timeout_seconds']:
+                    raise DiagnosticPreparationTimeout('Diagnostic preparation exhausted the wall time before candidate release')
                 (path / ".start").write_text("released", encoding="utf-8")
                 output_size = [0]
                 output_exceeded = asyncio.Event()
@@ -1847,6 +2017,8 @@ class ExperimentRunner:
                             output_exceeded.set()
                         else:
                             captured.extend(block)
+                            if observations is not None and name == 'stdout':
+                                observations.feed(block)
                     # Redact after reassembly: secrets can straddle pipe read boundaries.
                     cleaned = redact(captured.decode("utf-8", errors="replace"))
                     (path / f"{name}.txt").write_text(cleaned, encoding="utf-8")
@@ -1854,9 +2026,12 @@ class ExperimentRunner:
 
                 readers = [asyncio.create_task(drain(process.stdout, "stdout")), asyncio.create_task(drain(process.stderr, "stderr"))]
                 reason, peak_memory, max_cpu = None, 0, 0
+                staged_job = staged_diagnostic and job is not None
                 while process.returncode is None:
                     if internal_cancel.is_set() or (cancel_event and cancel_event.is_set()):
                         reason = "cancelled"
+                    elif compute_deadline is not None and time.monotonic() >= compute_deadline:
+                        reason = "diagnostic_compute_timeout"
                     elif normalized["timeout_seconds"] is not None and time.monotonic() - started > normalized["timeout_seconds"]:
                         reason = "timeout"
                     elif output_exceeded.is_set():
@@ -1874,22 +2049,45 @@ class ExperimentRunner:
                                 except psutil.Error:
                                     pass
                             peak_memory, max_cpu = max(peak_memory, memory), max(max_cpu, cpu)
+                            if compute_deadline is not None or staged_job:
+                                cpu = job.total_cpu_seconds()
+                                max_cpu = max(max_cpu, cpu)
                             if mode == "local" and memory > normalized["memory_mb"] * 1024 * 1024:
                                 reason = "memory_limit"
                             elif mode == "local" and normalized["cpu_seconds"] is not None and cpu > normalized["cpu_seconds"]:
                                 reason = "cpu_limit"
-                            total_size = sum(p.stat().st_size for p in path.rglob("*") if p.is_file() and not p.is_symlink())
+                            total_size = tree_bytes(path)
                             if total_size > normalized["disk_mb"] * 1024 * 1024:
                                 reason = "disk_limit"
                         except (psutil.Error, OSError):
-                            pass
+                            if compute_deadline is not None or staged_job:
+                                reason = 'diagnostic_monitor_failed'
                     if reason:
-                        await self._terminate(process, job=job, docker_name=docker_name)
+                        if computation_stopped is None:
+                            await self._terminate(process, job=job, docker_name=docker_name)
                         break
                     await asyncio.sleep(.08)
+                if computation_stopped is not None:
+                    max_cpu = max(max_cpu, job.total_cpu_seconds())
+                    job.close()  # Before any blocking wait, stop every remaining compute process.
+                    stopped_at = time.monotonic()
+                    computation_stopped(stopped_at)
                 await process.wait()
+                if staged_diagnostic and time.monotonic() - started >= normalized['timeout_seconds']:
+                    reason = reason or 'timeout'
+                if compute_deadline is not None and not reason:
+                    if computation_stopped is None:
+                        max_cpu = max(max_cpu, job.total_cpu_seconds())
+                    if max_cpu > normalized['cpu_seconds']:
+                        reason = 'cpu_limit'
+                    elif (time.monotonic() if computation_stopped is None else stopped_at) >= compute_deadline:
+                        reason = 'diagnostic_compute_timeout'
                 # Descendants must not survive a successfully exiting parent either.
-                if job:
+                if staged_job and job.handle:
+                    max_cpu = active['final_job_cpu_seconds'] = job.close_and_wait()
+                    if max_cpu > normalized['cpu_seconds']:
+                        reason = reason or 'cpu_limit'
+                elif job:
                     job.close()
                 elif os.name != "nt" and mode == "local":
                     try:
@@ -1901,7 +2099,7 @@ class ExperimentRunner:
                     peak_memory_mb=round(peak_memory / 1024 / 1024, 2), cpu_seconds=round(max_cpu, 3))
                 if output_exceeded.is_set():
                     reason = reason or "output_limit"
-                disk_used = sum(p.stat().st_size for p in path.rglob("*") if p.is_file() and not p.is_symlink())
+                disk_used = tree_bytes(path)
                 if disk_used > normalized["disk_mb"] * 1024 * 1024:
                     reason = reason or "disk_limit"
                 if internal_cancel.is_set() or (cancel_event and cancel_event.is_set()):
@@ -1942,6 +2140,8 @@ class ExperimentRunner:
                             if not artifact.is_relative_to(path) or not artifact.is_file() or (path / str(item)).is_symlink():
                                 raise ValueError("Experiment output artifact must be an existing file inside this attempt")
                             artifact_files.append(str(artifact))
+                        if observations is not None:
+                            observations.verify(metrics)
                         result.update(status="completed", metrics=metrics, artifacts=artifact_files,
                             experiment_metadata={k: v for k, v in parsed.items() if k not in {"metrics", "artifacts"}})
             except asyncio.CancelledError:
@@ -1952,7 +2152,8 @@ class ExperimentRunner:
             except Exception as exc:
                 if process:
                     await self._terminate(process, job=job, docker_name=docker_name)
-                result.update(status="failed", error=redact(f"{type(exc).__name__}: {exc}"))
+                result.update(status="timeout" if isinstance(exc, DiagnosticPreparationTimeout) else "failed",
+                              error=redact(f"{type(exc).__name__}: {exc}"))
             finally:
                 if job:
                     job.close()
@@ -1966,8 +2167,21 @@ class ExperimentRunner:
                         for reader in readers:
                             reader.cancel()
                         await asyncio.gather(*readers, return_exceptions=True)
+                if 'final_job_cpu_seconds' in active:
+                    result['cpu_seconds'] = round(active['final_job_cpu_seconds'], 3)
+                if observations is not None:
+                    result['received_cpu_observations'] = observations.values
+                input_locks.close()
                 self._active.pop(key, None)
-                result.update(duration_seconds=round(time.monotonic() - started, 3), finished_at=now())
+                if compute_deadline is not None and result.get('status') != 'completed':
+                    result.update(diagnostic_outcome='incomplete', retry_authorized=False, metrics={})
+                if computation_stopped is not None:
+                    result.update(requires_supervisor_confirmation=True, retry_authorized=False,
+                        duration_scope='Runner snapshot; end-to-end time is measured by the supervisor after durable archival and exit')
+                elapsed = time.monotonic() - started
+                if staged_diagnostic and result['status'] == 'completed' and elapsed >= normalized['timeout_seconds']:
+                    result.update(status='timeout', metrics={}, error='Diagnostic verification exceeded the wall time')
+                result.update(duration_seconds=round(elapsed, 3), finished_at=now())
                 if transport_io:
                     def persist_result():
                         self.store.put('experiments', key, result)
@@ -1978,6 +2192,8 @@ class ExperimentRunner:
                     self.store.put("experiment_attempts", f"{key}:{attempt}", result)
                 temporary_result = path / "result.json.tmp"
                 archive_result = result
+                if computation_stopped is not None and result['status'] == 'completed':
+                    archive_result = {**result, 'status':'awaiting_supervisor_confirmation', 'metrics':{}}
                 if transport_io:
                     # The complete output already has one lossless archive.
                     # A small manifest avoids duplicating echoed 256-MiB inputs

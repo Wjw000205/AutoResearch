@@ -21,6 +21,7 @@ def _sha(text):
 
 def artifact_text(engine, run_id, artifact_id):
     from .deletion import _plain_path
+    from .delivery_files import io_path
     artifact = engine.store.get('artifacts', artifact_id)
     if not artifact or artifact.get('run_id') != run_id:
         raise ValueError('Document does not belong to this run')
@@ -28,9 +29,9 @@ def artifact_text(engine, run_id, artifact_id):
     _plain_path(path, engine.data_dir)
     if not path.resolve().is_relative_to(engine.run_dir(run_id)) or path.suffix != '.md':
         raise ValueError('Document must be task-owned Markdown')
-    if path.stat().st_size > MAX_TEXT_BYTES:
+    if io_path(path).stat().st_size > MAX_TEXT_BYTES:
         raise ValueError('Document exceeds local index size limit')
-    text = path.read_text(encoding='utf-8')
+    text = io_path(path).read_text(encoding='utf-8')
     if _sha(text) != artifact.get('sha256'):
         raise ValueError('Document artifact SHA256 changed')
     return artifact, text
@@ -74,6 +75,11 @@ def index(engine, intelligence, run_id, artifact_id, *, kind='research_document'
 
 @existing_only
 def load(engine, run_id, document_id, expected_sha256):
+    return load_current(engine, run_id, document_id, expected_sha256)
+
+
+def load_current(engine, run_id, document_id, expected_sha256):
+    """Recheck external bytes even when a SQLite proof is operation-scoped."""
     from . import paper_document_navigation as papers
     if papers.is_source(document_id):
         return papers.load(engine, run_id, document_id, expected_sha256)

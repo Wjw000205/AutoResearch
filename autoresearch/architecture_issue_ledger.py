@@ -189,6 +189,9 @@ def evidence_covered(engine, run_id, document, vote, handoff_ids, context):
 
 def reconcile(previous, current):
     """Carry unproven closures forward; matching text is only a conservative alias."""
+    from . import independent_full_review as full
+    if full.KEY in current:
+        return _reconcile_full(previous,current)
     ledger = rows(previous) if previous else []
     by_id = {row['id']: row for row in ledger}
     current_rows = copy.deepcopy(current.get('objections', []))
@@ -257,3 +260,62 @@ def reconcile(previous, current):
         by_id[fresh['id']] = fresh
     return {'issue_ledger': ledger, 'verified_closures': closures, 'reopened_issue_ids': reopenings,
             'issue_ledger_errors': errors, 'issue_ledger_protocol': VERSION}
+
+
+def _reconcile_full(previous,current):
+    """Both actual whole reviewers must independently close every old origin.
+
+    This creates a derived transition; it neither changes an origin's author
+    nor synthesizes a missing Engineer vote for the historical protocol.
+    """
+    from . import independent_full_review as full
+    votes=current.get('votes',[])
+    if not full.members(votes,current[full.KEY]):
+        raise ValueError('Full issue reconciliation requires its exact independent policy')
+    ledger=rows(previous) if previous else []
+    by_id={r['id']:r for r in ledger};errors=[];accepted={};closures=[];reopenings=[]
+    context={'issue_ledger_protocol':VERSION,'previous_architecture_review':{
+        'issue_ledger':copy.deepcopy(ledger),'changed_fields':sorted(current.get('_changed_fields',[])),
+        'current_material':current.get('material'),'document':(previous or {}).get('document') or {}}}
+    for vote in votes:
+        try:validate_vote(vote,context,current.get('document') or {})
+        except ValueError as exc:errors.append({'role':vote['role'],'reason':str(exc)})
+    if not errors:
+        updates={v['role']:{u['issue_id']:u for u in v['progress']['issue_updates']} for v in votes}
+        for identity,row in by_id.items():
+            own={r:copy.deepcopy(updates[r][identity]) for r in full.REVIEWERS}
+            was=row['status'];resolved=all(u['disposition']=='resolved' for u in own.values())
+            row.update(last_source_id=current.get('source_id'),independent_updates=own,
+                independent_review_policy=copy.deepcopy(current[full.KEY]))
+            if resolved:
+                row['status']='closed'
+                if was!='closed':
+                    row.update(closure_evidence=[a for u in own.values() for a in u['acceptance_evidence']],
+                        closed_source_id=current.get('source_id'),closed_material=copy.deepcopy(current.get('material',{})),
+                        closed_reviewers=list(full.REVIEWERS))
+                    for role,u in own.items():closures.append({'id':identity,'role':role,
+                        'affected_fields':u['affected_fields'],'evidence_only':u.get('evidence_only') is True})
+            else:
+                row['status']='open'
+                if was=='closed':reopenings.append(identity)
+            for role,u in own.items():
+                for index in u['current_issue_indices']:accepted[(role,index)]=identity
+    for issue in copy.deepcopy(current.get('objections',[])):
+        identity=accepted.get((issue['role'],issue.get('final_issue_index')))
+        match=by_id.get(identity or issue['id'])
+        if match is None:
+            match=next((r for r in ledger if r['role']==issue['role'] and _normal(r['issue'])==_normal(issue['issue'])),None)
+        if match is not None and match['status']!='closed':
+            match.setdefault('aliases',[])
+            if issue['id']!=match['id'] and issue['id'] not in match['aliases']:match['aliases'].append(issue['id'])
+            match['last_source_id']=current.get('source_id')
+            continue
+        fresh=initial([issue],current.get('source_id'))[0]
+        fresh['origin_material']=copy.deepcopy(current.get('material',{}))
+        fresh['affected_fields']=affected_fields(issue,current.get('material',{}))
+        if fresh['id'] in by_id:
+            from .engine import digest
+            fresh['id']=digest([fresh['id'],current.get('source_id'),'unbound-dissent'])
+        ledger.append(fresh);by_id[fresh['id']]=fresh
+    return {'issue_ledger':ledger,'verified_closures':closures,'reopened_issue_ids':reopenings,
+        'issue_ledger_errors':errors,'issue_ledger_protocol':VERSION}

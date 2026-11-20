@@ -11,6 +11,7 @@ import httpx
 
 from .lab import SourceUnavailableError, arxiv_version_match, source_text_issue
 from .storage import RunDeletedError, now
+from .async_ownership import gather as gather_owned
 
 
 NOTE = ('Retrieval and indexing do not establish that an AI read this paper, that the downloaded document '
@@ -196,6 +197,10 @@ def _safe_error(exc):
                       error='Retrieved page is an intermediary or access challenge, not document text; no new memory was indexed.')
         if exc.code == 'tun_public_dns_unavailable':
             result['error'] = 'TUN returned synthetic DNS addresses and public DNS verification is unavailable; no paper content was downloaded.'
+        elif exc.code == 'legal_fulltext_unavailable':
+            result['error'] = 'No lawful full-text candidate was located; this does not establish that the paper is unavailable or that a challenge page was retrieved.'
+        elif exc.code in {'resolved_location_not_fulltext', 'publisher_pdf_link_did_not_return_pdf'}:
+            result['error'] = 'The resolved location did not return full text; another lawful location may still be available.'
     return result
 
 
@@ -616,11 +621,4 @@ async def read_papers(engine, intelligence, run_id, paper_ids, *, require_fullte
             _save_link(engine.store, run_id, paper, result)
             return result
 
-    tasks = [asyncio.create_task(read_one(identifier)) for identifier in paper_ids]
-    try:
-        return await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    return await gather_owned(*(read_one(identifier) for identifier in paper_ids))

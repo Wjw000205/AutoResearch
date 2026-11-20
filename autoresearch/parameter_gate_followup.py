@@ -15,6 +15,7 @@ from .training_adjustment import obj
 
 KEY = 'parameter_gate_followup'
 ROLES = ('director', 'engineer', 'scout')
+from . import independent_full_review as full
 ASSESSMENT_PATH = '/dataset_optimization/architecture_certificate/body/assessment'
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 1200}
 PATHS = {'type': 'array', 'minItems': 1, 'maxItems': 6,
@@ -26,8 +27,7 @@ def eligible(record, evidence, proposal):
     review = record.get(artifacts.KEY, {}).get('independent_review') or {}
     return (scope.get('phase') == 'parameters' and bool(scope.get('architecture_certificate'))
             and artifacts.requested(proposal) and not record.get('proposal') and not record.get('votes')
-            and len(review.get('results', [])) == 3
-            and {r.get('role') for r in review['results']} == set(ROLES)
+            and full.members(review.get('results', []))
             and proposal.get('artifact_review_sha256') == sha(review['results']))
 
 
@@ -105,12 +105,12 @@ def _verify(engine, run_id, record, evidence, saved):
             or not require_binding({**record, 'proposal': source})):
         raise ValueError('Parameter gate follow-up source/evidence/criteria binding changed')
     _answer_owner(engine, run_id, 'engineer', saved['source_assignment'], source)
-    assignment = review['assignment']
-    for role in ROLES:
+    from . import artifact_review_pages as pages
+    for role in full.reviewers(review['results']):
+        assignment = pages.assignment(review, role)
         answer = next(r for r in review['results'] if r['role'] == role)
-        _answer_owner(engine, run_id, role, assignment, {k: v for k, v in answer.items() if k != 'role'})
-        read = artifacts.require_reads(engine, run_id, role, assignment['purpose'],
-            assignment['instruction'], assignment['context'], assignment['schema'])
+        _answer_owner(engine, run_id, role, assignment, full.answer(answer))
+        read = pages.verified_reads(engine, run_id, role, review)
         old = next(r for r in review['reads'] if r['role'] == role)
         if old['handoff_id'] != read['handoff_id']:
             raise ValueError('Parameter gate follow-up lost the original role-owned artifact reads')
@@ -306,12 +306,16 @@ async def finish_hold(engine, harness, run_id, record, proposal, assignment, che
         await checkpoint(**{KEY: saved}, status='reviewing_parameter_gate_disposition')
     request = saved['vote_assignment']
     votes = {}
-    for role in ROLES:
-        if role not in saved['votes']:
-            saved['votes'][role] = await harness.ask(run_id, role, request['purpose'],
-                request['instruction'], request['context'], request['schema'])
-            await checkpoint(**{KEY: saved}, status='reviewing_parameter_gate_disposition')
-        votes[role] = await disposition_vote(engine, harness, run_id, record, saved, role, checkpoint)
+    if not saved.get('votes') or len(saved.get('votes',{})) != len(ROLES) or saved.get('full_disposition_votes'):
+        if not saved.get('full_disposition_votes'):
+            if saved.get('votes'): saved['legacy_disposition_votes']=copy.deepcopy(saved['votes'])
+            saved['full_disposition_votes']=await full.group(harness,run_id,request['purpose'],
+                request['instruction'],request['context'],request['schema'])
+            await checkpoint(**{KEY:saved},status='reviewing_parameter_gate_disposition')
+        full.authenticate_complete(engine.store,run_id,saved['full_disposition_votes'])
+        votes={v['role']:full.answer(v) for v in saved['full_disposition_votes']}
+    else:
+        votes = await _legacy_disposition_votes(engine,harness,run_id,record,saved,request,checkpoint)
     agreed = all(v['approve'] and not v['issues'] for v in votes.values())
     saved['status'] = 'blocked' if agreed else 'disputed'
     message = ('原判据处置已完成独立复核，仍有科研阻塞：' if agreed else '原判据处置仍有独立复核异议：')
@@ -322,6 +326,18 @@ async def finish_hold(engine, harness, run_id, record, proposal, assignment, che
     changed = previous_status != saved['status']
     await checkpoint(**{KEY: saved}, status='blocked_parameter_gates', rejection=message)
     if changed:
-        engine.store.event(run_id, 'experiment.parameter_gate_disposition', message,
-            {'decision_id': record['id'], 'status': saved['status'], 'execution_authorized': False})
+        engine.store.event(run_id,'experiment.parameter_gate_blocked',message,{'decision_id':record['id'],'execution_authorized':False})
     raise ResearchBlocked(message)
+
+
+async def _legacy_disposition_votes(engine,harness,run_id,record,saved,request,checkpoint):
+    votes={}
+    for role in ROLES:
+        if role not in saved['votes']:
+            saved['votes'][role] = await harness.ask(run_id, role, request['purpose'],
+                request['instruction'], request['context'], request['schema'])
+            await checkpoint(**{KEY: saved}, status='reviewing_parameter_gate_disposition')
+        votes[role] = await disposition_vote(engine, harness, run_id, record, saved, role, checkpoint)
+    return votes
+
+

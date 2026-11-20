@@ -23,6 +23,9 @@ def _original(engine, run_id, record, vote, key=None):
     role = vote['role']
     purpose = 'experiment_vote:' + record['proposal_sha256']
     answer = {k: v for k, v in vote.items() if k != 'role'}
+    if key is None and record.get('artifact_vote_page_assignments', {}).get(role):
+        requests = record['artifact_vote_page_assignments'][role]
+        key = Harness.decision_key(run_id, role, **requests[-1])
     if key is None:
         with engine.store._read_db() as db:
             rows = db.execute("SELECT key,data FROM records WHERE collection='decisions' "

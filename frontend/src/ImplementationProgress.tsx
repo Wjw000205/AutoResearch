@@ -1,7 +1,29 @@
 import { date, textOf, type Json } from './api';
+import { ArrowUpRight } from 'lucide-react';
+import './implementation-progress.css';
+import { LiveCodeReviewProgress } from './CodeReviewProgress';
 
 const statuses: Record<string, string> = { running: '进行中', paused: '已暂停', blocked: '等待处理', failed: '执行失败', cancelled: '已取消', completed: '已完成' };
 const roleNames: Record<string, string> = { director: '研究总监', engineer: '实验工程师', scout: '文献研究员' };
+
+export function wholeReviewSummary(progress: Json) {
+  const workflow = progress.workflow;
+  const value = workflow?.whole_review;
+  if (workflow?.review_mode !== 'whole_document' || value?.version !== 1 || value.binding_valid !== true
+    || value.projection_only !== true || value.scientific_approval !== false
+    || value.run_id !== progress.run_id || value.workflow_id !== workflow.id
+    || !Number.isInteger(value.revision) || !value.document_id || !value.document_sha256
+    || value.counts?.expected_reviews !== 2 || !Array.isArray(value.roles) || value.roles.length !== 2
+    || value.roles[0].role !== 'director' || value.roles[1].role !== 'scout') return null;
+  const saved = value.roles.filter((r: Json) => r.report_saved === true);
+  if (saved.some((r: Json) => !r.handoff_id || !['APPROVE', 'REQUEST_CHANGES'].includes(r.verdict))
+    || value.counts.saved_reviews !== saved.length
+    || value.counts.approved_reviews !== saved.filter((r: Json) => r.verdict === 'APPROVE').length
+    || value.counts.changes_required_reviews !== saved.filter((r: Json) => r.verdict === 'REQUEST_CHANGES').length
+    || value.complete === true && ['APPROVED', 'APPROVED_WITH_NOTES'].includes(value.outcome)
+      && value.counts.approved_reviews !== 2) return null;
+  return value;
+}
 
 function indexedReviewSummary(progress: Json) {
   const workflow = progress.workflow;
@@ -22,6 +44,13 @@ export function implementationReviewSummary(progress: Json | null | undefined, r
 } | null {
   if (!progress || progress.run_id !== runId || !['document_authoring', 'document_review'].includes(progress.phase)) return null;
   const workflow = progress.workflow;
+  if (workflow?.review_mode === 'whole_document') {
+    const value = wholeReviewSummary(progress);
+    return { version: value?.document_title?.split(/[\\/]/).pop() ?? '本轮实现文档',
+      scopes: `整篇独立审核 ${value?.counts.saved_reviews ?? 0} / 2`,
+      finals: value?.complete && value.outcome === 'REPAIR' ? '待修改，尚未通过最终验收'
+        : value?.complete && ['APPROVED', 'APPROVED_WITH_NOTES'].includes(value.outcome) ? '文档审核通过' : '等待同版本审核意见' };
+  }
   if (progress.phase === 'document_review' && !['indexed_review', 'acceptance_contract', 'definition_repair'].includes(workflow?.review_mode)) return null;
   const revision = progress.phase === 'document_authoring' ? workflow?.revision : workflow?.document_revision;
   if (!Number.isInteger(revision) || revision < 0) return null;
@@ -45,17 +74,37 @@ export function ImplementationReviewSummary({ value }: { value: NonNullable<Retu
   return <span className="implementation-review-summary"><span>{value.version} · {value.scopes}</span>{value.inherited && <span>{value.inherited}</span>}{value.finals && <span>{value.finals}</span>}</span>;
 }
 
+export function implementationPhaseLabel(progress: Json) {
+  return progress.phase === 'code_review' && progress.workflow?.review_mode === 'whole_document'
+    ? '实际代码独立审核' : progress.label;
+}
+
+export function ImplementationProgressEntry({ progress, runId, onDetails }: {
+  progress?: Json | null; runId: string; onDetails: () => void;
+}) {
+  if (!progress || progress.run_id !== runId) return null;
+  return <section className="implementation-progress-entry" aria-label="代码实现进度摘要">
+    <div><div className="implementation-entry-heading"><h3>代码实现进度</h3>
+      <span className={`implementation-pill state-${progress.run_status}`}>{statuses[progress.run_status] ?? '状态未报告'}</span></div>
+      <p>{implementationPhaseLabel(progress) || '等待进度回传'}</p>
+      <small>查看流程进度、审核意见与交付记录</small></div>
+    <button type="button" className="btn" aria-haspopup="dialog" onClick={onDetails}>查看实现详情<ArrowUpRight size={15} /></button>
+    <LiveCodeReviewProgress progress={progress} runId={runId} />
+  </section>;
+}
+
 export function ImplementationProgress({ progress, runId }: { progress?: Json | null; runId: string }) {
   if (!progress || progress.run_id !== runId) return null;
   const workflow = progress.workflow;
-  if (progress.phase === 'document_review' && !['indexed_review', 'acceptance_contract'].includes(workflow?.review_mode)) return null;
+  if (progress.phase === 'document_review' && !['indexed_review', 'acceptance_contract', 'whole_document'].includes(workflow?.review_mode)) return null;
   const authoring = progress.phase === 'document_authoring' ? progress.authoring : null;
   const indexedMode = progress.phase === 'document_review' && workflow?.review_mode === 'indexed_review';
   const whole = indexedReviewSummary(progress);
   return <section className="panel implementation-progress" aria-label="代码实现进度">
     <header><h3>代码实现进度</h3><span>{statuses[progress.run_status] ?? '状态未报告'}</span></header>
-    <h4>{progress.label}</h4><p>{progress.message}</p>
+    <div className="implementation-progress-intro"><h4>{implementationPhaseLabel(progress)}</h4><p>{progress.message}</p></div>
     {workflow?.review_mode === 'acceptance_contract' && <AcceptanceProgress value={workflow.acceptance} />}
+    {workflow?.review_mode === 'whole_document' && <WholeDocumentProgress progress={progress} />}
     {authoring && <div className="implementation-review-progress" aria-label="实现文档编写活动">
       <p><strong>{authoring.completion_phase ? '文档保存阶段' : '源文档读取与编写'}：</strong>已记录 {authoring.tool_turns} 轮工具交互</p>
       <p>本交接已保存读取回执 {authoring.read_calls} 次 · {authoring.read_documents} 个文档 · {authoring.read_sections} 个不同章节 · {authoring.read_ranges} 个不同范围</p>
@@ -77,12 +126,47 @@ export function ImplementationProgress({ progress, runId }: { progress?: Json | 
       </p>)}
       <p>三方同版本阅读完整且全部同意、原有执行门禁通过后，才派发代码。</p>
     </div>}
-    <p><strong>代码生成：</strong>{progress.code_generation_started ? '已派发，实际文件与验收记录见“代码实现与验收”。' : '尚未派发。'}</p>
-    {workflow && <p>实现尝试 {workflow.attempt_count} 次 · 当前交付文件 {workflow.file_count} 个</p>}
+    <section className="implementation-delivery-summary" aria-label="代码交付状态"><h4>代码交付</h4>
+      <p><strong>代码生成：</strong>{progress.code_generation_started ? '已派发，实际文件与验收记录见“代码实现与验收”。' : '尚未派发。'}</p>
+      {workflow && <p>实现尝试 {workflow.attempt_count} 次 · 当前交付文件 {workflow.file_count} 个</p>}
+    </section>
     {progress.block_reason && <p className="inline-warning">{progress.block_reason}</p>}
-    <p><strong>下一步：</strong>{progress.next_action}</p>
+    <p className="implementation-progress-next"><strong>下一步：</strong>{progress.next_action}</p>
     <small>最近保存：{date(progress.updated_at, true)} · 进度随研究状态自动更新</small>
   </section>;
+}
+
+export function WholeDocumentProgress({ progress }: { progress: Json }) {
+  const value = wholeReviewSummary(progress);
+  if (!value) return <p>整篇审核记录正在同步；尚无可核对的同版本结论。</p>;
+  const issues: Json[] = (progress.workflow.acceptance?.issues ?? []).filter((i: Json) =>
+    (i.document_sha256 === value.document_sha256 || i.whole_review_feedback?.document_sha256 === value.document_sha256)
+    && ['PROPOSED', 'OPEN', 'PATCHED', 'VERIFIED'].includes(i.status));
+  const verdicts: Record<string, string> = { APPROVE: '通过', REQUEST_CHANGES: '要求修改' };
+  const outcomes: Record<string, string> = { REPAIR: '待修改，尚未通过最终验收', APPROVED: '本版本文档审核通过',
+    APPROVED_WITH_NOTES: '本版本文档审核通过，保留非阻断意见', BLOCKED: '审核阻断',
+    NEEDS_PROBE: '需要补充验证', NEEDS_REPLAN: '需要重新规划' };
+  return <div className="implementation-review-progress" aria-label="总监与研究员整篇独立审核进度">
+    <h4>实现文档审核</h4>
+    <p><strong>整篇独立审核 {value.counts.saved_reviews} / 2</strong> · 通过 {value.counts.approved_reviews} 份 · 要求修改 {value.counts.changes_required_reviews} 份</p>
+    <p className="implementation-review-document">审核文档：<span>{value.document_title ?? value.document_id}</span></p>
+    <div className="implementation-review-role-list">{value.roles.map((role: Json) => <article key={role.role} className="implementation-review-opinion">
+      <header><h5>{roleNames[role.role]}</h5><span className={`implementation-pill verdict-${role.verdict ?? 'pending'}`}>{role.report_saved ? verdicts[role.verdict] : '等待意见'}</span></header>
+      {role.summary ? <details><summary>展开审核摘要</summary><p>{role.summary}</p></details>
+        : <p className="muted">尚未收齐有效意见</p>}
+    </article>)}</div>
+    <p><strong>文档验收：</strong>{value.complete ? outcomes[value.outcome] ?? '结论待同步' : '尚未收齐同版本意见'}</p>
+    {issues.length > 0 && <details open><summary>待处理修改意见（{issues.length}）</summary>
+      {issues.map(issue => <article key={issue.issue_id}>
+        <p><strong>{issue.issue_id} · {issue.severity}</strong> {issue.claim}</p>
+        <p>修改要求：{issue.minimal_fix}</p>
+        <p>修改位置：{(issue.change_locations ?? []).map((location: Json) =>
+          `${location.section_id} · 偏移 ${location.offset} · 长度 ${location.limit}`).join('；') || '见原始审核记录'}</p>
+        <p>关闭条件：{(issue.close_when ?? []).join('；')}</p>
+      </article>)}
+    </details>}
+    <p className="implementation-review-scope-note">以上意见属于标示的已提交版本；工程师修订后须重新审核，不代表新版本、代码或实验已通过。</p>
+  </div>;
 }
 
 export function AcceptanceProgress({ value }: { value: Json }) {

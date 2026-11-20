@@ -7,9 +7,10 @@ KEY = 'training_context_protocol'
 PURPOSES = {'experiment_train', 'tune', 'cycle_review', 'loss_diagnose', 'loss_propose', 'loss_vote',
             'experiment_diagnose', 'experiment_decide', 'experiment_vote', 'revise',
             'rapid_implement', 'rapid_review', 'dataset_configure', 'dataset_config_review', 'report',
-            'dataset_select', 'dataset_work_order', 'dataset_plan_review'}
+            'dataset_select', 'dataset_work_order', 'dataset_plan_review', 'dataset_project_protocol'}
 FIELDS = {
-    'research_anchor',
+    'bounded_evidence_review',
+    'research_anchor', 'tuning_point_reads',
     'benchmark_task', 'benchmark_tasks',
     KEY, 'stage', 'research_cycle', 'dataset', 'evaluation', 'primary_metric', 'direction',
     'resource_plan', 'execution_constraints', 'trial_budget', 'program', 'trial',
@@ -36,6 +37,10 @@ FIELDS = {
 
 
 def enabled(context, purpose=None):
+    if 'scientific_author_protocol' in context:
+        if context['scientific_author_protocol'] != 1:
+            raise ValueError('Unknown scientific author context protocol')
+        return True
     if context.get('dataset_transition_context_protocol') == 1:
         return str(purpose or context.get('_purpose', '')).split(':', 1)[0] in {
             'proposal', 'vote', 'amendment', 'design', 'protocol_review'}
@@ -44,6 +49,9 @@ def enabled(context, purpose=None):
 
 
 def project(context):
+    if 'scientific_author_protocol' in context:
+        from .scientific_author_materials import project as author_project
+        return author_project(context)
     if context.get('dataset_transition_context_protocol') == 1:
         from .dataset_transition import project as transition_project
         return transition_project(context)

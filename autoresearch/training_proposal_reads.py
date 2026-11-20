@@ -84,7 +84,7 @@ async def ensure_reads(engine, run_id, record, proposal, reads, context, checkpo
     from .training_investigation import validate_reads
 
     if not (context.get('experiment_decision', {}).get('training_investigation', {}).get('required')
-            or proposal.get('architecture_review')):
+            or proposal.get('architecture_review') or proposal.get('implementation_correction')):
         return reads
     if harness is not None:
         from .training_read_dispatch import ensure_reads as dispatch

@@ -187,14 +187,29 @@ def read(engine, run_id, cycle, args):
             'source': 'bounded_validation_read_projection', **_page(value[section], args)}
 
 
-def compare(engine, run_id, context, args):
+def comparison_reference(context, evidence_id):
+    """Only the primary and explicitly assigned supplemental snapshot are readable."""
     ref = context.get('validation_evidence') or {}
     from .experiment_evidence_handoff import KEY
     supplement = context.get('experiment_decision', {}).get(KEY, {}).get('evidence') or {}
-    if args['evidence_id'] == supplement.get('id'):
-        ref = supplement
-    if args['evidence_id'] != ref.get('id') or args['expected_sha256'] != ref.get('sha256'):
-        raise ValueError('Comparison is outside the frozen review evidence')
+    if evidence_id and evidence_id == supplement.get('id'):
+        if ref.get('id') == evidence_id and ref.get('sha256') != supplement.get('sha256'):
+            return None
+        return supplement
+    return ref if evidence_id and evidence_id == ref.get('id') else None
+
+
+def compare(engine, run_id, context, args):
+    ref = comparison_reference(context, args['evidence_id'])
+    if not ref or args['expected_sha256'] != ref.get('sha256'):
+        from .tool_navigation import NavigationError
+        assigned = ref or context.get('validation_evidence') or {}
+        calls = ([{'name': 'experiments.compare', 'arguments': {
+            'evidence_id': assigned['id'], 'expected_sha256': assigned['sha256'],
+            'path': '', 'offset': 0, 'limit': 4000}}]
+            if assigned.get('id') and assigned.get('sha256') else [])
+        raise NavigationError('Comparison is outside the frozen review evidence',
+                              code='frozen_evidence_identity_required', next_calls=calls)
     from .scope_read_session import verified_record
     error = 'Frozen validation comparison is missing or changed'
     record = verified_record(engine, 'experiment_evidence', args['evidence_id'], run_id, ref['sha256'], error=error)
@@ -204,20 +219,14 @@ def compare(engine, run_id, context, args):
             raise ValueError(error)
     value = record['summary']
     path = args.get('path', '')
-    if path:
-        if not path.startswith('/'):
-            raise ValueError('Comparison path must be a JSON pointer')
-        try:
-            for token in path[1:].split('/'):
-                token = token.replace('~1', '/').replace('~0', '~')
-                if isinstance(value, list):
-                    if not token.isdecimal():
-                        raise ValueError('Invalid list index')
-                    value = value[int(token)]
-                else:
-                    value = value[token]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ValueError('Comparison path does not exist') from exc
+    from .tool_navigation import pointer, NavigationError
+    try:
+        value = pointer(value, path)
+    except NavigationError as exc:
+        exc.recovery['next_calls'] = [{'name': 'experiments.compare', 'arguments': {
+            'evidence_id': ref['id'], 'expected_sha256': ref['sha256'],
+            'path': exc.recovery['parent_path'], 'offset': 0, 'limit': 4000}}]
+        raise
     return {'evidence_id': record['id'], 'sha256': record['sha256'], 'path': path,
             'source': record['provenance'], **_page(value, args)}
 
@@ -225,13 +234,22 @@ def compare(engine, run_id, context, args):
 def execute(harness, run_id, role, owner, name, args):
     context = _context(harness, run_id, role, owner, name, args)
     if name == 'experiments.status':
-        return status(harness.engine, run_id, args)
+        result = status(harness.engine, run_id, args)
+        if context.get('experiment_decision', {}).get('architecture_revision_workflow') and result.get('experiment_memory'):
+            from .proposal_request_contract import archived_diagnostic_memory
+            result['experiment_memory'] = archived_diagnostic_memory(result['experiment_memory'], result.get('rapid_revision'))
+        return result
     if name == 'experiments.cleanup':
         from .experiment_cleanup import execute as cleanup
         return cleanup(harness.engine, run_id, role, owner, context['research_cycle'], args)
     if name == 'experiments.record_notes':
         return record_notes(harness.engine, run_id, role, owner, args)
-    if name == 'experiments.read':
+    if name == 'experiments.files':
+        from .experiment_files import browse
+        if role != 'engineer' or not context.get('experiment_decision'):
+            raise ValueError('File discovery requires an engineer experiment assignment')
+        result = browse(harness.engine, run_id, context, args)
+    elif name == 'experiments.read':
         result = read(harness.engine, run_id, context['research_cycle'], args)
     elif name in {'experiments.analyze', 'experiments.inspect_module'}:
         from .experiment_analysis import analyze, inspect_module
@@ -252,14 +270,26 @@ def record_notes(engine, run_id, role, owner, args):
     valid = set()
     for row in [*inherited, *training_inherited, *progress.get('tool_results', [])]:
         call, result = row.get('call') or {}, row.get('result') or {}
-        if call.get('name') not in {'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module', 'hyperparameters.read', 'hyperparameters.revise'} or not result.get('text'):
+        if not isinstance(call, dict) or not isinstance(result, dict):
+            continue
+        if call.get('name') not in {'experiments.files', 'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module', 'hyperparameters.read', 'hyperparameters.revise'} or not result.get('text'):
             continue
         receipt = result.get('receipt_sha256')
         if receipt and receipt == sha({'call': call, 'result': {k: v for k, v in result.items() if k != 'receipt_sha256'}}):
             valid.add(receipt)
     notes = args['notes']
+    from .experiment_review_reads import note_origins
+    review_origins = note_origins(engine, run_id, role, context, {s for note in notes for s in note['receipt_sha256s']} - valid)
+    valid.update(review_origins)
     if any(not set(note['receipt_sha256s']).issubset(valid) for note in notes):
-        raise ValueError('Experiment notes require actual reads from this role and handoff')
+        from .tool_navigation import NavigationError
+        ref = context.get('validation_evidence') or {}
+        calls = ([{'name': 'experiments.compare', 'arguments': {'evidence_id': ref['id'],
+            'expected_sha256': ref['sha256'], 'offset': 0, 'limit': 4000}}]
+            if not valid and ref.get('id') and ref.get('sha256') else [])
+        raise NavigationError('Experiment notes require actual reads from this role and handoff',
+            code='note_read_receipt_required', next_calls=calls, details={'valid_receipts': sorted(valid)[-24:],
+            'action': 'Read an authorized evidence page, then cite its receipt_sha256; source hashes are not read receipts.'})
     key = run_id + ':' + owner
     def save(old):
         if old and (old['role'] != role or old['handoff_id'] != owner or old['run_id'] != run_id):
@@ -268,18 +298,26 @@ def record_notes(engine, run_id, role, owner, args):
         items = {note['key']: note for note in (old or {}).get('notes', initial)}
         items.update({note['key']: copy.deepcopy(note) for note in notes})
         if len(items) > 8:
-            raise ValueError('At most eight active notes; update existing keys to consolidate observations')
-        used_inherited = {ref for note in items.values() for ref in note['receipt_sha256s']} & {
-            row['result']['receipt_sha256'] for row in training_inherited}
+            from .tool_navigation import NavigationError
+            raise NavigationError('At most eight active notes; update existing keys to consolidate observations',
+                code='note_capacity', details={'active_limit': 8, 'existing_keys': sorted(
+                    note['key'] for note in (old or {}).get('notes', initial)),
+                    'action': 'Consolidate into existing keys; do not add a new key. Original read and note receipts remain archived.'})
+        active_receipts = {ref for note in items.values() for ref in note['receipt_sha256s']}
+        used_inherited = active_receipts & {row['result']['receipt_sha256'] for row in training_inherited}
+        prior_origins = {**(old or {}).get('retained_review_read_origins', {}), **review_origins}
+        saved_origins = {ref: hid for ref, hid in prior_origins.items() if ref in active_receipts}
         origin = ({'handoff_id': retained_handoff(context),
                    'receipt_sha256s': sorted(used_inherited), 'new_reading_credit': False}
                   if used_inherited else None)
         return {'id': key, 'run_id': run_id, 'role': role, 'handoff_id': owner,
             'notes': list(items.values()), 'scientific_approval': False,
+            **({'retained_review_read_origins': saved_origins} if saved_origins else {}),
             **({'retained_training_read_origin': origin} if origin else {}),
             'provenance': 'agent_observation_bound_to_actual_validation_reads'}
     value = engine.store.mutate('experiment_notes', key, save)
     return {'saved': True, 'notes': value['notes'], 'scientific_approval': False,
+            **({'retained_review_read_origins': value['retained_review_read_origins']} if value.get('retained_review_read_origins') else {}),
             **({'retained_training_read_origin': value['retained_training_read_origin']}
                if value.get('retained_training_read_origin') else {}),
             'provenance': value['provenance']}
@@ -398,7 +436,7 @@ def project_receipts(context):
                      and (r.get('result') or {}).get('saved') is True]
     notes = note_receipts[-1]['result']['notes'] if note_receipts else result.get('experiment_notes',{}).get('notes',[])
     noted = {ref for receipt in note_receipts for note in receipt['result']['notes'] for ref in note['receipt_sha256s']}
-    read_tools = {'experiments.status', 'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module', 'experiments.cleanup', 'hyperparameters.read', 'hyperparameters.revise'}
+    read_tools = {'experiments.files', 'experiments.status', 'experiments.read', 'experiments.compare', 'experiments.analyze', 'experiments.inspect_module', 'experiments.cleanup', 'hyperparameters.read', 'hyperparameters.revise'}
     if context.get('dataset_planning'):
         from .dataset_planning import READ_TOOLS
         read_tools |= READ_TOOLS
@@ -458,6 +496,9 @@ def project_receipts(context):
             'guidance':'This ledger shows actual source reads, not understanding or approval. Reconcile stale pending notes with later receipts; update existing note keys instead of restarting whole-file reads. Read only missing ranges or a specific unresolved detail. Independently approve or reject with concrete issues; never infer approval from coverage.'}
     if configuration_review(context):
         pending, source_reads = read_state(context, rows)
+        latest_status = next((i for i in reversed(indexes) if rows[i]['call']['name'] == 'experiments.status'), None)
+        if latest_status is not None:
+            evict.discard(latest_status)
         # The controller requires consolidation before another read batch.
         # All three results in the current batch must be visible at least once.
         evict -= set(pending[-3:])
@@ -467,6 +508,14 @@ def project_receipts(context):
         from .dataset_review_protocol import remaining_ranges
         result['dataset_configuration']['required_read_ranges'] = remaining_ranges(
             context['dataset_configuration']['changed_ranges'],source_reads)
+        followup = context['dataset_configuration'].get('review_evidence_followup')
+        if followup:
+            from .dataset_review_protocol import configuration_pages
+            digest = followup['configuration_sha256']
+            pages = followup['previous_pages'] + configuration_pages(context, rows, digest)
+            missing = remaining_ranges([{'path':'/configuration','sha256':digest,'start':0,
+                                         'end':followup['configuration_length']}], pages)
+            result['dataset_configuration']['configuration_unread'] = [[r['start'], r['end']] for r in missing]
     if notes:
         result['experiment_notes'] = {'notes': notes, 'provenance': 'agent_observations_not_independent_verification'}
     if evict:
@@ -538,7 +587,7 @@ def retained_source_reference(context, call):
 
 def archived_reread(context, progress, call):
     """Restoring evicted evidence is not a repeated action without progress."""
-    restorable = {'experiments.read', 'experiments.compare', 'experiments.inspect_module', 'hyperparameters.read'}
+    restorable = {'experiments.files', 'experiments.read', 'experiments.compare', 'experiments.inspect_module', 'hyperparameters.read'}
     if context.get('dataset_planning'):
         restorable |= {'sources.read', 'sources.links', 'datasets.discover', 'datasets.inspect', 'literature.protocols'}
     if context.get(PROTOCOL) != 1 or call.get('name') not in restorable:

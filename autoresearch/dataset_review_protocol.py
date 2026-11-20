@@ -10,6 +10,18 @@ experiment_review_evidence.source_reads 是本角色已经实际读取的源码�
 GUIDANCE += '''
 存在 prior_reading 时，只复用本角色实际读过且当前文件 SHA 完全不变的源码页及其笔记；它不是批准。required_read_ranges 列出尚需读取的区间，已有观察不足时仍可定向重读。对发生变化的文件重新核验，结合当前配置和接口证据自行给出结论。'''
 GUIDANCE += '\nissues 只列阻止本次配置审批的具体缺陷；有阻断项则 approve=false，无阻断项则 approve=true 且 issues=[]。比较解释边界、尚无运行结果及后续门禁写入 rationale。'
+ROUTING = ('\n否决时填写 blocker_kind：需要补读配置、状态或证据时用 review_evidence；'
+           '已确认必须修改交付物时用 implementation，并在 issues 中给出位置、缺陷和修改要求。')
+
+
+def routed_schema(original):
+    schema = copy.deepcopy(original)
+    if 'blocker_kind' in schema['properties']:
+        return schema
+    schema['properties']['blocker_kind'] = {'enum': ['review_evidence', 'implementation']}
+    schema.setdefault('allOf', []).append({'if': {'properties': {'approve': {'const': False}}},
+                                            'then': {'required': ['blocker_kind']}})
+    return schema
 
 
 def enabled(context):
@@ -56,8 +68,8 @@ def prepare(engine, run_id, saved):
         saved.setdefault('review_history', []).append({'context':previous,
             'instruction': saved.get('review_instruction', REVIEW),
             'schema': saved.get('review_schema', VOTE), 'votes':copy.deepcopy(saved['votes'])})
-    saved.update(review_context=context, review_instruction=REVIEW + GUIDANCE,
-        review_schema=schema, votes=[], status='reviewing')
+    saved.update(review_context=context, review_instruction=REVIEW + GUIDANCE + ROUTING,
+        review_schema=routed_schema(schema), votes=[], status='reviewing')
     engine.store.put(COLLECTION, saved['id'], saved)
 
 
@@ -69,7 +81,7 @@ def read_state(context, rows):
     noted = {s for r in notes for n in r['notes'] for s in n['receipt_sha256s']}
     noted.update(s for n in context.get('experiment_notes',{}).get('notes',[]) for s in n['receipt_sha256s'])
     config = context.get('dataset_configuration',{})
-    if config.get('review_clarification'):
+    if config.get('review_clarification') or config.get('review_evidence_followup'):
         noted.update(config.get('prior_vote',{}).get('read_receipts',[]))
     pending = []
     sources = {r['receipt_sha256']:r for r in context.get('experiment_review_evidence',{}).get('source_reads',[])
@@ -139,8 +151,8 @@ def inherited_rows(engine, run_id, role, context, _depth=0):
     return [r for r in result if r['result']['receipt_sha256'] in noted]
 
 
-def clarification(engine, run_id, saved, role, result):
-    """The same reviewer resolves contradictory approval fields, never the host."""
+def clarification(engine, run_id, saved, role, result, *, evidence=False):
+    """Bind a same-version follow-up to the requesting role's actual decision."""
     from .engine import Harness
     from .dataset_experiments import REVIEW
     from .rapid_experiment_revision import VOTE
@@ -151,10 +163,17 @@ def clarification(engine, run_id, saved, role, result):
     decision = (engine.store.get('decisions',owner) or {}).get('result')
     if decision != result:
         raise ValueError('Approval clarification requires the exact original reviewer decision')
+    if evidence:
+        candidate = saved['candidate']
+        if (result.get('candidate_sha256') != candidate['bundle']['sha256']
+                or result.get('amendment_sha256') != candidate['amendment_sha256']
+                or result.get('checks_sha256') != candidate['checks_sha256']):
+            raise ValueError('Evidence follow-up requires the same candidate, amendment and checks')
     from .rapid_experiment_revision import review_receipts
-    review_receipts(engine,run_id,saved,{'role':role,**result},base,purpose=purpose,instruction=instruction,schema=schema)
+    review_receipts(engine,run_id,saved,{'role':role,**result},base,purpose=purpose,instruction=instruction,schema=schema,
+                    require_complete=not evidence)
     context = copy.deepcopy(base)
-    context['dataset_configuration'].update(review_clarification=True, prior_vote=copy.deepcopy(result),
+    context['dataset_configuration'].update(review_clarification=not evidence, prior_vote=copy.deepcopy(result),
         prior_reading={'handoff_id':owner,'validation_evidence':base['validation_evidence'],
             'candidate_sha256':saved['candidate']['bundle']['sha256'],'approval_inherited':False,
             'final_decision_sha256':sha(result)})
@@ -166,6 +185,21 @@ def clarification(engine, run_id, saved, role, result):
         'provenance':'same_reviewer_saved_observations'}
     context['experiment_review_evidence'] = {'source_reads':[{k:r['result'][k] for k in
         ('receipt_sha256','path','source_sha256','offset','end')} for r in rows], 'scientific_approval':False}
+    if evidence:
+        from .experiment_tools import compare, status
+        ref = base['validation_evidence']
+        first = compare(engine, run_id, base, {'evidence_id': ref['id'], 'expected_sha256': ref['sha256'],
+                                               'path': '/configuration', 'limit': 1})
+        previous = configuration_pages(base, progress.get('tool_results', []), first['content_sha256'])
+        context['dataset_configuration']['review_evidence_followup'] = {
+            'configuration_sha256': first['content_sha256'], 'configuration_length': first['total_chars'],
+            'previous_pages': previous, 'status_at_dispatch': status(engine, run_id, {}),
+            'proposed_trials': saved['plan']['planned_trials']}
+        return {'purpose':purpose+':evidence-followup', 'context':context, 'schema':routed_schema(schema),
+            'instruction':instruction + ROUTING + '\n仅处理 prior_vote 的异议。沿用本角色同版本源码阅读。'
+            'configuration_unread 给出 /configuration 尚未读取的字符区间，按需用 experiments.compare 补读并记笔记。'
+            'status_at_dispatch 是宿主核验时实际的 experiments.status 返回；区分冻结前状态与 proposed_trials。'
+            '缺证据可继续用工具读取。核实后独立表决，已有异议和其他角色的票均保留。'}
     schema = copy.deepcopy(schema)
     schema.setdefault('allOf',[]).append({'if':{'properties':{'approve':{'const':True}}},'then':{'properties':{'issues':{'maxItems':0}}}})
     return {'purpose':purpose+':approval-clarification', 'context':context,'schema':schema,
@@ -190,6 +224,14 @@ def remaining_ranges(changes, indexes):
         if cursor<changed['end']:
             missing.append({**changed,'start':cursor})
     return missing
+
+
+def configuration_pages(context, rows, digest):
+    from .rapid_context import _valid
+    return [{'path': '/configuration', 'source_sha256': digest, 'offset': v['offset'], 'end': v['end']}
+            for row in rows for v in [row.get('result') or {}]
+            if row.get('call', {}).get('name') == 'experiments.compare' and _valid(context, row)
+            and v.get('path') == '/configuration' and v.get('content_sha256') == digest]
 
 
 def role_context(engine, run_id, saved, role):

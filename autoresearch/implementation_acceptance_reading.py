@@ -15,7 +15,14 @@ def gaps(engine, run_id, row, packet, criterion):
     from .implementation_reading import coverage
     scope = packet['context'][policy.CONTEXT]
     frozen = scope['required_sections'][criterion]
-    mapped = policy.required_sections(row, scope['contract'], [criterion])
+    author_ranges = packet['context'].get('implementation_document_review_scope', {}).get('endpoint_author_ranges', [])
+    if author_ranges:
+        frozen = [*frozen, *author_ranges]
+    from .implementation_endpoint_gap import KEY as gap_key, ranges as gap_ranges
+    supplemental = packet['context'].get('implementation_document_review_scope', {}).get(gap_key)
+    if supplemental and criterion in supplemental['criteria']:
+        frozen = [*frozen, *gap_ranges(packet['context'])]
+    mapped = frozen if packet['context'].get('implementation_document_review_scope') else policy.required_sections(row, scope['contract'], [criterion])
     original = coverage(engine, run_id, row['document'], required(frozen), [packet['handoff_id']])
     current = coverage(engine, run_id, row['document'], required(mapped), [packet['handoff_id']])
     return {'criterion_id': criterion, 'frozen_missing_ranges': original['missing_ranges'],
@@ -44,8 +51,17 @@ def plan(context, receipts):
     if context.get(PLAN) != 1 or policy.CONTEXT not in context:
         return None
     scope = context[policy.CONTEXT]; doc = scope['document']
-    sections = {s['id']: s for values in scope['required_sections'].values() for s in values}
+    ranges = { (s['id'], s['start'], s['end']): s for values in scope['required_sections'].values() for s in values}
+    from .implementation_document_review_scope import reading_dependencies
+    ranges.update({(s['id'], s['start'], s['end']): s for s in reading_dependencies(context)})
+    sections = {s['id']: s for s in doc['sections']}
     spans = {sid: [] for sid in sections}
+    inherited = context.get('implementation_whole_document_review', {}).get('inherited_read_index',
+                    context.get('_whole_navigation_origins', []))
+    for source in inherited:
+        if (source['document_id'], source['sha256']) == (doc['document_id'], doc['sha256']):
+            for span in source['covered_ranges']:
+                spans[span['section_id']].append((span['start'], span['end'], 'same_reviewer_submitted_origin'))
     for receipt in receipts:
         call, page = receipt.get('call', {}), receipt.get('result', {})
         args = call.get('arguments', {})
@@ -64,16 +80,41 @@ def plan(context, receipts):
             continue
         spans[sid].append((a, b, ''))
     missing, calls = [], []
-    for sid, section in sections.items():
+    for section in ranges.values():
+        sid = section['id']
         for a, b in _uncovered(section['start'], section['end'], spans[sid]):
+            spans[sid].append((a, b, 'planned'))
             missing.append({'section_id': sid, 'title': section['title'], 'start': a, 'end': b})
             for start in range(a, b, 6000):
                 calls.append({'name': 'documents.read', 'arguments': {'document_id': doc['document_id'],
-                    'expected_sha256': doc['sha256'], 'section_id': sid, 'offset': start-section['start'],
+                    'expected_sha256': doc['sha256'], 'section_id': sid, 'offset': start-sections[sid]['start'],
                     'limit': min(6000, b-start)}})
+    from .implementation_review_reads import KEY, MAX_CALLS
+    remaining_pages = len(calls)
+    # The same frozen source spans feed initial preload, continuation and
+    # final-only read navigation. Recursive views contain no scope marker.
+    sources = list(context.get('implementation_document_review_scope', {}).get('source_spans', []))
+    from .implementation_whole_review import request_enabled, KEY as WHOLE
+    whole = request_enabled(context)
+    if whole:
+        sources.extend({'document_id': d['document_id'], 'sha256': d['sha256'], 'sections': d['sections']}
+                       for d in context[WHOLE]['required_sources'])
+    for source in sources:
+        source_doc = next(d for d in context['indexed_documents']
+                          if (d['document_id'], d['sha256']) == (source['document_id'], source['sha256']))
+        view = {PLAN: 1, KEY: 1, policy.CONTEXT: {'document': source_doc,
+                                                'required_sections': {'source': source['sections']}}}
+        if inherited:
+            view['_whole_navigation_origins'] = inherited
+        source_plan = plan(view, receipts)
+        calls.extend(source_plan['next_calls'])
+        remaining_pages += source_plan['remaining_page_count']
+        missing.extend({**r, 'document_id': source_doc['document_id'], 'document_sha256': source_doc['sha256']}
+                       for r in source_plan['missing_ranges'])
+    batch_size = min(MAX_CALLS, 8) if whole else MAX_CALLS if context.get(KEY) == 1 else 3
     return {'version': 1, 'document_id': doc['document_id'], 'document_sha256': doc['sha256'],
         'missing_ranges': missing, 'missing_chars': sum(r['end']-r['start'] for r in missing),
-        'next_calls': calls[:3], 'remaining_page_count': len(calls),
+        'next_calls': calls[:batch_size], 'remaining_page_count': remaining_pages,
         'retrieval_navigation_only': True, 'scientific_approval': False,
         'instruction': '先按 next_calls 补读分配项及依赖的缺失范围。已读取范围保留原文，不重复读；'
             '清单只记录取回进度，最终仍需实际投递和批准来源证据。未核实不能给 PASS。'}

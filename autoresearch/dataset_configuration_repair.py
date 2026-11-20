@@ -95,7 +95,7 @@ def prepare(engine, run_id, saved, failure):
         from .dataset_codex import previous_files, _file_draft
         job = engine.store.get('dataset_codex_jobs', saved['codex_job_id']) or {}
         try:
-            draft = _file_draft(previous_files(job))
+            draft = _file_draft(previous_files(job), job)
         except (KeyError, ValueError):
             pass  # Incomplete files still seed the next native workspace.
     material = {k: draft.get(k) for k in ('configuration_json', 'adapter_files', 'checks', 'budget_plan') if k in draft}

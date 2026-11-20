@@ -1,0 +1,58 @@
+.implementation-progress-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 20px;
+  padding: 18px 20px;
+  border: 1px solid #dce5da;
+  border-radius: 12px;
+  background: #f7f9f5;
+  color: #293c30;
+}
+.implementation-progress-entry > div { min-width: 0; }
+.implementation-entry-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.implementation-entry-heading h3 { margin: 0; font-size: 15px; }
+.implementation-progress-entry p { margin: 7px 0 4px; line-height: 1.6; overflow-wrap: anywhere; }
+.implementation-progress-entry small { color: #687766; font-size: 12px; }
+.implementation-progress-entry > button { flex-shrink: 0; }
+.implementation-progress-entry { flex-wrap: wrap; }
+.code-review-live { flex: 1 1 100%; min-width: 0; margin-top: 14px; padding-top: 14px; border-top: 1px solid #dce5da; }
+.code-review-live > header, .code-review-counts { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px 14px; }
+.code-review-live > header { font-size: 14px; color: #2f4636; }
+.code-review-live > header > span, .code-review-counts > span { font-size: 12px; color: #63745f; }
+.code-review-live .code-review-counts { margin: 10px 0; font-size: 14px; }
+.code-review-live > progress { display: block; width: 100%; height: 7px; accent-color: #527759; }
+.code-review-roles { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 12px 0 8px; }
+.code-review-roles li { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border: 1px solid #dce5da; border-radius: 8px; background: #fff; font-size: 13px; }
+.code-review-roles strong { color: #416047; font-weight: 500; }
+.code-review-live > small { display: block; color: #687766; font-size: 12px; line-height: 1.6; }
+.implementation-sidebar .implementation-current-phase { color: #52654f; line-height: 1.6; margin: 10px 0; }
+.implementation-sidebar .implementation-reading-tabs { display: flex; flex-wrap: wrap; overflow: visible; gap: 4px; }
+.implementation-sidebar .implementation-reading-tabs button { min-height: 44px; white-space: normal; }
+.implementation-sidebar .implementation-progress { margin: 0; padding: 22px; box-shadow: none; }
+.implementation-progress-intro { padding-bottom: 16px; border-bottom: 1px solid #e3e9df; }
+.implementation-progress .implementation-review-progress { margin: 20px 0; }
+.implementation-review-document { display: flex; flex-wrap: wrap; gap: 4px 8px; color: #63735e; font-size: 13px; }
+.implementation-review-document span { min-width: 0; overflow-wrap: anywhere; }
+.implementation-review-role-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: 14px; margin: 16px 0; }
+.implementation-review-opinion { min-width: 0; padding: 16px; border: 1px solid #dfe6dc; border-radius: 10px; background: #fff; }
+.implementation-review-opinion > header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.implementation-review-opinion h5 { margin: 0; font-size: 14px; color: #293c30; }
+.implementation-review-opinion details { margin-top: 12px; }
+.implementation-review-opinion summary { padding: 8px 0; color: #45634a; cursor: pointer; font-size: 13px; line-height: 1.6; }
+.implementation-review-opinion details > p { max-width: 76ch; font-size: 14px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; color: #344537; }
+.implementation-review-opinion .verdict-APPROVE { color: #365b3d; background: #edf4e9; }
+.implementation-review-opinion .verdict-REQUEST_CHANGES { color: #7c5527; background: #fcf2e3; }
+.implementation-review-scope-note { padding: 12px 14px; border-left: 3px solid #b2bda8; background: #f5f7f2; font-size: 13px; color: #61705b; }
+.implementation-progress .implementation-delivery-summary { border-top: 1px solid #e3e9df; padding-top: 14px; margin-top: 20px; }
+.implementation-progress .implementation-progress-next { display: flex; align-items: baseline; gap: 6px; padding: 14px; margin-top: 18px; background: #f1f5ed; border-radius: 8px; overflow-wrap: anywhere; }
+.implementation-progress-next strong { flex-shrink: 0; }
+.implementation-progress :is(summary, button):focus-visible, .implementation-progress-entry button:focus-visible { outline: 2px solid #527759; outline-offset: 3px; }
+@media (max-width: 640px) {
+  .implementation-progress-entry { margin: 12px; padding: 16px; align-items: flex-start; flex-direction: column; }
+  .implementation-progress-entry > button { width: 100%; justify-content: center; }
+  .implementation-sidebar .implementation-progress { padding: 16px; }
+  .implementation-sidebar .implementation-reading-tabs button { flex: 1 1 30%; padding: 10px 8px; }
+  .implementation-progress .implementation-progress-next { flex-direction: column; }
+}

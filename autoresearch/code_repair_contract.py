@@ -6,11 +6,14 @@ whether the proposed change follows from those references.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
+
+import asyncio
 import copy
 import hashlib
 import json
 
-from .architecture_validation import operation
+from .architecture_validation import operation, once
 
 FIELD = 'code_repair_scope'
 VERSION = 1
@@ -97,7 +100,21 @@ def check_progress(state, attempt):
 def issue_id(attempt, vote, index):
     bindings = vote.get('repair_findings', [])
     existing = [r.get('origin_id') for r in bindings if r.get('issue_index') == index and r.get('origin_id')]
-    return existing[0] if len(existing) == 1 else sha({
+    if len(existing) == 1:
+        origin = existing[0]
+        siblings = [r for r in bindings if r.get('origin_id') == origin]
+        if len(siblings) == 1:
+            return origin
+        binding = next(r for r in siblings if r['issue_index'] == index)
+        # A split keeps its parent lineage, while independently routable
+        # children need distinct identities. Neither array order nor an
+        # unrelated sibling's wording belongs to a child's identity.
+        return sha({'origin_id':origin,'role':vote['role'],
+            'requirement_id':binding['requirement_id'],'disposition':binding['disposition'],
+            'issue':vote['issues'][index],'fixes':sorted(
+                ({k:f[k] for k in ('location','change','verification')} for f in vote.get('fixes',[])
+                    if f['issue_index']==index),key=lambda f:json.dumps(f,sort_keys=True))})
+    return sha({
         'delivery_hash': attempt['delivery_hash'], 'role': vote['role'],
         'vote_sha256': sha(vote), 'issue_index': index})
 
@@ -146,7 +163,7 @@ def review_schema(schema):
         'issue_index': {'type': 'integer', 'minimum': 0}, 'requirement_id': TEXT,
         'origin_id': {'anyOf': [TEXT, {'type': 'null'}]},
         'disposition': {'enum': ['repair_code', 'needs_review', 'spec_conflict', 'needs_execution', 'needs_definition']},
-        'evidence_indices': {'type': 'array', 'minItems': 1, 'uniqueItems': True,
+        'evidence_indices': {'type': 'array', 'uniqueItems': True,
             'items': {'type': 'integer', 'minimum': 0}},
         'regression': {'anyOf': [{'type': 'null'}, obj({'path': TEXT,
             'severity': {'enum': ['P0', 'P1']}, 'reason': TEXT})]}})}
@@ -157,10 +174,11 @@ def review_schema(schema):
 
 REVIEW_GUIDANCE = '''
 本轮实际代码复审按 code_repair_scope 收敛。只验收本角色的原 issue_id 与原 fixes.change/verification，
-不得追加可选优化、普通漏提问题，或借原问题提高标准。已满足或经证据反驳的问题不再列入 issues。
+不得借原问题提高标准。新发现的问题可以 needs_review、origin_id=null 报告，交独立复核后决定是否改码。
+已满足或经证据反驳的问题不再列入 issues。
 每条未解决问题返回一个 repair_findings，origin_id 使用本角色原 issue_id；change 和 verification
-逐字沿用原标准，location 可指向当前代码。evidence_indices 引用本次 code_evidence 的下标，
-requirement_id 必须一致。证据不足用 needs_review，文档冲突用 spec_conflict，均不能驱动改代码。
+忠实于原标准，可改写措辞、整理顺序，location 可指向当前代码。evidence_indices 引用本次 code_evidence 的下标。
+具体代码修改须有同验收项依据；证据不足用 needs_review，文档冲突用 spec_conflict，可留空代码引用，均不能驱动改代码。
 已有实现仅缺实际执行回执用 needs_execution；批准文档未定义必要做法用 needs_definition。
 这两类不得改写为代码缺陷、要求重复实现，或让 Codex 自行新增算法、测试标准和资源额度。
 只有本次实际改动新引入的 P0/P1 严重回归可用 origin_id=null，并给出 changed_paths 中的文件、
@@ -177,37 +195,35 @@ def validate_review(value, context, role):
         return
     if policy.get('version') != VERSION or policy.get('spec_hash') != context.get('spec_hash'):
         fail('复审范围与当前规范不一致。')
+    from .code_repair_response_correction import fail as response_error
     findings = value.get('repair_findings', [])
     if (len(findings) != len(value['issues']) or
             {r['issue_index'] for r in findings} != set(range(len(value['issues'])))):
-        fail('每条否决必须对应唯一原问题或真实严重回归。')
+        response_error('每条否决必须对应唯一原问题或真实严重回归。', value, context, role)
     allowed = {i['issue_id']: i for i in policy['issues'] if i['role'] == role}
     from .code_repair_clarification import validate_responses, FIELD as CLARIFICATION
     responses = validate_responses(value, context, role) if context.get(CLARIFICATION) else None
-    from .code_repair_response_correction import fail as response_error
-    seen = set()
     files = {i['artifact_id']: i['path'] for i in context['delivery_artifacts']}
     for row in findings:
         refs = value.get('code_evidence', [])
         if any(type(i) is not int or not 0 <= i < len(refs) for i in row['evidence_indices']):
             response_error('问题引用不存在的本轮代码依据。', value, context, role)
         selected = [refs[i] for i in row['evidence_indices']]
-        if not selected or any(e['requirement_id'] != row['requirement_id'] for e in selected):
+        from .review_response_policy import evidence_required
+        if evidence_required(row) and (not selected or any(e['requirement_id'] != row['requirement_id'] for e in selected)):
             response_error('问题与代码依据不属于同一验收项。', value, context, role)
         origin = row['origin_id']
         if origin is not None:
-            if origin not in allowed or origin in seen or row['regression'] is not None:
-                fail('问题不属于本角色待复核范围，或重复重开。')
-            seen.add(origin)
+            if origin not in allowed or row['regression'] is not None:
+                fail('问题不属于本角色待复核范围。')
             old = allowed[origin]
             if old['requirement_id'] != row['requirement_id']:
                 fail('原问题不能更换验收项。')
-            expected = sorted((f['change'], f['verification']) for f in old['fixes'])
-            actual = sorted((f['change'], f['verification']) for f in value['fixes']
-                            if f['issue_index'] == row['issue_index'])
-            if expected != actual and not (responses and responses[origin]['resolution'] == 'corrected'):
-                response_error('原问题的修改要求或验证标准发生漂移。', value, context, role)
+            # Text equality is not a semantic review. The downstream independent
+            # script/SPEC repair audits still assess the actual proposed edit.
         else:
+            if row['disposition'] != 'repair_code' and row.get('regression') is None:
+                continue  # A newly reported dependency is accepted, not an edit authorization.
             if responses is not None:
                 fail('同一代码交付的意见澄清不得新增问题。')
             regression = row.get('regression') or {}
@@ -223,8 +239,11 @@ def validate_review(value, context, role):
 PLAN_SCHEMA = obj({'source_sha256': TEXT, 'items': {'type': 'array', 'minItems': 1, 'maxItems': 90,
     'items': obj({'issue_id': TEXT, 'requirement_id': TEXT,
         'disposition': {'enum': ['repair_code', 'needs_review', 'spec_conflict', 'needs_execution', 'needs_definition']},
-        'evidence_indices': {'type': 'array', 'minItems': 1, 'uniqueItems': True,
+        'evidence_indices': {'type': 'array', 'uniqueItems': True,
             'items': {'type': 'integer', 'minimum': 0}}, 'reason': TEXT})}})
+PLAN_SCHEMA['properties']['items']['items']['allOf'] = [{
+    'if': {'properties': {'disposition': {'const': 'repair_code'}}},
+    'then': {'properties': {'evidence_indices': {'minItems': 1}}}}]
 AUDIT_SCHEMA = obj({'packet_sha256': TEXT, 'approve': {'type': 'boolean'},
     'checks': {'type': 'array', 'minItems': 1, 'maxItems': 90, 'items': obj({
         'issue_id': TEXT, 'supported': {'type': 'boolean'}, 'reason': TEXT})}})
@@ -234,7 +253,8 @@ RECEIPT_SCHEMA = obj({'repair_contract_sha256': TEXT, 'items': {
         'verification': TEXT, 'commands': {'type': 'array', 'minItems': 1, 'items': TEXT},
         'outcome': {'enum': ['passed', 'failed', 'not_run']}, 'details': TEXT})}})
 PLAN_TASK = '''逐条核对待修改意见，不编写代码、不改实现文档、不重写原 fixes。
-为每个 issue_id 选择本角色已有 code_evidence 下标和当前 acceptance_checks 的完整 requirement_id。
+为每个 issue_id 选择当前 acceptance_checks 的完整 requirement_id；具体改码引用本角色已有 code_evidence 下标，
+待复核、文档依赖和缺执行回执可留空证据下标，不必编造代码依据。
 只有批准实现条款明确要求且实际代码违背时才选择 repair_code；引用存在不代表语义支持。
 缺乏决定性原文/代码依据用 needs_review；要求与批准规范冲突或要求改变科学方案用 spec_conflict。
 原作者的建议只是待核实意见，不能凭其措辞补造要求。逐条解释为何原 change 和 verification 忠实实现原条款。
@@ -247,28 +267,45 @@ AUDIT_TASK = '''独立核对这份代码修改指令是否确实由当前批准�
 不得改计划、代码、文档或代替代码验收。任何不确定项返回 supported=false，保留原问题等待核实。'''
 
 
-@operation
+@once
 def build_source(engine, run_id, state, specification, attempt, *, votes=None, purpose=None):
     from .codex_workflow import _verify_snapshot, _frozen_spec_assignment, _digest
     from .implementation_alignment_evidence import validate_vote
     _verify_snapshot(engine, run_id, attempt['snapshot'])
     votes = attempt['review_votes'] if votes is None else votes
-    if {v['role'] for v in votes} != set(ROLES) or len(votes) != 3:
+    from . import independent_full_review as full
+    modern = full.reviewers(votes) == full.REVIEWERS
+    if not full.members(votes):
         fail('缺少同一交付的三个角色原始结论。')
     contexts = {}
     for vote in votes:
-        frozen = _frozen_spec_assignment(engine, run_id,
+        frozen = full.authenticate(engine.store, run_id, vote) if modern else _frozen_spec_assignment(engine, run_id,
             purpose or attempt.get('review_purpose') or f'code_review:{_digest(state["id"])}:{attempt["index"]}', vote['role'])
-        if not frozen or frozen['context'].get('implementation_alignment_protocol') != 1:
+        revised = modern and frozen and frozen['context'].get('code_revision_review')
+        if not frozen or not revised and frozen['context'].get('implementation_alignment_protocol') != 1:
             fail('原审核缺少不可变交接。')
         context = frozen['context']
         if (context['spec_hash'] != specification['spec_hash']
                 or context['delivery_hash'] != attempt['delivery_hash']
-                or context['implementation_document']['sha256'] != specification['document']['sha256']):
+                or not revised and context['implementation_document']['sha256'] != specification['document']['sha256']):
             fail('原意见没有绑定当前批准实现文档与代码交付。')
         # The sealed result excludes host-added role/handoff_id metadata.
-        result = {k: v for k, v in vote.items() if k not in {'role', 'handoff_id'}}
-        validate_vote(engine, run_id, vote['role'], vote['handoff_id'], result, context, delivery=True)
+        result = full.answer(vote) if modern else {k: v for k, v in vote.items() if k not in {'role', 'handoff_id'}}
+        if modern:
+            from .code_whole_review import validate_vote as whole_vote
+            whole_vote(engine, run_id, state, specification, attempt, vote)
+            if revised:
+                # Repair planning can resolve the approved sources on demand.
+                # They were not required reading for the diff review.
+                context = {**context, 'implementation_document':specification['document'],
+                    'indexed_documents':[specification['document']],
+                    'implementation_alignment_manifest_requirements':attempt['acceptance']['requirements'],
+                    'delivery_artifacts':[source for change in context['revision_material']['changes']
+                        for source in (change['before'],change['after']) if source] + [e['unchanged_source']
+                        for review in context['revision_material']['previous_reviews'] for issue in review['issues']
+                        for e in issue['original_evidence'] if e['unchanged_source']]}
+        else:
+            validate_vote(engine, run_id, vote['role'], vote['handoff_id'], result, context, delivery=True)
         contexts[vote['role']] = context
     return {'version': VERSION, 'workflow_id': state['id'], 'attempt_index': attempt['index'],
         'spec_hash': specification['spec_hash'], 'implementation_document': specification['document'],
@@ -299,7 +336,7 @@ def materialize(engine, run_id, source, proposal, *, allow_deferred=False, allow
         binding = issue.get('binding')
         if binding and (binding['disposition'] != row['disposition']
                 or binding['requirement_id'] != row['requirement_id']
-                or binding['evidence_indices'] != row['evidence_indices']):
+                or set(binding['evidence_indices']) != set(row['evidence_indices'])):
             fail('修改映射改变了原审核的问题分类或证据绑定。')
         if row['disposition'] != 'repair_code' and not allow_deferred:
             fail('存在需要补证据或与实现文档冲突的意见；不下发代码修改。')
@@ -312,7 +349,7 @@ def materialize(engine, run_id, source, proposal, *, allow_deferred=False, allow
         evidence = []
         for index in row['evidence_indices']:
             ref = refs[index]
-            if ref['requirement_id'] != row['requirement_id']:
+            if row['disposition'] == 'repair_code' and ref['requirement_id'] != row['requirement_id']:
                 fail('原修改、验收项、代码依据未对齐。')
             code = next((d for d in context['delivery_artifacts'] if d['artifact_id'] == ref['artifact_id']
                          and d['sha256'] == ref['sha256']), None)
@@ -374,7 +411,8 @@ def materialize(engine, run_id, source, proposal, *, allow_deferred=False, allow
             '不能修改批准文档、降低验收门槛或依据历史建议重写。发现矛盾立即报告，不擅自选边。'
             + DELIVERY_GUIDANCE +
             '按 repair_receipt_schema 写 repair-results.json，为每个 issue_id 提供实际变更文件、验证命令、结果和未验证项；'
-            'verification 逐字沿用原标准（多项标准用换行拼接），details 记录退出码及真实输出文件位置。'
+            'verification 描述实际核验情况，details 记录退出码及真实输出文件位置；'
+            '原 fixes.verification 仍为验收标准，不因回执改写而变化。'
             'implementation.json 的 delivery_files 必须包含 repair-results.json；它不是 runtime_files。'
             '不能伪造执行记录。'
             'repair_contract_sha256 使用修改指令指定的完整 SHA256。'
@@ -456,7 +494,7 @@ def validate_dispatch(engine, run_id, state, attempt):
     base = previous_attempt(state, attempt['index'], reviewed=True)
     packet = (base or {}).get('repair_contract')
     audits = (base or {}).get('repair_audits', [])
-    if (not packet or sha(packet) != expected or len(audits) != 2
+    if (not packet or not packet.get('items') or sha(packet) != expected or len(audits) != 2
             or {v.get('role') for v in audits} != {'director', 'scout'}):
         fail('修改指令缺少同版本的独立核对。')
     if packet.get('clarification'):
@@ -490,104 +528,6 @@ def validate_dispatch(engine, run_id, state, attempt):
         validate_audit(audit['result'], packet)
 
 
-async def prepare(engine, h, run_id, state, specification, attempt, save):
-    """Once per immutable rejection; completed decisions are replayed by Harness."""
-    source = await engine._read_consensus_check(run_id, build_source,
-        engine, run_id, state, specification, attempt)
-    engine.check_active(run_id)
-    packet = attempt.get('repair_contract')
-    if packet:
-        # Delivery/receipt corrections do not reopen an already sealed plan.
-        # Reauthenticate the actual sources and all independent votes, while
-        # preserving historical packet text even after host formatting changes.
-        if not packet.get('clarification') and packet.get('source_sha256') != sha(source):
-            fail('已保存修改清单不属于当前冻结来源。')
-        await engine._read_consensus_check(run_id, validate_dispatch, engine, run_id, state,
-            {'index': attempt['index'] + 1, 'instruction': '',
-             'instruction_sha256': hashlib.sha256(b'').hexdigest(), 'repair_contract_sha256': sha(packet)})
-        return copy.deepcopy(packet)
-    original = source
-    from .code_followup import enabled as followup_enabled, prepare as prepare_followup
-    if followup_enabled(engine, run_id, state):
-        source, proposal, clarification = await prepare_followup(
-            engine, h, run_id, state, specification, attempt, source, save)
-    else:
-        source, proposal, clarification = await _legacy_proposal(
-            engine, h, run_id, state, specification, attempt, source, save)
-    if not source['issues']:
-        return None
-    packet = await engine._read_consensus_check(run_id, materialize, engine, run_id, source, proposal,
-        allow_deferred=clarification is not None or followup_enabled(engine, run_id, state))
-    if clarification:
-        packet['clarification'] = clarification
-    return await _audit_and_save(engine, h, run_id, state, specification, attempt, original, packet, clarification, save)
-
-
-async def _legacy_proposal(engine, h, run_id, state, specification, attempt, source, save):
-    identity = sha(source)
-    # Full frozen contexts stay in SQLite; the mapper only needs source locators.
-    view = {k: v for k, v in source.items() if k != 'source_contexts'}
-    proposal = await h.ask(run_id, 'engineer', 'code_repair_map:' + identity,
-        PLAN_TASK, {'code_repair_protocol': VERSION, 'indexed_document_context': True,
-                    'source_sha256': identity, 'repair_source': view}, PLAN_SCHEMA)
-    clarification = None
-    from .code_repair_clarification import clarify, mapping_problems
-    if any(row['disposition'] != 'repair_code' for row in proposal['items']) or mapping_problems(source, proposal):
-        source, proposal, clarification = await clarify(
-            engine, h, run_id, state, specification, attempt, source, proposal, save)
-        if not source['issues']:
-            # All three original roles re-read and approved the unchanged
-            # delivery. The caller completes that delivery without a fake edit.
-            return source, proposal, clarification
-    return source, proposal, clarification
-
-
-async def _audit_and_save(engine, h, run_id, state, specification, attempt, original, packet, clarification, save):
-    from .code_repair_amendment import amend, fingerprint
-    visited = set()
-    while True:
-        mark = fingerprint(packet)
-        if mark in visited:
-            fail('定向纠正后回到了同一修改要求，停止重复审查并保留原分歧。')
-        visited.add(mark)
-        audits = []
-        instruction, context = audit_task(packet), audit_context(packet)
-        if packet.get('audit_sources'):
-            identity = sha(packet)
-            saved = engine.store.get('code_repair_packets', identity)
-            record = {'run_id': run_id, 'packet': packet}
-            if saved is not None and saved != record:
-                fail('已保存的修改清单发生变化。')
-            if saved is None:
-                engine.store.put('code_repair_packets', identity, record)
-        for role in ('director', 'scout'):
-            from .code_repair_tool_review import review
-            audit = await review(engine, h, run_id, role, packet)
-            vote = audit['result']
-            validate_audit(vote, packet, require_approval=False)
-            if any(not row['supported'] for row in vote['checks']):
-                packet = await amend(engine, h, run_id, state, attempt, packet, audit, save)
-                break
-            validate_audit(vote, packet)
-            audits.append(audit)
-        else:
-            break
-    engine.check_active(run_id)
-    # Reauthenticate sources after the async reviews and before dispatch authority.
-    current = await engine._read_consensus_check(run_id, build_source,
-        engine, run_id, state, specification, attempt)
-    if sha(current) != sha(original):
-        fail('独立核对期间原输入变化。')
-    if clarification:
-        from .code_repair_clarification import verify
-        await engine._read_consensus_check(run_id, verify,
-            engine, run_id, state, specification, attempt, original, clarification)
-    attempt['repair_contract'] = packet
-    attempt['repair_audits'] = audits
-    save()
-    return packet
-
-
 def validate_delivery(state, attempt):
     """Bind author checks and actual changed files; never treat claims as tests."""
     expected = attempt.get('repair_contract_sha256')
@@ -610,7 +550,8 @@ def validate_delivery(state, attempt):
     try:
         result = parse_json(path.read_text(encoding='utf-8'), RECEIPT_SCHEMA)
     except (ValueError, ProviderError) as exc:
-        raise ImplementationDeliveryCorrection('repair-results.json 不符合已派发的回执格式。',
+        detail = str(exc) if isinstance(exc, ProviderError) else '文件必须是 UTF-8 编码的 JSON。'
+        raise ImplementationDeliveryCorrection('repair-results.json 不符合已派发的回执格式。' + detail,
                                                diagnostic='repair_receipt_format') from exc
     known = {r['issue_id']: r for r in packet['items']}
     if (result['repair_contract_sha256'] != expected or len(result['items']) != len(known)
@@ -652,8 +593,9 @@ def validate_delivery(state, attempt):
     problems = []
     for row in result['items']:
         item = known[row['issue_id']]
-        if row['verification'] != '\n'.join(f['verification'] for f in item['fixes']):
-            fail('修改回执改变了原问题的验证标准。')
+        # The author's description is not the approved acceptance criterion.
+        # Keep both; wording differences cannot change the frozen packet or
+        # substitute for the independent host checks that follow.
         invalid = [p for p in row['changed_files'] if p not in changed or p not in after
                    or (p not in item['allowed_paths'] and p not in auxiliary
                        and p != 'implementation.json' and not test_path(p))]
@@ -669,6 +611,8 @@ def validate_delivery(state, attempt):
     return {'repair_contract_sha256': expected, 'receipt_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
         'changed_paths': sorted(changed), 'issue_ids': sorted(known),
         'author_verification': copy.deepcopy(result['items']),
+        'approved_verification': {identity: [f['verification'] for f in item['fixes']]
+                                  for identity, item in known.items()},
         'pending_issue_ids': [r['issue_id'] for r in result['items'] if r['outcome'] == 'not_run'],
         'failed_issue_ids': [r['issue_id'] for r in result['items'] if r['outcome'] == 'failed'],
         'verification_passed': False,

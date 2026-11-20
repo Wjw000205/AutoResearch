@@ -7,12 +7,30 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 
 OVERRIDE = 'AUTORESEARCH_CODEX_EXECUTABLE'
 
 
 def _installed_windows(environ):
+    # The detached Windows service doesn't inherit the desktop application's
+    # PATH. Prefer its registered package over an obsolete extracted CLI.
+    if os.name == 'nt' and environ.get('ProgramFiles'):
+        import winreg
+        registry = r'Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages'
+        packages = []
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry) as key:
+                for index in range(winreg.QueryInfoKey(key)[0]):
+                    name = winreg.EnumKey(key, index)
+                    match = re.fullmatch(r'OpenAI\.Codex_(\d+\.\d+\.\d+\.\d+)_[^_]+__2p2nqsd0c76g0', name)
+                    if match:
+                        packages.append((tuple(map(int, match[1].split('.'))), name))
+        except OSError:
+            pass
+        for _, name in sorted(packages, reverse=True):
+            yield Path(environ['ProgramFiles']) / 'WindowsApps' / name / 'app/resources/codex.exe', 'desktop_package'
     local = environ.get('LOCALAPPDATA')
     if local:
         directory = Path(local) / 'OpenAI/Codex/bin'

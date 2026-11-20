@@ -36,6 +36,14 @@ class Profile:
 
 
 def profile_for(context):
+    from .context_assembly import resolve
+    phase=resolve(context)['phase']
+    if phase in {'experiment_execution','dataset_transition'}:
+        return Profile('experiment_execution',12000,16000,0)
+    if phase in {'implementation','documents','architecture'}:
+        return Profile(phase,80000,128000,8)
+    if phase=='task':
+        return Profile('task_packet',24000,48000,4)
     from .training_context import enabled as training_context
     if training_context(context):
         return Profile('experiment_execution', 12000, 16000, 0)
@@ -135,6 +143,19 @@ def note_card(note, path, *, details):
                  if isinstance(row, dict) and set(row) - citation_fields]
     if annotated:
         card['annotated_citations'] = annotated
+    # A historical note may contain its only adverse/quantitative finding in
+    # a quotation, without a separate summary/results field. Keep those exact
+    # citations in the selected card, including when final tools are closed.
+    from .compression_safety import ADVERSE_TEXT, CONDITION_TEXT
+    citations=[]
+    for row in [*note.get('excerpts',[]),*note.get('citations',[])]:
+        quote=row.get('quote') if isinstance(row,dict) else None
+        if (not note.get('summary') and not note.get('results') and isinstance(quote,str)
+                and (ADVERSE_TEXT.search(quote) or CONDITION_TEXT.search(quote)
+                or re.search(r'\d',quote)) and row not in citations):
+            citations.append(copy.deepcopy(row))
+    if citations:
+        card['protected_citations']=citations
     anchors = [{key: row[key] for key in ('locator', 'char_start', 'char_end', 'page_number') if key in row}
                for row in note.get('excerpts', []) if isinstance(row, dict) and row.get('locator')]
     if anchors:
@@ -142,11 +163,14 @@ def note_card(note, path, *, details):
     card['archive_pointer'] = path
     card['detail_level'] = 'findings_and_method' if details else 'findings_and_gaps'
     card['historical_excerpt_text_displayed'] = False
+    if citations:
+        card['protected_excerpt_text_displayed']=True
     return card
 
 
 def catalog_view(document, artifact_id, sha, query, profile):
-    notes, papers = document.get('notes'), document.get('papers')
+    # Search/catalog indexes legitimately precede all reading notes.
+    notes, papers = document.get('notes', []), document.get('papers')
     if (not isinstance(notes, list) or not isinstance(papers, list)
             or any(not isinstance(row, dict) for row in [*notes, *papers])):
         raise ValueError('Unknown catalog shape')
@@ -343,7 +367,7 @@ def share_source_metadata(context):
         context['source_metadata_policy'] = 'Each source_metadata_ref supplies exact shared fields of its page, including verification failures and extraction limitations. Interpret these fields together; no scientific evidence was deleted.'
 
 
-def exact_text_table(result, run_id, valid_page):
+def exact_text_table(result, run_id, valid_page, *, slices=False):
     """Opportunistic lossless interning, including small working sets.
 
     Only complete, hash-verified internal JSON receipts can change from a JSON
@@ -369,7 +393,7 @@ def exact_text_table(result, run_id, valid_page):
         if isinstance(item, str) and len(item) >= 32:
             counts[item] += 1
         elif isinstance(item, dict):
-            if '$text' in item or 'shared_context_text' in item:
+            if '$text' in item or '$text_slice' in item or 'shared_context_text' in item:
                 raise ValueError('Reserved context interning key already present')
             for sub in item.values():
                 count(sub)
@@ -382,8 +406,29 @@ def exact_text_table(result, run_id, valid_page):
         count({key: item for key, item in value.items() if key != 'context_compilation'})
     except ValueError:
         return result
-    refs = {text: str(i) for i, (text, n) in enumerate(counts.items()) if n > 1}
+    # Whole-string sharing misses overlapping PDF reads and quotes embedded in
+    # pages. Slice references share only literally identical Unicode ranges;
+    # every original string is reconstructible from this very model input.
+    parents = {}
+    if slices:
+        roots = []
+        for text in sorted(counts, key=lambda text: (-len(text), text)):
+            if len(text) < 128:
+                continue
+            for parent in roots:
+                start = parent.find(text)
+                if start >= 0:
+                    parents[text] = (parent, start, start + len(text))
+                    break
+            else:
+                roots.append(text)
+    table_strings = {text for text, n in counts.items() if n > 1 and text not in parents}
+    table_strings.update(parent for parent, _, _ in parents.values())
+    refs = {text: str(i) for i,text in enumerate(sorted(table_strings))}
     def pack(item):
+        if isinstance(item, str) and item in parents:
+            parent, start, end = parents[item]
+            return {'$text_slice': [refs[parent], start, end]}
         if isinstance(item, str) and item in refs:
             return {'$text': refs[item]}
         if isinstance(item, dict):
@@ -396,6 +441,10 @@ def exact_text_table(result, run_id, valid_page):
     packed['shared_context_text_policy'] = ('LOSSLESS TEXT TABLE: every object with exactly one $text field stands for the '
         'complete verbatim string at shared_context_text[ID]. Resolve references before interpreting any ID, hash, '
         'quotation, limitation or JSON pointer. All evidence strings are present; no evidence was summarized or omitted.')
+    if parents:
+        packed['shared_context_text_policy'] += (' An object with exactly one $text_slice:[ID,start,end] field '
+            'is the verbatim Unicode substring shared_context_text[ID][start:end], zero-based, end exclusive. '
+            'Resolve it exactly as text; overlapping pages and quotations retain every character and source binding.')
     # Keep the public budget manifest directly readable; its strings are small.
     packed['context_compilation'] = result['context_compilation']
     return packed if len(encoded(packed).encode('utf-8')) < len(encoded(result).encode('utf-8')) else result
@@ -488,6 +537,13 @@ class ContextCompiler:
 
     def _build(self, run_id, active, system, hard_limit, *, estimate, valid_page, evidence_memory=None, image_tokens=0, effort=None, working_set=None):
         original = copy.deepcopy(active)
+        from .code_review_reading import PLAN, apply as reading_view, reuse_policy
+        reading_plan_present = bool(active.get('context', {}).get(PLAN))
+        active, fresh_review_receipts = reading_view(run_id, active)
+        code_reading_policy = reuse_policy(run_id, active, authenticated_plan=reading_plan_present)
+        if fresh_review_receipts and working_set:
+            working_set = copy.deepcopy(working_set)
+            working_set['consumed'] = set(working_set.get('consumed', ())) - fresh_review_receipts
         result = copy.deepcopy(active)
         context = result['context']
         profile = effort_profile(profile_for(context), effort)
@@ -606,6 +662,8 @@ class ContextCompiler:
                       'Input capacity never implies evidence approval or permission to run experiments.'}
         from .code_review_context import directory_view
         result['context'] = directory_view(result['context'])
+        from .code_reading_memory import wire_view as code_memory_wire_view
+        result['context'] = code_memory_wire_view(result['context'])
         result['context_compilation'] = manifest
         if working_set:
             manifest.update(working_set_actions=working_actions, working_set_budget_version=3,
@@ -626,6 +684,8 @@ class ContextCompiler:
                 'Committed historical records contribute exact facts, conditions and objections plus task-selected prose; originals remain expandable. '
                 'Packing targets are advisory; only configured/model input capacity blocks oversized dispatch. '
                 'Undisplayed material must be expanded before decisive judgments; no reading, consensus or execution gate is relaxed.')
+        if code_reading_policy is not None:
+            manifest['policy'] = code_reading_policy
         if image_tokens:
             manifest['image_tokens_allowance'] = image_tokens
         manifest['input_tokens'] = 0
@@ -651,7 +711,8 @@ class ContextCompiler:
                 # Known uninspected links are navigation, not scientific evidence.
                 # They retain hashes and the existing versioned sources.links tool.
                 evidence['sources'] = [source_directory_entry(row, run_id) for row in evidence['sources']]
-            interned = exact_text_table(result, run_id, valid_page)
+            interned = exact_text_table(result, run_id, valid_page,
+                                        slices=bool(working_set and profile.name == 'reading'))
             if estimate(system + encoded(interned)) < estimate(system + encoded(result)):
                 result = interned
             manifest['exact_text_table'] = 'shared_context_text' in result

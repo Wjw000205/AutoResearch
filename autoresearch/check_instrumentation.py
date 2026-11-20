@@ -1,6 +1,8 @@
 """Instrument assertions without rewriting source into the host's Python syntax."""
 import ast
 
+REQUIRE_ASSERTIONS = "if not __debug__:\n    raise RuntimeError('CPU check requires Python assertions enabled')\n"
+
 
 def split_future_prefix(source):
     """Keep author future imports before the host instrumentation preamble."""

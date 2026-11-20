@@ -5,7 +5,8 @@ import copy
 import hashlib
 import json
 import math
-from pathlib import Path
+import re
+from pathlib import Path, PureWindowsPath
 
 import yaml
 
@@ -16,6 +17,8 @@ from .tuning_scope import safe_path, configured_value
 COLLECTION = 'hyperparameter_yaml_versions'
 TOOLS = ('hyperparameters.read', 'hyperparameters.revise')
 RUNTIME_FILE = 'hyperparameters.yaml'
+YAML_ARGV = ('params.json','--config',RUNTIME_FILE)
+TASK_YAML_ARGV = ('params.json','--config','{config}')
 RECEIPT_FILE = 'hyperparameters.receipt.json'
 MAX_BYTES = 128 * 1024
 
@@ -94,8 +97,9 @@ def assign(tree, path, value):
     target[parts[-1]] = copy.deepcopy(value)
 
 
-def profile(params, capabilities=()):
-    result = {}
+def profile(params, capabilities=(), *, configuration_scope='hyperparameters'):
+    from .experiment_configuration import inputs
+    result = inputs(params) if configuration_scope == 'experiment' else {}
     for path, value in leaves(params):
         if safe_path(path): assign(result, path, value)
     for item in capabilities:
@@ -106,14 +110,24 @@ def profile(params, capabilities=()):
 
 
 def effective_profile(params, program, capabilities=()):
+    from .experiment_configuration import scope
+    configuration_scope = scope(program)
     defaults = program.get('hyperparameter_contract', {}).get('defaults', {}).get('profiles', {}).get(params['variant'], {})
-    result = copy.deepcopy(defaults)
-    for path, value in leaves(profile(params, capabilities)):
+    # An earlier dataset's defaults cannot leak into an admitted new dataset.
+    if configuration_scope == 'experiment':
+        from .fair_comparison import dimension_name
+        result = {}
+        for path, value in leaves(defaults):
+            if safe_path(path) and dimension_name(path.rsplit('/', 1)[-1]) not in {'input_length', 'output_length', 'channels'}:
+                assign(result, path, value)
+    else:
+        result = copy.deepcopy(defaults)
+    for path, value in leaves(profile(params, capabilities, configuration_scope=configuration_scope)):
         assign(result, path, value)
     return result
 
 
-def _store(engine, run_id, text, binding, *, parent=None, owner=None, evidence=None, controls=None, allowed=None):
+def _store(engine, run_id, text, binding, *, parent=None, owner=None, evidence=None, controls=None, allowed=None, persist=True):
     document = parse(text)
     checksum = hashlib.sha256(text.encode('utf-8')).hexdigest()
     body = {'binding': copy.deepcopy(binding), 'yaml_sha256': checksum, 'yaml': text,
@@ -122,13 +136,15 @@ def _store(engine, run_id, text, binding, *, parent=None, owner=None, evidence=N
             'execution_authorized': False}
     identifier = run_id + ':hyperparameters:' + sha(body)
     row = {'id': identifier, 'run_id': run_id, 'body': body, 'sha256': sha(body), 'created_at': now()}
-    engine.store.mutate(COLLECTION, identifier, lambda old: old or row)
+    if persist:
+        engine.store.mutate(COLLECTION, identifier, lambda old: old or row)
     return row
 
 
 def read_version(engine, run_id, identifier, checksum=None):
     row = engine.store.get(COLLECTION, identifier) or {}
-    if row.get('run_id') != run_id or sha(row.get('body')) != row.get('sha256'):
+    if (row.get('run_id') != run_id or sha(row.get('body')) != row.get('sha256')
+            or row.get('id') != identifier or identifier != run_id + ':hyperparameters:' + row['sha256']):
         raise ValueError('YAML version is missing, foreign or changed')
     body = row['body']
     if (hashlib.sha256(body['yaml'].encode('utf-8')).hexdigest() != body['yaml_sha256']
@@ -176,8 +192,20 @@ def revise(engine, run_id, base, args, owner):
     if set(document['profiles']) != set(old['document']['profiles']):
         raise ValueError('A revision must retain the comparison profile identities')
     for variant, tree in document['profiles'].items():
-        if any(path not in old['allowed_paths'][variant] or not safe_path(path) for path, _ in leaves(tree)):
-            raise ValueError('New YAML keys require a declared source capability, not an implicit code change')
+        from .fair_comparison import strict_equal
+        from .tuning_scope import get
+        original = dict(leaves(old['document']['profiles'][variant]))
+        for path, value in leaves(tree):
+            if path not in old['allowed_paths'][variant] or not safe_path(path) and not strict_equal(value, original.get(path)):
+                raise ValueError('New YAML keys or task changes require a separately reviewed capability/task')
+        for path, value in original.items():
+            if not safe_path(path):
+                try:
+                    unchanged = strict_equal(get(tree, path), value)
+                except (KeyError, TypeError):
+                    unchanged = False
+                if not unchanged:
+                    raise ValueError('Parameter tuning cannot change or remove YAML task settings')
     if document == old['document']: raise ValueError('YAML revision has no parameter change')
     engine.check_active(run_id)
     return _store(engine, run_id, text, old['binding'], parent=base['id'], owner=owner,
@@ -196,6 +224,14 @@ def view(row, offset=0, limit=6000):
 
 
 async def execute(harness, run_id, role, owner, name, args):
+    from .async_ownership import to_thread
+    def work():
+        harness.engine.check_active(run_id)
+        return _execute_sync(harness, run_id, role, owner, name, args)
+    return await to_thread(work)
+
+
+def _execute_sync(harness, run_id, role, owner, name, args):
     from .tool_authorization import authorize
     authorize(harness, run_id, role, owner, name, args)
     engine = harness.engine
@@ -214,7 +250,9 @@ async def execute(harness, run_id, role, owner, name, args):
         if name != TOOLS[0]: raise ValueError('YAML edits require an exact base revision')
         row = control_version(engine, run_id, evidence, ref, args['base_unit_id'], args['validation_seed'])
     if row['body']['binding'] != evidence['binding']:
-        raise ValueError('YAML version belongs to a different dataset/code/configuration')
+        from .saved_validation_configuration import admits_historical_read
+        if name != TOOLS[0] or not admits_historical_read(engine, run_id, context, evidence, row, args):
+            raise ValueError('YAML version belongs to a different dataset/code/configuration')
     if name == TOOLS[1]:
         if role != 'engineer' or not frozen.get('instruction') or not engine.store.get('handoffs', owner)['purpose'].startswith('experiment_decide:'):
             raise ValueError('Only the current engineer proposal task may revise hyperparameters')
@@ -248,7 +286,10 @@ def replay_read(engine, run_id, context, args):
                 'base_unit_id':args['base_unit_id'],'validation_seed':args['validation_seed']}]
         if len(matches)!=1:raise ValueError('YAML read has no unique saved control document')
         row=read_version(engine,run_id,matches[0]['id'])
-    if row['body']['binding']!=evidence['binding']:raise ValueError('YAML read belongs to another code/dataset')
+    if row['body']['binding'] != evidence['binding']:
+        from .saved_validation_configuration import admits_historical_read
+        if not admits_historical_read(engine, run_id, context, evidence, row, args):
+            raise ValueError('YAML read belongs to another code/dataset')
     return _view_with_schema(row,evidence,args)
 
 
@@ -272,17 +313,100 @@ def compact_sha(value):
     return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
-def prepare_trial(engine, run_id, program, params, *, use_pending=True):
+def entry_arguments(engine,run_id,program):
+    declaration=program['hyperparameter_contract'].get('contract',{}).get('entry_arguments')
+    if declaration is not None:
+        if declaration not in (['params.json'],list(YAML_ARGV),list(TASK_YAML_ARGV)): raise ValueError('Unsupported YAML entry arguments')
+        return declaration
+    # Early YAML contracts stored the invocation in the approved parameter
+    # contract and the delivered README, before a structured argv field existed.
+    workflow=engine.store.get('codex_workflows',program.get('delivery_id','')) or {}
+    if not workflow or workflow.get('run_id')!=run_id: return None
+    command='experiment.py '+' '.join(YAML_ARGV)
+    doc=next((d for d in workflow['specifications'] if d.get('approved') and d['spec_hash']==program.get('spec_hash')
+              and d['document']['sha256']==program.get('implementation_document_sha256')),None)
+    if not doc or command not in str(doc['spec'].get('parameter_contract','')): return None
+    attempt=next((a for a in workflow['attempts'] if a.get('status')=='approved' and a['delivery_hash']==program['delivery_hash']),None)
+    if not attempt: raise ValueError('YAML entry arguments require the approved delivery')
+    if (program.get('rapid_revision_id') or program.get('dataset_runtime_id')
+            or attempt['code_sha256']!=program.get('code_sha256')):
+        raise ValueError('A successor to this YAML entry point must declare its own entry_arguments')
+    from .delivery_files import io_path
+    snapshot=attempt['snapshot']
+    raw=io_path(Path(snapshot['workspace'])/'README.md').read_bytes()
+    if not any(r['path']=='README.md' and r['sha256']==hashlib.sha256(raw).hexdigest() for r in snapshot['files']):
+        raise ValueError('YAML invocation guide differs from the reviewed delivery')
+    if 'python '+command not in {line.strip() for line in raw.decode('utf-8-sig').splitlines()}:
+        raise ValueError('The approved YAML command is not confirmed in the delivery invocation guide')
+    return list(YAML_ARGV)
+
+
+def config_filename(name):
+    if (not isinstance(name,str) or not re.fullmatch(r'[\w.-]+\.ya?ml',name,re.I)
+            or name.startswith('.') or len(name)>160 or PureWindowsPath(name).is_reserved()):
+        raise ValueError('The trial config must be a portable YAML filename')
+    return name
+
+
+def config_path(name):
+    if isinstance(name,str) and name.startswith('task-inputs/'):
+        return 'task-inputs/'+config_filename(name[len('task-inputs/'):])
+    return config_filename(name)
+
+
+def task_config(engine,run_id,program,params,trial_name):
+    """Choose the CLI input from the frozen task and the reviewed configuration catalog."""
+    if program.get('hyperparameter_yaml_protocol')!=1: return None
+    argv=entry_arguments(engine,run_id,program)
+    if not argv or len(argv)==1: return None
+    if program['hyperparameter_contract'].get('contract',{}).get('entry_arguments')==list(YAML_ARGV):
+        return RUNTIME_FILE,None
+    from .benchmark_matrix import TASK_KEY
+    task_id=params.get(TASK_KEY) or trial_name
+    if not task_id: return RUNTIME_FILE,None
+    source=program['hyperparameter_contract'].get('task_configs',{}).get(task_id)
+    if source:
+        name=config_filename(Path(source['path']).name)
+    else:
+        label=task_id
+        if not params.get(TASK_KEY):
+            paths=program['hyperparameter_contract'].get('contract',{}).get('configuration_paths',{})
+            if 'dataset' in paths:
+                from .tuning_scope import get
+                label=f"{get(params,paths['dataset'])}-{task_id}"
+        stem=re.sub(r'[^\w.-]+','_',label).strip(' ._')[:128]
+        if PureWindowsPath(stem).is_reserved(): stem='task-'+sha(label)[:12]
+        elif not stem or stem!=label:
+            stem=(stem[:96] or 'task')+'-'+sha(label)[:12]
+        name=config_filename(stem+'.yaml')
+    occupied={p.casefold() for p in program['hyperparameter_contract'].get('root_yaml_files',[])}
+    target=name
+    if target.casefold() in occupied:
+        target='task-inputs/'+name
+        suffix=1
+        while target.casefold() in occupied:
+            target=f'task-inputs/{suffix}-{name[-140:]}'
+            suffix+=1
+    return target,source
+
+
+def prepare_trial(engine, run_id, program, params, *, use_pending=True, trial_name=None, legacy_cli=False, persist=True):
     if program.get('hyperparameter_yaml_protocol') != 1: return None
     from .experiment_decisions import session
     from jsonschema import validate
     contract = program['hyperparameter_contract']
     # Declared defaults exist in the immutable default YAML, not in Python.
     target = effective_profile(params, program)
+    selected=None if legacy_cli else task_config(engine,run_id,program,params,trial_name)
     state = (session(engine, run_id) or {}) if use_pending else {}
     pending = state.get('pending') or {}
     decision = engine.store.get('experiment_decisions', pending.get('decision_id','')) or {}
     spec = decision.get('proposal', {}).get('parameter_search') or {}
+    if pending.get('authorization') == 'approved_bayesian_script':
+        batch = engine.store.get('parameter_search_batches', pending['script_batch_id']) or {}
+        if not batch or batch['sha256'] != sha(batch['body']):
+            raise ValueError('Bayesian YAML manifest changed')
+        spec = batch['body']['script_admission']['point']
     if spec.get('yaml_revision_id'):
         row = read_version(engine, run_id, spec['yaml_revision_id'], spec['yaml_sha256'])
         if row['body']['document']['profiles'].get(params['variant']) != target:
@@ -291,13 +415,45 @@ def prepare_trial(engine, run_id, program, params, *, use_pending=True):
         from .python_training import code_hash
         binding = {'cycle': engine.cycle(run_id), 'code_sha256': code_hash(program), 'revision': program.get('revision',0),
                    'plan_sha256': sha(engine.experiment_plan(run_id))}
-        row = _store(engine,run_id,render({'version':1,'profiles':{params['variant']:target}}),binding,
+        text=render({'version':1,'profiles':{params['variant']:target}})
+        if selected and selected[1]:
+            from .fair_comparison import strict_equal
+            source=selected[1]
+            text=source['yaml']
+            if (hashlib.sha256(text.encode()).hexdigest()!=source['sha256']
+                    or not strict_equal(parse(text)['profiles'].get(params['variant']),target)):
+                raise ValueError('The task YAML differs from the approved invocation parameters')
+        row = _store(engine,run_id,text,binding,
                      controls={'source':'already_approved_frozen_configuration'},
-                     allowed={params['variant']:[p for p,_ in leaves(target)]})
+                     allowed={params['variant']:[p for p,_ in leaves(target)]},persist=persist)
     validate(row['body']['document'],contract['schema'])
-    return {'revision_id': row['id'], 'yaml_sha256': row['body']['yaml_sha256'], 'yaml': row['body']['yaml'],
+    receipt = {'revision_id': row['id'], 'yaml_sha256': row['body']['yaml_sha256'], 'yaml': row['body']['yaml'],
             'profile': params['variant'], 'params_sha256': sha(params),
             'effective_profile_sha256': compact_sha(target)}
+    if contract.get('contract', {}).get('configuration_scope') == 'experiment':
+        receipt['configuration_scope'] = 'experiment'
+    if selected:
+        receipt['config_file']=selected[0]
+        receipt['entry_arguments']=['params.json','--config',selected[0]]
+    elif legacy_cli and entry_arguments(engine,run_id,program)==list(YAML_ARGV):
+        receipt['entry_arguments']=list(YAML_ARGV)
+    elif legacy_cli and entry_arguments(engine,run_id,program)==list(TASK_YAML_ARGV):
+        raise ValueError('The frozen training request is missing its task-specific YAML selection')
+    return receipt
+
+
+def trial_receipt(contract):
+    if not contract:
+        return None
+    receipt={k:contract[k] for k in ('revision_id','yaml_sha256','profile','params_sha256','effective_profile_sha256')}
+    if 'config_file' in contract: receipt['config_file']=config_path(contract['config_file'])
+    if contract.get('configuration_scope') == 'experiment':
+        receipt['configuration_scope'] = 'experiment'
+    return receipt
+
+
+def receipt_bytes(contract):
+    return json.dumps(trial_receipt(contract), ensure_ascii=False).encode('utf-8')
 
 
 def stage_trial(path, contract, params):
@@ -307,9 +463,25 @@ def stage_trial(path, contract, params):
         raise ValueError('Staged YAML or approved parameter mirror changed')
     if contract['profile']!=params['variant'] or compact_sha(document['profiles'].get(params['variant']))!=contract['effective_profile_sha256']:
         raise ValueError('Staged YAML profile binding changed')
-    receipt={k:contract[k] for k in ('revision_id','yaml_sha256','profile','params_sha256','effective_profile_sha256')}
-    for name,raw in ((RUNTIME_FILE,contract['yaml'].encode()),(RECEIPT_FILE,json.dumps(receipt,ensure_ascii=False).encode())):
+    receipt=trial_receipt(contract)
+    if contract.get('configuration_scope') == 'experiment':
+        from .experiment_configuration import inputs
+        from .fair_comparison import strict_equal
+        from .tuning_scope import get
+        selected = document['profiles'][params['variant']]
+        for parameter_path, wanted in leaves(inputs(params)):
+            try:
+                matches = strict_equal(get(selected, parameter_path), wanted)
+            except (KeyError, TypeError):
+                matches = False
+            if not matches:
+                raise ValueError('Experiment YAML differs from the admitted task/configuration: ' + parameter_path)
+    for name,raw in ((receipt.get('config_file',RUNTIME_FILE),contract['yaml'].encode()),(RECEIPT_FILE,receipt_bytes(contract))):
         target=Path(path)/name
+        if target.parent!=Path(path):
+            from .deletion import _plain_path
+            _plain_path(target.parent,Path(path))
+            target.parent.mkdir(exist_ok=True)
         if target.exists() or target.is_symlink():raise ValueError('Runtime YAML control file already exists')
         target.write_bytes(raw)
     return receipt
@@ -318,10 +490,13 @@ def stage_trial(path, contract, params):
 def check_result(result, contract):
     if not contract:return []
     metadata=result.get('experiment_metadata',{})
+    envelopes=[metadata]
+    if isinstance(metadata.get('evaluation'),dict):
+        envelopes.append(metadata['evaluation'])
     return [message for key,wanted,message in (
         ('hyperparameter_yaml_sha256',contract['yaml_sha256'],'Execution did not attest the admitted YAML bytes'),
         ('effective_hyperparameters_sha256',contract['effective_profile_sha256'],'Execution did not attest the selected effective YAML profile'))
-        if metadata.get(key)!=wanted]
+        if not any(key in item for item in envelopes) or any(item[key]!=wanted for item in envelopes if key in item)]
 
 
 GUIDANCE = '''超参数通过 YAML 版本管理。先 hyperparameters.read(base_unit_id,validation_seed) 获取精确对照配置和 SHA；

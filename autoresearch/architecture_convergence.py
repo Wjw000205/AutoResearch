@@ -65,7 +65,9 @@ def objections(source, scope):
         return _objections(source)
     from .engine import digest
     rows = {}
-    for final, vote in [(True, v) for v in source.get('votes', [])] + [(False, v) for v in source.get('unit_reviews', [])]:
+    from .architecture_definition_full import FIELD as FULL
+    units=[] if FULL in source else source.get('unit_reviews',[])
+    for final, vote in [(True, v) for v in source.get('votes', [])] + [(False, v) for v in units]:
         updates = vote.get('progress', {}).get('issue_updates') if final else None
         stable_ids = {index: u['issue_id'] for u in updates or []
                       if u.get('disposition') in {'carried_forward', 'reopened'}
@@ -181,35 +183,53 @@ def assess(prior, current, *, window, author_role):
 def record(engine, run_id, scope, source, candidate):
     """Persist a separate derived receipt; historical candidates and votes stay immutable."""
     from .engine import ResearchBlocked, digest
+    from .architecture_full_review import FIELD as FULL_ARCH
+    from .architecture_definition_full import FIELD as FULL_DEF
+    from . import independent_full_review as full
+    full_source=FULL_ARCH in source or FULL_DEF in source
+    full_votes=source.get('reviews',source.get('votes',[]))
+    source_sha=digest(source)
     key = f'{run_id}:architecture-progress:{scope}:{engine.cycle(run_id)}:{source["id"]}'
+    if full_source:
+        full.authenticate_complete(engine.store,run_id,full_votes)
+        key+=':full-v1:'+full_votes[0][full.KEY]['policy']['sha256']
+        source_sha=digest({'id':source['id'],'status':source['status'],'document':source['document'],
+            'material':material(candidate,scope),'votes':full_votes})
     existing = engine.store.get(COLLECTION, key)
     if existing:
-        if existing['source_sha256'] != digest(source):
+        if existing['source_sha256'] != source_sha:
             raise ResearchBlocked('架构推进记录的原评议发生变化，不能复用停滞判断。')
         return existing
     raw_source = source
-    if scope == 'architecture' and source.get('review_recovery_protocol') == 1:
+    if scope == 'architecture' and source.get('review_recovery_protocol') == 1 and not full_source:
         from .architecture_review_recovery import effective_source
         source = effective_source(source)
     votes = source.get('reviews', source.get('votes', []))
+    if full_source:
+        full.authenticate_complete(engine.store,run_id,votes)
     issue_field = 'issues' if scope == 'architecture' else 'required_changes'
     approved = {v['role'] for v in votes if v.get('approve') is True and not v.get(issue_field)}
-    approved -= {v['role'] for v in source.get('unit_reviews', [])
-                 if v.get('approve') is not True or v.get(issue_field)}
+    if not full_source:
+        approved -= {v['role'] for v in source.get('unit_reviews', [])
+                     if v.get('approve') is not True or v.get(issue_field)}
     previous = history(engine, run_id, scope)
     current = {'id': key, 'run_id': run_id, 'cycle': engine.cycle(run_id), 'scope': scope,
-        'number': len(previous) + 1, 'source_id': source['id'], 'source_sha256': digest(raw_source),
+        'number': len(previous) + 1, 'source_id': source['id'], 'source_sha256': source_sha,
         'document': copy.deepcopy(source.get('document')), 'material': material(candidate, scope),
         'review_handoffs': [{'role': v['role'], 'handoff_id': v['handoff_id']}
                             for v in [*votes, *source.get('unit_reviews', [])] if v.get('handoff_id')],
         'status': source['status'], 'votes': copy.deepcopy(votes), 'approved_roles': sorted(approved),
         'objections': objections(source, scope), 'derived': True, 'scientific_approval': False,
         'created_at': now()}
+    if full_source:
+        current['source_hash_protocol']='independent_full_review_v1'
+        current[full.KEY]=copy.deepcopy(votes[0][full.KEY]['policy'])
+        current['review_handoffs']=[{'role':v['role'],'handoff_id':v[full.KEY]['handoff_id']} for v in votes]
     if not previous:
         current.update(issue_ledger.reconcile(None, current))
     window = engine.store.get('runs', run_id)['config'].get('architecture_stagnation_rounds', 3)
     current.update(assess(previous, current, window=window,
-                          author_role='engineer' if scope == 'architecture' else 'director'))
+                          author_role='engineer' if full_source or scope == 'architecture' else 'director'))
     engine.store.put(COLLECTION, key, current)
     engine.store.event(run_id, 'architecture.progress_recorded', current['reason'],
         {k: current[k] for k in ('scope', 'source_id', 'consecutive_no_progress', 'stalled', 'progress_roles')})

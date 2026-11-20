@@ -6,6 +6,7 @@ already dispatched requests and their original receipts keep their contract.
 from __future__ import annotations
 
 import copy
+from .code_review_reread import withheld as read_withheld
 import hashlib
 import json
 
@@ -84,7 +85,7 @@ def project(context, receipts):
             continue
         call, page = row.get('call', {}), row.get('result', {})
         if (call.get('name') not in {'documents.read', 'documents.search'}
-                or not isinstance(page, dict) or page.get('error')):
+                or not isinstance(page, dict) or page.get('error') or read_withheld(page)):
             continue
         doc = documents.get(page.get('document_id'))
         if not doc or page.get('sha256') != doc['sha256']:
@@ -231,6 +232,19 @@ def _inherited_delivery_required_ranges(context, documents):
 
 
 def _range_project(context, receipts):
+    from .implementation_whole_review import request_enabled
+    originals = receipts
+    if request_enabled(context):
+        # Presentation-only adapter: supplemental document bodies share the same
+        # window, but their immutable tool identity and receipt hashes survive.
+        receipts = copy.deepcopy(receipts)
+        for row in receipts:
+            call, page = row.get('call', {}), row.get('result', {})
+            args = call.get('arguments', {})
+            if (call.get('name') == 'materials.request_read' and args.get('kind') == 'document'
+                    and isinstance(page.get('text'), str) and not page.get('error')):
+                row['call'] = {'name': 'documents.read', 'arguments': {k: args[k] for k in
+                    ('document_id', 'expected_sha256', 'section_id', 'offset', 'limit') if k in args}}
     """Deduplicate physical source ranges without rewriting an actual receipt.
 
     Partial text lives in explicitly disposable fragments. Its parent retains
@@ -245,19 +259,30 @@ def _range_project(context, receipts):
     inherited = _inherited_delivery_required_ranges(context, documents)
     total_limit, document_limit = ((24000, 12000) if workflow and not inherited
                                    else (TOTAL_LIMIT, DOCUMENT_LIMIT))
+    from .architecture_review_budget import from_context as review_budget
+    stage_budget = review_budget(context)
+    if stage_budget:
+        total_limit, document_limit = stage_budget['total_window_chars'], stage_budget['document_window_chars']
     if retained:
         # Retain only actually read, deduplicated text from frozen versions.
         # Model input admission remains the hard limit: never silently evict
         # decisive earlier pages and ask the reviewer to read them in a loop.
         total_limit = sum(d['total_chars'] for d in documents.values())
         document_limit = max((d['total_chars'] for d in documents.values()), default=0)
+    from .implementation_whole_review import request_enabled, READ_LIMIT
+    whole_review = request_enabled(context)
+    from .independent_full_review import tool_available
+    whole_review = whole_review or tool_available(context)
+    if whole_review:
+        total_limit = document_limit = READ_LIMIT
     sources, limits = {}, {}
     for did, doc in documents.items():
         key = sha([doc.get('physical_memory_document_id', did), doc['sha256']])
         sources[did] = key
-        limit = doc['total_chars'] if retained else min(document_limit, max(0, doc['total_chars'] - 1))
+        limit = (min(document_limit, doc['total_chars']) if whole_review else
+                 doc['total_chars'] if retained else min(document_limit, max(0, doc['total_chars'] - (0 if stage_budget else 1))))
         limits[key] = min(limits.get(key, limit), limit)
-    views = copy.deepcopy(receipts)
+    views = copy.deepcopy(originals)
     used, per_document, per_source, spans = 0, {}, {}, {}
     retained_ranges = {}
     deduplicated, evicted = 0, 0
@@ -370,7 +395,7 @@ def _range_project(context, receipts):
             continue
         call, page = row.get('call', {}), row.get('result', {})
         if (not isinstance(call, dict) or call.get('name') not in {'documents.read', 'documents.search'}
-                or not isinstance(page, dict) or page.get('error')):
+                or not isinstance(page, dict) or page.get('error') or read_withheld(page)):
             continue
         doc = documents.get(page.get('document_id'))
         args = call.get('arguments', {})
@@ -437,14 +462,14 @@ def _range_project(context, receipts):
                 fragment['source_pages'] = [copy.deepcopy(p) for p in page['source_pages']
                                             if p['start'] < b and p['end'] > a]
             fragments.append(fragment)
-        views[position] = _reference(row, position)
+        views[position] = _reference(originals[position], position)
         if fragments:
             views[position]['result']['document_read_fragments'] = fragments
     metadata = {
         'version': RETAINED_VERSION if retained else RANGE_VERSION, 'text_chars': used, 'total_limit': total_limit,
         'per_document_limit': document_limit, 'per_document_chars': per_document,
         'per_source_version_chars': per_source, 'deduplicated_read_chars': deduplicated,
-        'evicted_read_chars': evicted, 'ledger_receipts': len(receipts), 'ledger_sha256': sha(receipts),
+        'evicted_read_chars': evicted, 'ledger_receipts': len(receipts), 'ledger_sha256': sha(originals),
         'visible_receipt_sha256': _visible_signature(spans),
         'scope': 'Prompt view only. document_read_fragments contain exact subsets of one archived read, '
                  'with Unicode source locators; they do not replace the original receipt or grant read credit. '

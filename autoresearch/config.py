@@ -94,8 +94,7 @@ DEFAULTS['defaults'].update({
     'evidence_semantic_enabled': True,
     'execution_archive_inline_bytes': 65536,
     'execution_archive_retention_days': None,
-    'implementation_review_strategy': 'acceptance_contract',
-    'implementation_indexed_review_protocol': 1,
+    'implementation_review_strategy': 'document_code',
     'implementation_review_max_revisions': 2,
     'implementation_review_max_seconds': 14400,
     'implementation_review_time_basis': 'policy_active_time',
@@ -127,8 +126,9 @@ def get_settings(store):
     # implementation review protocol and cannot reactivate retired dispatch.
     for name in RETIRED_IMPLEMENTATION_REVIEW_FIELDS:
         current['defaults'].pop(name, None)
-    current['defaults']['implementation_review_strategy'] = 'acceptance_contract'
-    current['defaults']['implementation_indexed_review_protocol'] = 1
+    current['defaults']['implementation_review_strategy'] = 'document_code'
+    current['defaults'].pop('implementation_indexed_review_protocol',None)
+    current['defaults'].pop('implementation_whole_document_review_protocol',None)
     current['defaults']['implementation_backend'] = 'local_codex'
     current['defaults']['implementation_review_time_basis'] = 'policy_active_time'
     for name in ('implementation_review_max_revisions', 'implementation_review_max_seconds', 'implementation_review_max_calls'):

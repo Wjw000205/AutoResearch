@@ -40,13 +40,13 @@ def split(ledger, packet, ids):
     decisions = packet['result']['decisions']
     received = [d['issue_id'] for d in decisions]
     if len(set(ids)) != len(ids) or len(set(received)) != len(received) or not set(ids) <= set(received):
-        policy.fail('总监裁决存在漏项或重复编号，不能登记或跳过问题。')
+        policy.delivery_error('总监裁决存在漏项或重复编号，不能登记或跳过问题。')
     known = [d for d in decisions if d['issue_id'] in ids]
     extra = [d for d in decisions if d['issue_id'] not in ids]
     if extra and ('additional_issues' in packet['result'] or any(
             d['issue_id'] in ledger['issues'] or d['action'] != 'OPEN'
             or d['duplicate_of'] is not None or d.get('probe_plan') is not None for d in extra)):
-        policy.fail('未登记裁决只能作为新的 OPEN 候选问题补充登记，不能引用其他轮次或授予结论。')
+        policy.delivery_error('未登记裁决只能作为新的 OPEN 候选问题补充登记，不能引用其他轮次或授予结论。')
     return known, extra
 
 
@@ -73,7 +73,7 @@ def apply_response(engine, run_id, state, row, packet, ids):
         policy.fail('候选问题必须由工程师回应。')
     responses = packet['result']['responses']
     if len(responses) != len(ids) or {r['issue_id'] for r in responses} != set(ids):
-        policy.fail('结构化回应必须覆盖全部候选问题。')
+        policy.delivery_error('结构化回应必须覆盖全部候选问题。')
     ledger = state[policy.FIELD]
     for item in responses:
         flow.validate_refs(engine, run_id, packet['handoff_id'], context, item['evidence'], current=row['document'])
@@ -120,12 +120,12 @@ def findings(engine, run_id, state, row, packet, ids, intake):
         issues = intake['result']['issues']
         by_id = {i['local_id']: i for i in issues}
         if len(by_id) != len(issues) or set(by_id) != {d['issue_id'] for d in extra}:
-            policy.fail('补充登记必须唯一保留所有新增问题。')
+            policy.delivery_error('补充登记必须唯一保留所有新增问题。')
         for item in extra:
             issue = by_id[item['issue_id']]
             if (issue['claim'] != item['reason'] or issue['evidence'] != item['evidence']
                     or issue['reopen_issue_id'] is not None or issue['needs'] != 'REPAIR'):
-                policy.fail('补充登记不能删除或改变原新增缺陷及其证据。')
+                policy.delivery_error('补充登记不能删除或改变原新增缺陷及其证据。')
         source = intake
     else:
         if intake:
@@ -152,82 +152,13 @@ def apply_primary(engine, run_id, state, row, slot, packet, intake=None):
 
 def context_for(state, row, common, ids):
     ledger = state[policy.FIELD]
-    context = flow.base_context(state, [*common['indexed_documents'], row['document']], row)
+    from .experiment_materials import carry
+    context = carry(common, flow.base_context(state, [*common['indexed_documents'], row['document']], row))
     context.update(acceptance_contract=copy.deepcopy(ledger['contract']),
         proposed_issues=[copy.deepcopy(ledger['issues'][iid]) for iid in ids],
         existing_issues=copy.deepcopy(list(ledger['issues'].values())),
         decision_records=copy.deepcopy(ledger['decision_records']))
     return context
-
-
-async def respond(engine, h, run_id, state, row, common, persist, *, supplemental=False):
-    slot = state[policy.FIELD]['rounds'][-1]
-    target = slot['supplemental'] if supplemental else slot
-    if target.get('author_response'):
-        return
-    ids = target['proposed_ids']
-    context = context_for(state, row, common, ids)
-    suffix = ':supplemental' if supplemental else ''
-    response = await flow.ask(engine, h, run_id, state,
-        f'implementation_acceptance_response:{digest(state["id"])}:{row["index"]}' + suffix, 'engineer',
-        '对每个 proposed_issues 用原文证据回应一次。接受缺陷或提交反证；不能修改文档、关闭问题或扩大范围。',
-        context, policy.obj({'responses': policy.array(policy.obj({'issue_id': {'enum': ids},
-            'response': policy.TEXT, 'evidence': policy.REFS}), len(ids), len(ids))}))
-    updated = copy.deepcopy(state)
-    apply_response(engine, run_id, updated, row, response, ids)
-    target = updated[policy.FIELD]['rounds'][-1]
-    if supplemental:
-        target = target['supplemental']
-    target['author_response'] = response
-    state[policy.FIELD] = updated[policy.FIELD]
-    persist()
-
-
-async def adjudicate(engine, h, run_id, state, row, common, persist):
-    slot = state[policy.FIELD]['rounds'][-1]
-    if not slot['proposed_ids']:
-        return
-    if not slot.get('adjudication'):
-        state[policy.FIELD]['phase'] = 'ADJUDICATE'
-        await respond(engine, h, run_id, state, row, common, persist)
-        slot = state[policy.FIELD]['rounds'][-1]
-        ids = slot['proposed_ids']
-        context = context_for(state, row, common, ids)
-        context['author_response'] = slot['author_response']['result']
-        purpose = f'implementation_acceptance_adjudication:{digest(state["id"])}:{row["index"]}'
-        packet = await flow.ask(engine, h, run_id, state, purpose, 'director', INSTRUCTION, context, schema(ids))
-        validate_decisions(engine, run_id, state, row, packet, ids)
-        _, extra = split(state[policy.FIELD], packet, ids)
-        intake = None
-        if extra:
-            context = copy.deepcopy(packet['context'])
-            context[KEY] = intake_context(packet, extra)
-            intake = await flow.ask(engine, h, run_id, state, purpose + ':intake', 'director',
-                '原裁决完整保留，但其中新增编号尚未登记。仅对 original_extra_decisions 补齐标准问题结构，'
-                '每项 local_id 原样使用 issue_id，claim 原样保留 reason，evidence 原样保留并通过 documents.read 真实读取。'
-                '按冻结合同给出 criterion_id、severity、impact、minimal_fix 和可核验 close_when。'
-                'needs=REPAIR、reopen_issue_id=null；不得遗漏、新增或改写原问题，不得修改原裁决。'
-                '这是一次补充登记，随后仍须工程师回应和正式裁决，不能授权实现或实验。',
-                context, intake_schema(extra))
-        updated = copy.deepcopy(state)
-        apply_primary(engine, run_id, updated, row, updated[policy.FIELD]['rounds'][-1], packet, intake)
-        state[policy.FIELD] = updated[policy.FIELD]
-        persist()
-    slot = state[policy.FIELD]['rounds'][-1]
-    if slot.get('supplemental') and not slot['supplemental'].get('adjudication'):
-        await respond(engine, h, run_id, state, row, common, persist, supplemental=True)
-        slot = state[policy.FIELD]['rounds'][-1]
-        supplemental = slot['supplemental']
-        ids = supplemental['proposed_ids']
-        context = context_for(state, row, common, ids)
-        context['author_response'] = supplemental['author_response']['result']
-        packet = await flow.ask(engine, h, run_id, state,
-            f'implementation_acceptance_adjudication:{digest(state["id"])}:{row["index"]}:supplemental',
-            'director', INSTRUCTION, context, schema(ids, supplemental=True))
-        updated = copy.deepcopy(state)
-        apply_supplemental(engine, run_id, updated, row, updated[policy.FIELD]['rounds'][-1], packet)
-        state[policy.FIELD] = updated[policy.FIELD]
-        persist()
 
 
 def apply_supplemental(engine, run_id, state, row, slot, packet):

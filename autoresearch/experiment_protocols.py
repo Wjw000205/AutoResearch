@@ -11,6 +11,7 @@ import json
 
 from .literature_notes import _digest, _value_in_quote, notes_view
 from .storage import now
+from .paper_protocol_fields import GUIDANCE as PAPER_FIELDS
 
 
 FIELDS = ('note_id', 'note_sha256', 'dataset', 'setting', 'parameters')
@@ -21,18 +22,20 @@ GUIDANCE = '''
 values 是原文报告的可选标量值列表，保留数值/字符串类型；evidence 引用该笔记的
 {kind:excerpts或results,index:零基索引}，原文、定位、哈希和阅读回执由宿主复制并校验。
 reported 值必须逐一见于所引摘录；not_reported/conflicting 的 values 必须为空，不能补默认值。
+conflicting 至少引用一条已校验摘录；同一摘录可包含相互冲突的原文，不按引用条数推断是否冲突。
 dataset 本身也作为 reported 参数保存，值与 dataset 字段一致。同一记录只描述同一实验设置，
 不能把不同实验表格的参数值拼为组合。用 literature.protocols 查目录/按哈希读取。
 各数据集与任务规格在设计的 benchmark_tasks 中逐项列出，引用对应 protocol_id/protocol_sha256，
-每项独立提供完整三分支参数、搜索网格、validation_seeds、final_test_seeds。
+每项独立记录协议维度、搜索网格、validation_seeds、final_test_seeds。paper_reported 模式仅执行自有模型及批准的自有消融。
 各任务的 task_dimensions 与分支 comparison_task 声明协议中的共同任务条件及实际 JSON 参数路径；
 dataset 与所有共同维度只能选择该协议已报告值，并与原文来源对应。
 根级三分支参数/网格在矩阵模式不参与执行，执行参数以各 benchmark_tasks 为准。
 未知或冲突的必要设置先定向补读；保存提取记录不代表该参数语义或科学协议已获审核通过。
-'''
+''' + PAPER_FIELDS
 
 
 def argument_schema():
+    from .dataset_contract import name_schema
     def obj(properties):
         return {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}
     text = {'type': 'string', 'minLength': 1, 'maxLength': 1200}
@@ -42,9 +45,13 @@ def argument_schema():
         'values': {'type': 'array', 'items': scalar, 'maxItems': 32, 'uniqueItems': True},
         'evidence': {'type': 'array', 'maxItems': 12, 'uniqueItems': True, 'items': obj({
             'kind': {'enum': ['excerpts', 'results']}, 'index': {'type': 'integer', 'minimum': 0, 'maximum': 11}})}})
-    return obj({'note_id': text, 'note_sha256': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
-        'dataset': text, 'setting': text,
+    schema = obj({'note_id': text, 'note_sha256': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+        'dataset': name_schema(**text), 'setting': text,
         'parameters': {'type': 'array', 'items': parameter, 'minItems': 1, 'maxItems': 64}})
+    schema['properties']['reported_baselines'] = {'type':'array','minItems':1,'maxItems':12,'items':obj({
+        'method':text, 'result_index':{'type':'integer','minimum':0,'maximum':11},
+        'header_excerpt_index':{'type':'integer','minimum':0,'maximum':11}})}
+    return schema
 
 
 def _notes(engine, run_id):
@@ -97,12 +104,21 @@ def _compile(args, notes):
                     raise ValueError(f'Parameter {name} value does not occur unchanged in cited original text')
             if name in {'input_length', 'output_length', 'channels'} and any(type(v) is not int or v <= 0 for v in values):
                 raise ValueError(f'{name} must contain reported positive integer values')
-        elif values or status == 'conflicting' and len(sources) < 2:
-            raise ValueError('Unknown/conflicting parameters have no executable values; conflicts require at least two citations')
+        elif values or status == 'conflicting' and not sources:
+            raise ValueError('Unknown/conflicting parameters have no executable values; conflicts require cited source evidence')
         parameters.append({**copy.deepcopy(parameter), 'sources': sources})
     dataset = next((p for p in parameters if p['name'] == 'dataset'), None)
     if not dataset or dataset['status'] != 'reported' or not strict_equal(dataset['values'], [args['dataset']]):
         raise ValueError('Protocol requires a reported dataset parameter matching the exact dataset')
+    for item in args.get('reported_baselines', []):
+        try:
+            cell = note['results'][item['result_index']]
+            header = note['excerpts'][item['header_excerpt_index']]
+        except IndexError as exc:
+            raise ValueError('Published baseline cell or header does not exist in its source note') from exc
+        if (cell['dataset'] != args['dataset'] or cell['setting'] != args['setting']
+                or not _value_in_quote(item['method'], header['quote']) or not _value_in_quote(cell['value'], cell['quote'])):
+            raise ValueError('Published baseline must match the method header, result cell, dataset and setting of the same note')
     return {'version': 1, **copy.deepcopy(args), 'parameters': parameters,
         **{key: note[key] for key in ('paper_id', 'source_id', 'text_sha256')},
         'provenance': 'ai_extraction_from_verified_read_passages', 'scientific_claims_verified': False}
@@ -157,10 +173,15 @@ def record(engine, run_id, **args):
 
 
 def checked(engine, run_id, protocol_id, expected_sha256, *, notes=None):
+    if protocol_id.startswith(run_id+':paper-matrix-protocol:'):
+        from .paper_matrix_design import checked as checked_group
+        return checked_group(engine,run_id,protocol_id,expected_sha256,notes)
     row = engine.store.get('experiment_protocols', protocol_id)
     if not row or row.get('id') != protocol_id or row.get('run_id') != run_id or row.get('protocol_sha256') != expected_sha256:
         raise ValueError('Experiment protocol is missing, belongs to another task or has a different SHA256')
     args = {key: copy.deepcopy(row[key]) for key in FIELDS}
+    if 'reported_baselines' in row:
+        args['reported_baselines'] = copy.deepcopy(row['reported_baselines'])
     args['parameters'] = [{k: v for k, v in p.items() if k != 'sources'} for p in args['parameters']]
     payload = _compile(args, _notes(engine, run_id) if notes is None else notes)
     if _digest([run_id, payload]) != expected_sha256 or any(row.get(k) != v for k, v in payload.items()):
@@ -174,6 +195,10 @@ def inspect(engine, run_id, *, protocol_id=None, note_id=None, expected_sha256=N
         raise ValueError('Read either a protocol or its source note, not both')
     if note_id:
         note = notes.get(note_id)
+        from .experiment_workflow import sha as record_digest
+        if note and expected_sha256 == record_digest(note) and expected_sha256 != note['note_sha256']:
+            raise ValueError('This is the archived note record hash, not the literature read key. '
+                             'Use note_sha256=' + note['note_sha256'] + ' for this note_id.')
         if not note or not expected_sha256 or note['note_sha256'] != expected_sha256:
             raise ValueError('Source note is missing or differs from expected_sha256')
         return {'note_id': note_id, **{k: copy.deepcopy(note[k]) for k in (
@@ -203,5 +228,11 @@ def resolve_design(engine, run_id, design):
     if 'benchmark_tasks' not in design:
         return None
     notes = _notes(engine, run_id)
-    return {task['protocol_id']: checked(engine, run_id, task['protocol_id'], task['protocol_sha256'], notes=notes)
-            for task in design['benchmark_tasks']}
+    resolved = {}
+    for task in design['benchmark_tasks']:
+        identifier, expected = task['protocol_id'], task['protocol_sha256']
+        if identifier not in resolved:
+            resolved[identifier] = checked(engine, run_id, identifier, expected, notes=notes)
+        elif resolved[identifier]['protocol_sha256'] != expected:
+            raise ValueError('A benchmark matrix references conflicting versions of the same protocol')
+    return resolved

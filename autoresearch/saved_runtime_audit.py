@@ -47,8 +47,10 @@ def trial_audit(store, run_id, trial_id):
     if not folder.is_relative_to(root):
         raise ValueError('Audit path is outside the original trial')
     _plain_path(folder, store.path.parent.resolve())
+    from .hyperparameter_yaml import RUNTIME_FILE,config_path
+    filename=config_path((record.get('limits',{}).get('hyperparameter_yaml') or {}).get('config_file',RUNTIME_FILE))
     names = ['artifacts/best.pt', 'artifacts/result.json', 'artifacts/model_provenance.json',
-        'artifacts/training_log.json', 'params.json', 'hyperparameters.yaml',
+        'artifacts/training_log.json', 'params.json', filename,
         'hyperparameters.receipt.json', 'environment.json', 'dataset_runtime/training.py',
         'dataset_runtime/adapter.py', 'dataset_runtime/hyperparameters.py',
         'src/training/checkpoints.py', 'src/models/factory.py', 'src/data/dataset.py',
@@ -65,7 +67,7 @@ def trial_audit(store, run_id, trial_id):
     result, provenance = read('artifacts/result.json'), read('artifacts/model_provenance.json')
     log, params = read('artifacts/training_log.json'), read('params.json')
     receipt, environment = read('hyperparameters.receipt.json'), read('environment.json')
-    profile = yaml.safe_load((folder / 'hyperparameters.yaml').read_text(encoding='utf8'))['profiles'][params['variant']]
+    profile = yaml.safe_load((folder / filename).read_text(encoding='utf8'))['profiles'][params['variant']]
     # Restricted unpickler and CPU storage only; no model construction or restore.
     state = torch.load(folder / 'artifacts/best.pt', map_location='cpu', weights_only=True)
     descriptors = {}
@@ -97,7 +99,7 @@ def trial_audit(store, run_id, trial_id):
     checks = {
         'host_params_match_record': params == record['params'],
         'host_params_digest_matches_receipt': sha(params) == receipt['params_sha256'] == environment['params_sha256'],
-        'yaml_file_matches_receipt': files['hyperparameters.yaml'] == receipt['yaml_sha256'],
+        'yaml_file_matches_receipt': filename==receipt.get('config_file',RUNTIME_FILE) and files[filename] == receipt['yaml_sha256'],
         'yaml_profile_matches_receipt': compact_sha(profile) == receipt['effective_profile_sha256'],
         'host_environment_binds_receipt': environment['hyperparameter_yaml'] == receipt,
         'optimizer_values_match_loaded_yaml': actual == expected,
@@ -281,7 +283,7 @@ def overview(value):
         'execution_authorized':False,'scientific_approval':False}
 
 
-def missing_pages(engine, run_id, context, rows):
+def missing_pages(engine, run_id, context, rows, carried=()):
     """Coverage comes from authenticated exact pages, never an answer's assertion."""
     requested=context.get('experiment_decision',{}).get('training_investigation',{}).get(KEY)
     if not requested:return []
@@ -293,6 +295,11 @@ def missing_pages(engine, run_id, context, rows):
         raise ValueError('Runtime audit reading evidence changed')
     texts={p:encoded(_pointer(record['summary'],p)) for p in requested['required_paths']}
     spans={p:[] for p in texts}
+    for item in carried:
+        path = item['key']
+        if (item['kind'] == 'evidence' and path in spans and item['total_chars'] == len(texts[path])
+                and item['sha256'] == sha(_pointer(record['summary'], path))):
+            spans[path].extend((start, end) for start, end in item['ranges'])
     for row in rows:
         call,result=row.get('call',{}),row.get('result',{})
         args=call.get('arguments',{});path=args.get('path');start,end=result.get('offset'),result.get('end')
@@ -325,7 +332,7 @@ class MissingRuntimeAuditReads(ValueError):
                          + str(list(dict.fromkeys(p['path'] for p in pages))))
 
 
-def require_reads(engine, run_id, context, rows):
-    pages = missing_pages(engine, run_id, context, rows)
+def require_reads(engine, run_id, context, rows, carried=()):
+    pages = missing_pages(engine, run_id, context, rows, carried)
     if pages:
         raise MissingRuntimeAuditReads(pages)

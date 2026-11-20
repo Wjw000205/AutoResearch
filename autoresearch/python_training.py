@@ -26,20 +26,23 @@ def jobs(plan, stage, transport=None):
             raise ValueError('Comparison transport v1 does not support a benchmark matrix')
         return benchmark_matrix.jobs(plan, stage)
     if transport:
+        if plan.get('baseline_mode') == 'paper_reported':
+            raise ValueError('An external paper score cannot be a local comparison transport producer')
         from .comparison_transport import ordered_validation
         rows = ordered_validation(plan, transport['contract'])
         return rows[:2] if stage == 'experiments' else rows[2:]
     rows = []
+    variants = ('proposed',) if plan.get('baseline_mode') == 'paper_reported' else ('baseline', 'proposed')
     pairs = enumerate(plan['validation_pairs'])
     for index, pair in pairs:
-        for variant in ('baseline', 'proposed'):
+        for variant in variants:
             name = f'initial-{variant}' if index == 0 else f'grid-{index}-{variant}'
             rows.append((name, {**pair[variant], 'phase': 'validation',
                                 'seed': pair.get('seed', plan['selection_seed'])}))
     for index, params in enumerate(plan.get('ablation_candidates', [plan['ablation_params']])):
         rows.append(('ablation' if index == 0 else f'ablation-{index}',
             {**params, 'phase': 'validation', 'seed': params.get('seed', plan['selection_seed'])}))
-    return rows[:2] if stage == 'experiments' else rows[2:]
+    return rows[:len(variants)] if stage == 'experiments' else rows[len(variants):]
 
 
 def packet(engine, run_id, trial_name, params):
@@ -58,6 +61,10 @@ def packet(engine, run_id, trial_name, params):
     from .dataset_configuration_queue import budget as dataset_budget
     budget = dataset_budget(engine.store, run_id)
     pending = (session(engine, run_id) or {}).get('pending') or {}
+    from .hyperparameter_yaml import task_config
+    config=task_config(engine,run_id,program,params,trial_name)
+    trial={'name':trial_name,'params':copy.deepcopy(params)}
+    if config: trial['entry_arguments']=['params.json','--config',config[0]]
     return {KEY: 1, 'experiment_workflow_protocol': 1, 'stage': run['stage'], 'research_cycle': engine.cycle(run_id),
         'experiment_memory': recall(engine, run_id),
         **({'experiment_batch': {k: pending[k] for k in ('unit_id', 'decision_id', 'proposal_sha256')}} if pending else {}),
@@ -74,7 +81,7 @@ def packet(engine, run_id, trial_name, params):
         'program': {**{k: program[k] for k in ('artifact_id', 'delivery_id', 'delivery_hash',
             'spec_hash', 'implementation_document_sha256', 'dependencies') if k in program},
             'code_sha256': code_hash(program), 'revision': program.get('revision', 0)},
-        'trial': {'name': trial_name, 'params': copy.deepcopy(params)}}
+        'trial': trial}
 
 
 def arguments(context):
@@ -99,6 +106,9 @@ async def execute(harness, run_id, role, handoff_id, args):
     engine.check_active(run_id)
     await engine._read_consensus_check(run_id, engine._execution_gate, run_id)
     current = packet(engine, run_id, context['trial']['name'], context['trial']['params'])
+    legacy_cli='entry_arguments' in current['trial'] and 'entry_arguments' not in context['trial']
+    if legacy_cli:
+        current['trial'].pop('entry_arguments')
     # Harness preparation may carry internal protocol metadata, but cannot
     # broaden the execution contract beyond this persisted packet.
     if any(current[key] != context.get(key) for key in current
@@ -118,7 +128,8 @@ async def execute(harness, run_id, role, handoff_id, args):
         candidates.update(search_jobs(engine, run_id, plan))
     if candidates.get(args['trial_name']) != params or params.get('phase') != 'validation':
         raise ResearchBlocked('Python training parameters are outside the approved stage plan')
-    result = await engine._trial(run_id, harness, args['trial_name'], copy.deepcopy(params))
+    result = await engine._trial(run_id, harness, args['trial_name'], copy.deepcopy(params),
+                                **({'legacy_cli':True} if legacy_cli else {}))
     # Keep the full runner record and logs in experiments. Only measured validation
     # scalars and identifiers enter the next model request (never arrays/stdout).
     return {'trial_id': result['id'], 'status': result['status'],
@@ -157,6 +168,10 @@ async def run(engine, harness, run_id, trial_name, params):
     context = packet(engine, run_id, trial_name, params)
     purpose = f'experiment_train:{context["research_cycle"]}:{context["stage"]}:{trial_name}'
     key = harness.decision_key(run_id, 'engineer', purpose, GUIDANCE, context, FINAL)
+    if 'entry_arguments' in context['trial'] and not engine.store.get('handoff_inputs',key):
+        legacy={**context,'trial':{k:v for k,v in context['trial'].items() if k!='entry_arguments'}}
+        old_key=harness.decision_key(run_id,'engineer',purpose,GUIDANCE,legacy,FINAL)
+        if engine.store.get('handoff_inputs',old_key): context,key=legacy,old_key
     reply = await harness.ask(run_id, 'engineer', purpose, GUIDANCE, context, FINAL)
     result = completed(engine, run_id, key, reply)
     from .training_adjustment import after_trial

@@ -16,9 +16,15 @@ def resume_blockers(run, revision, definition):
             or definition.get('run_id') != run.get('id') or definition.get('cycle') != cycle):
         return ['Current definition review binding is missing or belongs to another cycle']
     status = definition.get('status')
-    if status in {'rejected', 'blocked'}:
+    from .architecture_definition_full import FIELD as FULL
+    from . import independent_full_review as full_review
+    full_policy=definition.get(FULL)
+    if full_policy is not None and (not isinstance(full_policy,dict) or full_policy.get('version')!=1):
+        return problems+['Unknown complete definition review protocol']
+    expected_roles=full_review.REVIEWERS if full_policy else full_review.LEGACY_REVIEWERS
+    if status in {'rejected', 'blocked'} and not full_policy:
         problems.append('Current definition candidate has a terminal veto or unresolved definition gate')
-    elif status not in {'prepared', 'drafting', 'reviewing', 'approved'}:
+    elif status not in {'prepared', 'drafting', 'reviewing', 'approved','rejected','blocked'}:
         problems.append('Current definition status does not identify a resumable original handoff')
     votes = definition.get('votes', [])
     if not isinstance(votes, list):
@@ -34,7 +40,7 @@ def resume_blockers(run, revision, definition):
             continue
         valid_votes.append(vote)
         role = vote.get('role')
-        if not isinstance(role, str) or role not in {'director', 'engineer', 'scout'} or role in seen:
+        if not isinstance(role, str) or role not in expected_roles or role in seen:
             problems.append('Current definition votes have duplicate or unknown roles')
         if isinstance(role, str):
             seen.add(role)
@@ -44,8 +50,10 @@ def resume_blockers(run, revision, definition):
             problems.append('Current definition vote conclusion is malformed')
         if vote.get('document_sha256') != document_sha:
             problems.append('Current definition vote refers to a different document version')
-    full = seen == {'director', 'engineer', 'scout'} and len(valid_votes) == len(votes) == 3
-    if full and any(vote.get('approve') is not True or vote.get('required_changes') for vote in valid_votes):
+    full = seen == set(expected_roles) and len(valid_votes) == len(votes) == len(expected_roles)
+    if full_policy and votes and not full_review.members(votes):
+        problems.append('Complete definition reviews have mixed or invalid frozen policies')
+    if full and not full_policy and any(vote.get('approve') is not True or vote.get('required_changes') for vote in valid_votes):
         problems.append('All independent opinions are saved and the current definition has not passed')
     if status == 'approved' and not full:
         problems.append('Approved definition is missing its three independent opinions')

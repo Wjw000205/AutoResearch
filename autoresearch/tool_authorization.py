@@ -456,5 +456,9 @@ def authorize(harness, run_id, role, owner, name, arguments):
         if pending is not None and not isinstance(pending, list):
             _fail('Frozen pending tool batch is invalid')
     _validate(schema, name, arguments, pending, version=version)
+    if controller is None and 'code_review_reread_protocol' in context and name in harness.executable_tools(role):
+        from .code_review_reread import validate as validate_reread
+        validate_reread(harness.engine, run_id, role, owner, frozen['context'], prepared,
+                        progress, name, arguments)
     return {'handoff_id': owner, 'run_id': run_id, 'role': role, 'purpose': purpose,
             'source': source, 'tool_contract_version': version, 'context': copy.deepcopy(context)}

@@ -26,6 +26,14 @@ def current(job):
     return job['continuations'][-1] if job.get('continuations') else job
 
 
+def continuation_instruction(job, successor):
+    text = job['instruction'] + '\n\n' + CONTINUE
+    if successor.get('hash_policy_version') == 1:
+        from .request_hash_policy import instruction
+        text = instruction(text)
+    return text
+
+
 def _bound(receipt, run_id, work, workspace, project_root, model, effort):
     identity = {'run_id': run_id, 'operation_id': work['operation_id'],
         'workspace': str(workspace.resolve()), 'project_root': str(project_root.resolve()),
@@ -82,7 +90,14 @@ async def run(engine, harness, run_id, job, save, verify, *, label):
     from .local_codex import LocalCodexClient
     workspace, root = Path(job['workspace']), engine.run_dir(run_id).resolve()
     config = engine.store.get('runs', run_id)['config']
-    model, effort = config.get('codex_model') or None, config.get('codex_reasoning_effort') or None
+    from . import code_model_migration as worker_models
+    verify()
+    original_profile = copy.deepcopy(job.get(worker_models.FIELD))
+    worker_models.bind_job(engine, run_id, job)
+    if job.get(worker_models.FIELD) != original_profile:
+        save()  # Freeze the exact job/profile before native dispatch.
+    selected = worker_models.job_profile(engine, run_id, job, work=current(job))
+    model, effort = selected['model'] or None, selected['effort'] or None
     blocked = tuple(p['api_key_env'] for p in getattr(harness.intelligence, 'settings', {}).get('providers', [])
                     if p.get('api_key_env'))
     client = getattr(engine, 'codex_client', None) or LocalCodexClient(
@@ -100,12 +115,13 @@ async def run(engine, harness, run_id, job, save, verify, *, label):
                     or source.get('status') not in {'interrupted', 'failed'}
                     or successor.get('source_operation_id') != previous['operation_id']
                     or successor.get('thread_id') != source.get('thread_id')
-                    or successor.get('instruction') != job['instruction'] + '\n\n' + CONTINUE
+                    or successor.get('instruction') != continuation_instruction(job, successor)
                     or not successor.get('operation_id') or successor['operation_id'] in identifiers):
                 raise ResearchBlocked(f'{label}续接记录的原回合、指令或检查点绑定发生变化。')
             identifiers.add(successor['operation_id'])
             previous = successor
         work = current(job)
+        worker_models.job_profile(engine, run_id, job, work=work)
         checkpoint = work.get('checkpoint')
         if checkpoint and checkpoint.get('status') == 'completed':
             return copy.deepcopy(checkpoint)
@@ -136,6 +152,7 @@ async def run(engine, harness, run_id, job, save, verify, *, label):
             model=model, effort=effort, on_progress=progress,
             check_active=lambda: engine.check_active(run_id), reasoning_only=False)
         progress(receipt)
+        worker_models.job_profile(engine, run_id, job, work=work)
         if receipt.get('status') == 'completed':
             return receipt
         engine.check_active(run_id)
@@ -148,7 +165,8 @@ async def run(engine, harness, run_id, job, save, verify, *, label):
                 raise ResearchBlocked(f'{label}已达到配置的代码交付次数上限（{maximum}）；原回执和文件已保留。')
             verify()
             successor = {'operation_id': uid(), 'thread_id': receipt['thread_id'],
-                'instruction': job['instruction'] + '\n\n' + CONTINUE,
+                'instruction': continuation_instruction(job, {'hash_policy_version': 1}),
+                'hash_policy_version': 1,
                 'source_operation_id': work['operation_id'], 'source_checkpoint': copy.deepcopy(receipt),
                 'source_checkpoint_sha256': sha(receipt), 'reason': reason or 'explicit_resume',
                 'created_at': now()}

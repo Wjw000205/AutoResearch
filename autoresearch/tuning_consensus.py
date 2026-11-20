@@ -23,16 +23,25 @@ def issues(votes, error=None):
     return [{**v, 'id': sha([i, v])} for i, v in enumerate(result)]
 
 
-def contract(items, source_sha):
-    return obj({'source_sha256': {'const': source_sha}, 'objective': TEXT,
+def contract(items, source_sha, *, assign_readers=False):
+    schema = obj({'source_sha256': {'const': source_sha}, 'objective': TEXT,
         'resolutions': {'type': 'array', 'minItems': len(items), 'maxItems': len(items), 'items': obj({
             'issue_id': {'enum': [v['id'] for v in items]},
             'kind': {'enum': ['clarify', 'revise', 'inspect_evidence']},
             'instruction': TEXT, 'acceptance_check': TEXT})},
         'execution_authorized': {'const': False}})
+    if assign_readers:
+        step = schema['properties']['resolutions']['items']
+        step['properties']['reader_roles'] = {'type': 'array', 'minItems': 1, 'uniqueItems': True,
+            'items': {'enum': ['director', 'engineer', 'scout']}}
+        step['properties']['save_notes'] = {'type': 'boolean'}
+        step['allOf'] = [{'if': {'properties': {'kind': {'const': 'inspect_evidence'}}},
+                          'then': {'required': ['reader_roles', 'save_notes']}, 'else': {'not': {
+                              'anyOf': [{'required': ['reader_roles']}, {'required': ['save_notes']}]}}}]
+    return schema
 
 
-async def mediate(engine, harness, run_id, row, context, source, items, save):
+async def mediate(engine, harness, run_id, row, context, source, items, save, *, assign_readers=False):
     """One durable director assignment; engineering and all votes follow it."""
     from .parameter_resolution import owner
     async def persist():
@@ -50,10 +59,16 @@ async def mediate(engine, harness, run_id, row, context, source, items, save):
         row['mediation'] = {'purpose': 'experiment_diagnose:tuning-consensus:' + source_sha,
             'instruction': '主持当前分歧的定向收敛。逐项解释异议，提出可验证的澄清、修订或已有证据读取要求，交工程师落实。'
                 '已有材料用 experiments.compare / inspect_module 定向读取，不重做无关研究。'
-                '不能用多数票、删除反对票、降低验收或宣布共识来关闭异议。你的答复不是批准，修订后仍须三方独立复审。'
+                '逐项保留原始异议与验收条件。协调意见用于修订；修订后由当前协议指定的评审者各自独立复审。'
                 '重复争议须找出前次修订为何无效，明确不同的可检验修订或所需证据。不要仅重复“存在异议，暂停”。'
                 '保留未知根因、原数据划分、种子、预算及完成记录，不调用训练工具。返回每个 issue_id 恰好一次。',
-            'context': ctx, 'schema': contract(items, source_sha)}
+            'context': ctx, 'schema': contract(items, source_sha, assign_readers=assign_readers)}
+        if ctx['experiment_decision'].get('architecture_revision_workflow'):
+            row['mediation']['instruction'] += ' 将分歧落实为运行实现或架构修订及其真实数据验证；独立夹具不在本阶段派发。'
+        if assign_readers:
+            row['mediation']['instruction'] += (' 对每一项 inspect_evidence，用 reader_roles 指定实际读取原页和记录核对结论的角色；'
+                '角色须与本项 instruction 一致。工程师负责取证时填 engineer；需要某位评审本人核对时填写相应席位。'
+                '若需以真实页回执保存核对结论，设 save_notes=true。')
         await persist()
     assignment = row['mediation']
     if assignment['schema']['properties']['source_sha256']['const'] != source_sha:

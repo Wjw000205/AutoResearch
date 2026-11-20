@@ -130,11 +130,23 @@ def _reading(store, run_id, note, document, *, _papers=None, _links=None):
     raise ValueError('No successful read_papers receipt matches this paper and retained document hash')
 
 
-def _read_events(store, run_id):
-    """Read complete receipt history, never the recent-events display window."""
+def _read_events(store, run_id, *, event_ids=None):
+    """Read complete applicable receipts, never the recent-events display window.
+
+    Saved notes already bind exact receipt IDs. Use that primary-key subset
+    instead of scanning all tool history to rediscover those same events.
+    """
+    restriction=''
+    parameters=[run_id]
+    if event_ids is not None:
+        identifiers=sorted({i for i in event_ids if type(i) is int})
+        if not identifiers:
+            return []
+        restriction=' AND id IN (SELECT value FROM json_each(?))'
+        parameters.append(json.dumps(identifiers))
     with store._db() as db:
         rows = db.execute("SELECT * FROM events WHERE run_id=? AND kind='tool.completed' "
-                          "AND message IN ('sources.read','pdf.read') ORDER BY id", (run_id,)).fetchall()
+                          "AND message IN ('sources.read','pdf.read')"+restriction+" ORDER BY id", parameters).fetchall()
     return [{**dict(row), 'data': json.loads(row['data'])} for row in rows]
 
 
@@ -483,12 +495,13 @@ class _NoteProjection:
     scientific/reading credit is created. Writes still call validate_notes
     without this projection and recheck their commit anchors transactionally.
     """
-    def __init__(self, store, run_id, loader):
+    def __init__(self, store, run_id, loader, *, read_event_ids=None):
         if not getattr(store, 'is_read_snapshot', False):
             raise TypeError('Note projection requires a read-only snapshot')
         self.store, self.run_id, self.loader = store, run_id, loader
         self._documents, self._readings, self._receipts = {}, {}, {}
         self._papers, self._events, self._links = None, None, None
+        self._read_event_ids = read_event_ids
 
     @property
     def papers(self):
@@ -519,7 +532,7 @@ class _NoteProjection:
         if key not in self._receipts:
             if self._events is None:
                 self._events = {}
-                for event in _read_events(self.store, self.run_id):
+                for event in _read_events(self.store, self.run_id, event_ids=self._read_event_ids):
                     data = event['data']
                     result = data.get('result') if isinstance(data, dict) else None
                     if isinstance(result, dict) and isinstance(result.get('text_sha256'), str):
@@ -536,11 +549,15 @@ def _notes_view(store, run_id, *, document_loader=None):
         raise ValueError('Research not found')
     loader = document_loader or SourceEvidenceService(store, store.path.parent).document
     root = getattr(getattr(loader, '__self__', None), 'data_dir', store.path.parent)
-    projection = _NoteProjection(store, run_id, loader) if getattr(store, 'is_read_snapshot', False) else None
+    notes = store.list('literature_notes', run_id)
+    event_ids={identifier for note in notes if isinstance(note.get('source_read_event_ids'),list)
+               for identifier in note['source_read_event_ids'] if type(identifier) is int}
+    projection = (_NoteProjection(store, run_id, loader, read_event_ids=event_ids)
+                  if getattr(store, 'is_read_snapshot', False) else None)
     effective_loader = projection.document if projection is not None else loader
     engine = SimpleNamespace(store=store, sources=SimpleNamespace(document=effective_loader))
     valid = []
-    for note in store.list('literature_notes', run_id):
+    for note in notes:
         try:
             if (note.get('role') != 'scout' or note.get('generation') != 'ai_extraction'
                     or note.get('reading_scope') != 'inspected_passages'

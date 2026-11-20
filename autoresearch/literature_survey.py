@@ -93,7 +93,7 @@ class LiteratureSurvey:
     def _queries(queries):
         if not isinstance(queries, list) or not 1 <= len(queries) <= 3:
             raise ValueError('Provide one to three academic search queries')
-        if any(not isinstance(q, str) or not q.strip() for q in queries):
+        if any(not isinstance(q, str) or not q.strip() or len(q) > 400 for q in queries):
             raise ValueError('Each search query must contain 1 to 400 characters')
         return list(queries)  # Preserve the supplied direction verbatim in the frozen plan.
 
@@ -106,6 +106,9 @@ class LiteratureSurvey:
             inputs.update(phase=self.phase, date_policy=self.date_policy, proposal_hash=self.proposal_hash, version=2)
         if self.module_protocol == 1:
             inputs['codex_literature_protocol'] = 1
+        from .literature_discovery import enabled, POLICY
+        if enabled(self.store.get('runs', run_id).get('config', {})):
+            inputs['literature_discovery_policy'] = POLICY
         if self.search_profile:
             # New explicit acquisition identity; never reinterpret old plans.
             inputs['search_profile'] = self.search_profile
@@ -141,13 +144,25 @@ class LiteratureSurvey:
             add(queries[0], 'reviews', suffix='review')
             if self.phase == 'idea':
                 schedule = []
-                for query in queries:
-                    add(query, 'latest_idea_methods', recent=True)
-                    add(query, 'latest_idea_architectures', suffix='architecture', recent=True)
-                    add(query, 'latest_idea_limitations', suffix='limitations', recent=True)
+                if inputs.get('literature_discovery_policy'):
+                    # Cover every direction in the preferred six-month window
+                    # before widening to twelve months; an empty fresh search
+                    # is a recorded gap, never filled from an older RAG cohort.
+                    for query in queries:
+                        add(query, 'latest_idea_methods_preferred', recent=True)
+                    for query in queries:
+                        add(query, 'latest_idea_architectures', suffix='architecture', recent=True)
+                        add(query, 'latest_idea_limitations', suffix='limitations', recent=True)
+                else:
+                    for query in queries:
+                        add(query, 'latest_idea_methods', recent=True)
+                        add(query, 'latest_idea_architectures', suffix='architecture', recent=True)
+                        add(query, 'latest_idea_limitations', suffix='limitations', recent=True)
                 for item in schedule:
-                    item.update(date_from=self.date_policy['date_from'], date_to=self.date_policy['date_to'],
-                        year_from=int(self.date_policy['date_from'][:4]), year_to=int(date[:4]))
+                    start = (self.date_policy['preferred_from'] if item['facet'].endswith('_preferred')
+                             else self.date_policy['date_from'])
+                    item.update(date_from=start, date_to=self.date_policy['date_to'],
+                        year_from=int(start[:4]), year_to=int(date[:4]))
             elif self.phase == 'related_work' and self.search_profile != 'novelty':
                 for item in schedule:
                     # Relevance and mechanism overlap take priority, with no age exclusion.
@@ -189,6 +204,8 @@ class LiteratureSurvey:
                 try:
                     report = await source_service.search_with_report(item['query'], limit=item['limit'],
                         sort=item['sort'], year_from=item['year_from'], year_to=item['year_to'],
+                        **({'discovery_policy': plan['literature_discovery_policy']}
+                           if plan.get('literature_discovery_policy') else {}),
                         **({'ccf_ab_only': True} if plan.get('venue_policy', {}).get('enabled') else {}),
                         **({k: item[k] for k in ('date_from', 'date_to')} if 'date_from' in item else {}))
                     papers = report['papers']
@@ -238,7 +255,8 @@ class LiteratureSurvey:
                     if not assess(paper)['eligible']:
                         row['rejected_venue_count'] += 1
                         continue
-                rag_match = paper.get('rag_version_id') and paper.get('rag_score', 0) >= .38
+                rag_match = (not plan.get('literature_discovery_policy')
+                             and paper.get('rag_version_id') and paper.get('rag_score', 0) >= .38)
                 if not paper.get('id') or not paper.get('title') or not (rag_match or _search_relevance(item['base_query'], paper)['accepted']):
                     row['rejected_irrelevant_count'] += 1
                     continue

@@ -1,13 +1,13 @@
 import { ChevronDown, Database, FlaskConical } from 'lucide-react';
 import { type Json } from './api';
 import { latestComparison } from './ExperimentComparison';
+import { MethodResults } from './MethodResults';
 import './experiment-summary.css';
 
 const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
 const value = (n: unknown) => finite(n) ? n !== 0 && Math.abs(n) < 1e-6 ? n.toExponential(3) : n.toFixed(6).replace(/0+$/, '').replace(/\.$/, '') : '—';
 const percent = (n: unknown) => finite(n) ? `${n > 0 ? '+' : ''}${(n * 100).toFixed(2)}%` : '未报告';
 const phases: Record<string, string> = {validation: '验证集', test: '独立测试集'};
-const variants: Record<string, string> = {baseline: '主基线', proposed: '候选方法', ablation: '对照 / 消融'};
 const label = (name: string) => name;
 const loss = (name: unknown) => typeof name === 'string' ? name : '训练损失未记录';
 const source = (name: unknown) => typeof name === 'string' ? ({real_experiment_execution: '真实训练', fixture: '测试样例', offline_fixture: '离线测试样例', simulation: '模拟记录', demo: '演示记录'} as Record<string, string>)[name] ?? name : '来源未记录';
@@ -50,7 +50,7 @@ function Criteria({ review }: {review: Json}) {
   </details>;
 }
 
-export function ExperimentSummary({ summary }: {summary?: Json | null}) {
+export function ExperimentSummary({ summary, experiments = [] }: {summary?: Json | null; experiments?: Json[]}) {
   if (!summary?.groups?.length && !summary?.benchmark_tasks?.length && !summary?.performance_policy_status) return null;
   const groups: Json[] = summary.groups ?? [];
   const sources = [...new Set(groups.map(g => source(g.provenance)))];
@@ -105,13 +105,8 @@ export function ExperimentSummary({ summary }: {summary?: Json | null}) {
     {assessment && <div className="result-note" role="note"><strong>{assessment.research_outcome === 'positive' ? '整体主指标已改善' : assessment.research_outcome === 'negative' ? '整体主指标尚未改善' : '整体性能证据待核对'}</strong><p>当前任务按整体指标判断，局部指标允许取舍。这里是用户调整规则后的重评；原始结果和旧评审保留。</p></div>}
     {diagnosticLosses.length > 0 && <p className="result-note">需说明的性能取舍：{diagnosticLosses.map(row => `${label(row.metric)}${finite(row.relative_improvement) && row.relative_improvement < 0 ? `退化 ${(Math.abs(row.relative_improvement) * 100).toFixed(2)}%` : '未达原门槛'}`).join('；')}。这些诊断项不自动否决整体改善。</p>}
     {failed.length > 0 && <div className="result-verdict" role="note"><strong>{failed.map(row => `${label(row.metric)}${finite(row.relative_improvement) && row.relative_improvement < 0 ? `退化 ${(Math.abs(row.relative_improvement) * 100).toFixed(2)}%` : '未达门槛'}`).join('；')}</strong><span>当前必需的性能条件未满足。</span></div>}
-    <div className="result-table-heading"><h4>各方法结果</h4><span>{label(metric)} {direction === 'maximize' ? '越高越好' : '越低越好'} · 同一配置的训练种子均值</span></div>
-    <div className="table-scroll result-method-table"><table><caption>方法、训练种子与原始指标汇总</caption><thead><tr><th>方法</th><th>训练种子</th>{visibleMetrics.map(m => <th key={m}>{label(m)}{m === metric ? direction === 'maximize' ? ' ↑' : direction === 'minimize' ? ' ↓' : '' : ''}</th>)}<th>完成记录</th></tr></thead><tbody>{groups.map(group => <tr key={group.id} className={group.variant === 'proposed' ? 'result-candidate-row' : ''}>
-      <th scope="row"><strong>{group.name}<span className="result-tag">{variants[group.variant] ?? group.variant}</span></strong><small>{loss(group.loss)} · {phases[group.phase] ?? '划分未记录'}{group.cycle ? ` · 第 ${group.cycle} 轮` : ''}</small>{summary.datasets.length > 1 && <small>{summary.datasets.find((d: Json) => d.key === group.dataset_key)?.name} · 预测 {summary.datasets.find((d: Json) => d.key === group.dataset_key)?.horizon ?? '未记录'}</small>}
-        <details className="result-source"><summary>对应实验与版本<ChevronDown size={12} /></summary><p>{source(group.provenance)} · 配置 {group.id} · 代码版本 {group.code_revision ?? '未记录'}</p>{(group.trial_ids ?? []).map((id: string) => <code key={id}>{id}</code>)}</details></th>
-      <td>{group.seeds.length ? group.seeds.map((s: unknown) => s ?? '未记录').join('、') : '未记录'}</td>
-      {visibleMetrics.map(m => <td className="result-number" key={m}>{value(group.metrics[m]?.mean)}{group.metrics[m]?.mean == null && group.metrics[m] && <small>{group.metrics[m].count}/{group.metrics[m].total} 已报告</small>}</td>)}
-      <td>{group.completed} / {group.total}{group.issues.map((issue: string, i: number) => <small className="warn-text" key={i}>{issue}</small>)}</td></tr>)}</tbody></table></div>
+    <MethodResults groups={groups} experiments={experiments} datasets={summary.datasets ?? []} metric={metric}
+      direction={direction} metrics={visibleMetrics} />
     <p className="result-note">表内为原始指标均值。{observed ? '当前改善按配对种子的指标均值计算，仅描述验证结果，不替代正式验收比较。' : assessment ? '当前整体提升比例按配对种子均值计算；历史比较保留原有聚合口径。' : '提升比例来自已保存验收比较，可能采用逐种子比例再平均，因此不一定等于两个均值直接相除。'}不同配置、划分和版本分别列出。</p>
     {summary.truncated && <p className="warn-text">当前仅展示最近 256 次实验，未展示完整验收比较。</p>}
     {summary.superseded_count > 0 && <p className="result-note">另有 {summary.superseded_count} 次旧版本实验，保留在下方分次记录中。</p>}

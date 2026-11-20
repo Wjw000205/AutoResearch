@@ -6,8 +6,10 @@ the research cursor, or authorize experiments.
 from __future__ import annotations
 
 import asyncio
+from .async_ownership import gather as gather_owned, cancel as cancel_owned, to_thread as owned_to_thread
 import copy
 import json
+import logging
 
 from .prose_schema import validate as validate_schema
 
@@ -436,13 +438,13 @@ async def draw(engine, run_id, role, handoff_id, bundle):
     from pathlib import Path
     row, context = _assignment(engine, run_id, role, handoff_id)
     receipts = engine.store.get('handoff_progress', handoff_id, {}).get('tool_results', [])
-    audit = await asyncio.to_thread(validate_bundle, engine, run_id, bundle, context, receipts)
+    audit = await owned_to_thread(validate_bundle, engine, run_id, bundle, context, receipts)
     if row.get('tool_receipt'):
         if row['bundle_hash'] != digest(bundle):
             raise ValueError('本次交接已保存其他图结构；不能覆盖已保存图片。')
         return _checked_saved(engine, run_id, row)
 
-    content, rendering = await asyncio.to_thread(render_bundle, bundle)
+    content, rendering = await owned_to_thread(render_bundle, bundle)
     row, _ = _assignment(engine, run_id, role, handoff_id)  # Pause/version guards after CPU work.
     if row.get('tool_receipt'):
         if row['bundle_hash'] != digest(bundle):
@@ -553,7 +555,7 @@ async def generate(engine, key):
         else:
             # Existing paid protocol-1 assignments retain their immutable contracts.
             bundle = result
-            audit = await asyncio.to_thread(validate_bundle, engine, run_id, bundle, context, receipts)
+            audit = await owned_to_thread(validate_bundle, engine, run_id, bundle, context, receipts)
             artifact = engine.artifact(run_id, f'architecture-diagrams/{row["document_sha256"]}/{digest(bundle)}.json',
                 json.dumps(bundle, ensure_ascii=False, indent=2, allow_nan=False), 'architecture_diagrams')
             completed = {**row, 'status': 'completed', 'bundle': bundle,
@@ -583,17 +585,33 @@ def start_pending(engine):
     tasks = getattr(engine, '_architecture_diagram_tasks', None)
     if tasks is None:
         tasks = engine._architecture_diagram_tasks = {}
-    for row in engine.store.list(COLLECTION):
-        run = engine.store.get('runs', row['run_id'], {})
-        if row['status'] not in {'queued', 'generating', 'drawn'} or run.get('status') != 'running':
-            continue
-        key = row['id']
+    # Select only job identities. Historical bundles and frozen model contexts
+    # never need decoding just to discover pending work.
+    with engine.store._read_db() as db:
+        keys = [row[0] for row in db.execute("""SELECT d.key FROM records d JOIN records r
+            ON r.collection='runs' AND r.key=json_extract(d.data,'$.run_id')
+            WHERE d.collection=? AND json_extract(d.data,'$.id')=d.key
+              AND json_type(d.data,'$.run_id')='text'
+              AND json_extract(d.data,'$.status') IN ('queued','generating','drawn')
+              AND json_extract(r.data,'$.status')='running'
+              AND NOT EXISTS(SELECT 1 FROM records x WHERE x.collection='run_deletions' AND x.key=r.key)
+            ORDER BY d.updated_at,d.key""", (COLLECTION,))]
+    def observe(task):
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logging.getLogger(__name__).error('Architecture diagram worker exited: %s', type(error).__name__)
+    for key in keys:
         if key not in tasks or tasks[key].done():
-            tasks[key] = asyncio.create_task(generate(engine, key))
+            work = generate(engine, key)
+            try:
+                tasks[key] = asyncio.create_task(work)
+            except BaseException:
+                work.close()
+                raise
+            tasks[key].add_done_callback(observe)
 
 
 async def shutdown(engine):
     tasks = list(getattr(engine, '_architecture_diagram_tasks', {}).values())
     for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+        cancel_owned(task)
+    await gather_owned(*tasks, return_exceptions=True)

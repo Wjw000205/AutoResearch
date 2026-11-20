@@ -11,10 +11,10 @@ from .storage import now, redact
 
 COLLECTIONS = ['experiment_protocols', 'dataset_assets', 'dataset_downloads', 'context_evidence', 'paper_dossiers', 'paper_ocr', 'paper_visual', 'semantic_vectors',
                'context_receipts', 'context_commits', 'context_documents', 'context_manifests', 'evidence_deliveries',
-               'execution_archives', 'experiment_evidence', 'experiment_notes', 'experiment_cleanups', 'performance_policies', 'performance_policy_archives', 'experiment_decisions', 'experiment_decision_sessions', 'experiment_sources', 'experiment_analyses', 'rapid_experiment_revisions', 'experiment_memories', 'rapid_continuations', 'rapid_continuation_archives', 'tool_invocations', 'tool_tasks', 'training_adjustments', 'training_review_recoveries',
+               'execution_archives', 'code_repair_packets', 'code_repair_read_followups', 'experiment_evidence', 'experiment_notes', 'experiment_cleanups', 'performance_policies', 'performance_policy_archives', 'experiment_decisions', 'experiment_decision_sessions', 'experiment_sources', 'experiment_analyses', 'rapid_experiment_revisions', 'experiment_memories', 'rapid_continuations', 'rapid_continuation_archives', 'tool_invocations', 'tool_tasks', 'training_adjustments', 'training_review_recoveries',
                'innovation_sessions', 'steps', 'events', 'experiments', 'experiment_attempts', 'usage', 'codex_usage', 'artifacts', 'consensus',
                'decisions', 'selections', 'tuning_plans', 'programs', 'stage_contexts', 'context_snapshots',
-               'transcripts', 'handoffs', 'handoff_inputs', 'handoff_progress', 'operator_resumes', 'run_evidence', 'literature_inputs',
+               'transcripts', 'handoffs', 'handoff_inputs', 'handoff_progress', 'operator_resumes', 'execution_intents', 'run_evidence', 'literature_inputs',
                'research_cycles', 'cycle_steps', 'revision_plans', 'graph_status', 'experiment_restarts', 'debate_inputs', 'proposal_reviews', 'experiment_plans', 'implementation_routing_recoveries',
                'moderation_reviews', 'request_audits', 'memory_documents', 'memory', 'literature_notes', 'pdf_citations', 'codex_workflows', 'codex_checks', 'codex_check_attempts', 'architecture_reviews', 'architecture_revisions', 'architecture_definitions']
 SUFFIXES = {'.py', '.json', '.jsonl', '.ndjson', '.md', '.txt', '.csv', '.tsv', '.arff', '.h5', '.hdf5', '.mat', '.log', '.npy', '.npz', '.pt', '.pth', '.bin', '.parquet',

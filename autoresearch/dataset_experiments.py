@@ -5,6 +5,8 @@ cover a configuration and its data adapter, never a replacement architecture.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned, to_thread as owned_to_thread
+
 import ast
 import asyncio
 import copy
@@ -260,19 +262,27 @@ def outputs(engine, run_id):
             'implementation': (saved or {}).get('program', original['program'])}
 
 
-def configuration_schema():
+def configuration_schema(packet=None):
     from .engine import DESIGN
     from .benchmark_matrix import PLAN_FIELDS
     fields = ('evaluation', 'primary_metric', 'direction', 'acceptance', 'iteration_policy', 'resource_plan', 'limitations')
-    return {'type': 'object', 'additionalProperties': False,
+    result = {'type': 'object', 'additionalProperties': False,
         'required': [*fields, 'datasets'], 'properties': {
             **{key: DESIGN['properties'][key] for key in fields},
             'datasets': {'type': 'object', 'minProperties': 1, 'additionalProperties': {'type': 'object',
-                'properties': {key: DESIGN['properties'][key] for key in PLAN_FIELDS},
+                'properties': {**{key: DESIGN['properties'][key] for key in PLAN_FIELDS},
+                    'search_space': {'enum': [[], [{}]], 'description': 'Initial paired pilot, with no hyperparameter overrides.'}},
                 'required': list(PLAN_FIELDS), 'additionalProperties': False}}}}
+    if packet is not None:
+        names = [row['target']['dataset'] for row in packet['datasets']]
+        datasets = result['properties']['datasets']
+        profile = datasets.pop('additionalProperties')
+        datasets.update(properties={name: copy.deepcopy(profile) for name in names},
+                        required=names, additionalProperties=False)
+    return result
 
 
-def compile_configuration(engine, run_id, configuration, packet, budget_plan=None):
+def compile_configuration(engine, run_id, configuration, packet, budget_plan=None, *, dataset_catalog=None):
     from . import benchmark_matrix as matrix
     from .experiment_plan import build_plan
     from .fair_comparison import task_signature
@@ -286,7 +296,7 @@ def compile_configuration(engine, run_id, configuration, packet, budget_plan=Non
             f'extra={sorted(set(configuration) - allowed)}。预算单独交付 budget_plan.json。')
     from .engine import DESIGN
     try:
-        validate(configuration, configuration_schema())
+        validate(configuration, configuration_schema(packet))
     except ValidationError as exc:
         raise ValueError('配置字段 ' + '/'.join(map(str, exc.absolute_path)) + ': ' + exc.message) from exc
     expected = {d['target']['dataset']: d for d in packet['datasets']}
@@ -297,7 +307,7 @@ def compile_configuration(engine, run_id, configuration, packet, budget_plan=Non
         raise ValueError('配置必须明确验证主指标及优化方向。')
     tasks, protocols = [], {}
     for index, (name, settings) in enumerate(configuration['datasets'].items()):
-        if not isinstance(settings, dict) or set(settings) != set(matrix.PLAN_FIELDS) or settings['search_space'] != [{}]:
+        if not isinstance(settings, dict) or set(settings) != set(matrix.PLAN_FIELDS) or settings['search_space'] not in ([], [{}]):
             raise ValueError('数据切换先配置一个小规模成对批次及明确种子，不自动启动整张网格。')
         task = copy.deepcopy(settings)
         for role in ('baseline', 'proposed', 'ablation'):
@@ -319,9 +329,16 @@ def compile_configuration(engine, run_id, configuration, packet, budget_plan=Non
         protocols[protocol['id']] = protocol
     design['benchmark_tasks'] = tasks
     design['dataset'] = ', '.join(expected)
+    if dataset_catalog or original['design'].get('dataset_catalog') or original['program'].get('dataset_catalog'):
+        from .dataset_contract import checked, from_packet
+        frozen = checked(dataset_catalog) if dataset_catalog else from_packet(packet)
+        if frozen != from_packet(packet):
+            raise ValueError('Dataset configuration catalog does not match the current frozen dataset packet')
+        design.update(dataset_catalog=frozen, dataset_catalog_sha256=frozen['sha256'], dataset_request_protocol=2,
+                      dataset_description='当前配置的数据集：' + ', '.join(expected) + '。数据处理与评估设置见 evaluation。')
     from .engine import DESIGN
     try:
-        validate({k: v for k, v in design.items() if k != 'benchmark_tasks'}, DESIGN)
+        validate({k: v for k, v in design.items() if k in DESIGN['properties'] and k != 'benchmark_tasks'}, DESIGN)
     except ValidationError as exc:
         raise ValueError('配置字段 ' + '/'.join(map(str, exc.absolute_path)) + ': ' + exc.message) from exc
     from .dataset_configuration_queue import batch, current as current_queue, task_budgeted
@@ -343,11 +360,12 @@ def compile_configuration(engine, run_id, configuration, packet, budget_plan=Non
     plan = build_plan(design, plan_allowance, protocols=protocols)
     if task_budget:
         dataset_budgets.check(budget_plan, plan)
-    acceptance = classify(design['acceptance'], design['primary_metric'])
-    if not any(c['metric'] == design['primary_metric'] and c['direction'] == design['direction'] for c in acceptance['criteria']):
+    acceptance_metric = plan.get('matrix_acceptance', {}).get('metric', design['primary_metric'])
+    acceptance = classify(design['acceptance'], acceptance_metric)
+    if not any(c['metric'] == acceptance_metric and c['direction'] == design['direction'] for c in acceptance['criteria']):
         raise ValueError('配置未包含主指标验收定义。')
     threshold = engine.store.get('runs', run_id)['config'].get('min_relative_improvement', 0)
-    if any(c['metric'] == design['primary_metric'] and c['minimum_relative_improvement'] < threshold for c in acceptance['criteria']):
+    if any(c['metric'] == acceptance_metric and c['minimum_relative_improvement'] < threshold for c in acceptance['criteria']):
         raise ValueError('数据配置不能降低任务约定的主指标标准。')
     plan.update(id=run_id, run_id=run_id, design_hash=sha(design), acceptance=acceptance, iteration_policy=design['iteration_policy'],
                 dataset_configuration_protocol=1, cycle=engine.cycle(run_id))
@@ -379,7 +397,12 @@ def candidate(engine, run_id, draft, original):
     from .rapid_experiment_revision import _write_files
     from .experiment_analysis import freeze_sources
     bundle = _base_bundle(engine, run_id, original)
-    files = {r['path']: (Path(bundle['root']) / r['path']).read_bytes() for r in bundle['files']}
+    files = {}
+    for row in bundle['files']:
+        raw = (Path(bundle['root']) / row['path']).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != row['sha256']:
+            raise ValueError('数据适配底座文件已变化：' + row['path'])
+        files[row['path']] = raw
     if not draft['adapter_files']:
         if original['program'].get('execution_interface') != experiment_config.INTERFACE:
             raise ValueError('原入口只支持旧配置；请在实验阶段补齐 dataset_runtime 数据接口。')
@@ -398,7 +421,9 @@ def candidate(engine, run_id, draft, original):
                 raise ValueError(f'数据接口 {name}:{exc.lineno} 语法错误：{exc.msg}') from exc
             seen.add(name)
             files[name] = item['source'].encode('utf-8')
-        if 'dataset_runtime/adapter.py' not in seen:
+        if ('dataset_runtime/adapter.py' not in seen and
+                (original['program'].get('execution_interface') != experiment_config.INTERFACE
+                 or 'dataset_runtime/adapter.py' not in files)):
             raise ValueError('缺少统一数据适配入口 run(config)。')
         files['experiment.py'] = experiment_config.ENTRY.encode()
         files['dataset_runtime/__init__.py'] = b''
@@ -433,16 +458,19 @@ def _source_gate(engine, run_id):
 
 
 def _reviews(engine, run_id, saved):
+    from . import independent_full_review as full_review
     from .engine import Harness
     from .rapid_experiment_revision import VOTE, review_receipts
     candidate_ = saved['candidate']
     instruction, schema = saved.get('review_instruction', REVIEW), saved.get('review_schema', VOTE)
     votes = saved.get('votes', [])
-    if len(votes) != 3 or {v['role'] for v in votes} != {'director', 'engineer', 'scout'}:
+    if not full_review.members(votes):
         raise ValueError('实验配置与接口适配尚未取得三方独立核验。')
     for vote in votes:
-        context = saved.get('review_contexts',{}).get(vote['role'],saved['review_context'])
-        assignment = saved.get('review_clarifications',{}).get(vote['role'])
+        if full_review.KEY in vote:
+            full_review.validate_delivery(engine.store, run_id, vote, engine=engine)
+        context = saved['review_context'] if full_review.KEY in vote else saved.get('review_contexts',{}).get(vote['role'],saved['review_context'])
+        assignment = None if full_review.KEY in vote else saved.get('review_clarifications',{}).get(vote['role'])
         expected = {'amendment_sha256': candidate_['amendment_sha256'],
             'candidate_sha256': candidate_['bundle']['sha256'], 'checks_sha256': candidate_['checks_sha256']}
         if not vote.get('approve') or vote.get('issues') or any(vote.get(k) != v for k, v in expected.items()):
@@ -451,9 +479,9 @@ def _reviews(engine, run_id, saved):
         current_instruction,current_schema = instruction,schema
         if assignment:
             purpose,context,current_instruction,current_schema = (assignment[k] for k in ('purpose','context','instruction','schema'))
-        key = Harness.decision_key(run_id, vote['role'], purpose, current_instruction, context, current_schema)
+        key = full_review.decision_key(engine, run_id, vote, purpose, current_instruction, context, current_schema)
         actual = engine.store.get('decisions', key, {})
-        if actual.get('result') != {k: v for k, v in vote.items() if k != 'role'}:
+        if actual.get('result') != full_review.answer(vote):
             raise ValueError('实验配置审批缺少同版本真实交付。')
         review_receipts(engine, run_id, saved, vote, context, purpose=purpose, instruction=current_instruction, schema=current_schema)
 
@@ -533,42 +561,98 @@ async def ensure(engine, harness, run_id):
 
 async def review_configuration(engine, harness, run_id, saved):
     """Independent roles review the same frozen candidate concurrently."""
+    from . import independent_full_review as full_review
+    from .rapid_experiment_revision import VOTE
+    if not saved.get('votes') or full_review.reviewers(saved['votes']) == full_review.REVIEWERS or not full_review.members(saved['votes']):
+        if saved.get('votes') and full_review.reviewers(saved['votes']) != full_review.REVIEWERS:
+            saved.setdefault('review_history', []).append({'votes': copy.deepcopy(saved['votes']),
+                'contexts': copy.deepcopy(saved.get('review_contexts', {})),
+                'clarifications': copy.deepcopy(saved.get('review_clarifications', {}))})
+            saved['votes'] = []
+        if not saved.get('votes'):
+            def complete_reads(vote):
+                try:
+                    return review_receipts(engine, run_id, saved, vote, saved['review_context'],
+                        purpose='dataset_config_review:' + saved['candidate']['amendment_sha256'],
+                        instruction=saved.get('review_instruction', REVIEW), schema=saved.get('review_schema', VOTE))
+                except (ValueError, RuntimeError) as exc:
+                    error = ValueError('Dataset whole review requires its actual complete source reads: ' + str(exc))
+                    error.covered_chars = full_review.read_progress(engine.store, run_id, vote, {'experiments.inspect_module'})
+                    error.missing_read_targets = saved['candidate']['changed_ranges']
+                    raise error from exc
+            saved['votes'] = await full_review.group(harness, run_id,
+                'dataset_config_review:' + saved['candidate']['amendment_sha256'],
+                saved.get('review_instruction', REVIEW), saved['review_context'], saved.get('review_schema', VOTE),
+                validator=complete_reads)
+            engine.check_active(run_id)
+            engine.store.put(COLLECTION, saved['id'], saved)
+        saved.update(status='checking_data')
+        engine.store.put(COLLECTION, saved['id'], saved)
+        return
+    return await _legacy_review_configuration(engine, harness, run_id, saved)
+
+
+async def _legacy_review_configuration(engine, harness, run_id, saved):
+    """Explicit adapter for already complete historical three-role groups."""
     from .rapid_experiment_revision import VOTE
     roles = ('director', 'engineer', 'scout')
     votes = {v['role']: v for v in saved.get('votes', [])}
+    assignments = saved.setdefault('review_clarifications', {})
+    def needs_followup(result):
+        if result.get('approve') is True:
+            return bool(result.get('issues'))
+        return result.get('blocker_kind') != 'implementation'
     async def ask(role):
         from .dataset_review_protocol import role_context
         contexts = saved.setdefault('review_contexts',{})
         if role not in contexts:
             contexts[role] = role_context(engine,run_id,saved,role)
             engine.store.put(COLLECTION,saved['id'],saved)
-        result = {k:v for k,v in votes[role].items() if k!='role'} if role in votes else await harness.ask(
-            run_id, role, 'dataset_config_review:' + saved['candidate']['amendment_sha256'],
-            saved.get('review_instruction', REVIEW), contexts[role], saved.get('review_schema', VOTE))
-        if result.get('approve') is True and result.get('issues'):
-            from .dataset_review_protocol import clarification
-            assignments = saved.setdefault('review_clarifications',{})
-            if role not in assignments:
-                assignments[role] = clarification(engine,run_id,saved,role,result)
+        if role not in assignments:
+            result = {k:v for k,v in votes[role].items() if k!='role'} if role in votes else await harness.ask(
+                run_id, role, 'dataset_config_review:' + saved['candidate']['amendment_sha256'],
+                saved.get('review_instruction', REVIEW), contexts[role], saved.get('review_schema', VOTE))
+            if needs_followup(result):
+                from .dataset_review_protocol import clarification
+                assignments[role] = await asyncio.to_thread(clarification, engine, run_id, saved, role, result,
+                                                            evidence=result.get('approve') is False)
                 engine.store.put(COLLECTION,saved['id'],saved)
+        if role in assignments:
             task = assignments[role]
             result = await harness.ask(run_id,role,task['purpose'],task['instruction'],task['context'],task['schema'])
         engine.check_active(run_id)
         votes[role] = {'role': role, **result}
         saved.update(votes=[votes[r] for r in roles if r in votes])
         engine.store.put(COLLECTION, saved['id'], saved)
-    tasks = [asyncio.create_task(ask(role)) for role in roles if role not in votes or votes[role].get('approve') is True and votes[role].get('issues')]
+    def pending(role):
+        if role not in votes:
+            return True
+        if role not in assignments:
+            return needs_followup(votes[role])
+        # If interrupted between persisting the follow-up and replacing a saved
+        # legacy vote, reuse the exact dispatched assignment on resume.
+        task = assignments[role]
+        from .engine import Harness
+        key = Harness.decision_key(run_id, role, task['purpose'], task['instruction'], task['context'], task['schema'])
+        final = engine.store.get('decisions', key) or {}
+        return final.get('result') != {k:v for k,v in votes[role].items() if k != 'role'}
+    tasks = [asyncio.create_task(ask(role)) for role in roles if pending(role)]
     try:
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        outcomes = await gather_owned(*tasks, return_exceptions=True)
     except BaseException:
         for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            cancel_owned(task)
+        await gather_owned(*tasks, return_exceptions=True)
         raise
     failures = [r for r in outcomes if isinstance(r, BaseException)]
     if failures:
         raise failures[0]
     engine.check_active(run_id)
+    missing = [v for v in votes.values() if not v['approve'] and v.get('blocker_kind') == 'review_evidence']
+    if missing and not any(not v['approve'] and v.get('blocker_kind') == 'implementation' for v in votes.values()):
+        from .engine import ResearchBlocked
+        raise ResearchBlocked('同版本定向复核后仍有证据缺项：' + '；'.join(
+            v['role'] + ' ' + '；'.join(v['issues'] or [v['rationale']]) for v in missing))
     saved.update(status='checking_data')
     engine.store.put(COLLECTION, saved['id'], saved)
 
@@ -616,8 +700,7 @@ async def _ensure_once(engine, harness, run_id):
                 'budget_schema': dataset_budgets.SCHEMA, 'task_requirements_path': '/task_requirements',
                 'coverage_scope': '当前真实数据配置尚未冻结。原数据的种子和消融清单是历史参考；'
                     '按当前任务要求与本份预算配置必要对照，保留一次 CPU 检查；不能更改已冻结实验或降低明确验收要求。',
-                'configuration_schema': {**{key: DESIGN['properties'][key] for key in fields},
-                    'datasets': {'each_value': {key: DESIGN['properties'][key] for key in PLAN_FIELDS}}},
+                'configuration_schema': configuration_schema(packet),
                 'result_contract': {'metrics': 'finite numeric values, configured validation metric; no test_* metrics in validation',
                     'evaluation': {'dataset_id': 'content/version identity', 'seed': 'exact config seed', 'phase': 'exact config phase',
                         'actual_params': 'the complete unmodified resolved config', 'split_identity': capability()},
@@ -631,7 +714,13 @@ async def _ensure_once(engine, harness, run_id):
         saved = {'id': active['setup_id'] if active else receipt['id'], 'run_id': run_id, 'cycle': engine.cycle(run_id), 'status': 'configuring',
             'request': request, 'dataset_packet': packet, 'source_program_sha256': sha(original['program']),
             'architecture_design': original['architecture_design'], 'architecture_cycle': original['architecture_cycle'], 'created_at': now()}
+        from .dataset_contract import from_packet
+        saved['request']['dataset_catalog'] = from_packet(packet)
+        saved['request']['dataset_request_protocol'] = 2
         engine.store.put(COLLECTION, saved['id'], saved)
+    if not saved.get('draft') and saved.get('previous_codex_job_id') and not saved.get('codex_job_id'):
+        from .dataset_delivery_readback import recover
+        saved = await recover(engine, run_id, saved)
     if not saved.get('draft'):
         from . import dataset_codex
         if dataset_codex.enabled(engine, run_id):
@@ -661,23 +750,34 @@ async def _ensure_once(engine, harness, run_id):
         original = source(engine, run_id)
         require_delivery(engine, run_id, saved)
         try:
-            design, plan = compile_configuration(engine, run_id, json.loads(saved['draft']['configuration_json']), saved['dataset_packet'], saved['draft'].get('budget_plan'))
-            built = await asyncio.to_thread(candidate, engine, run_id, saved['draft'], original)
+            design, plan = compile_configuration(engine, run_id, json.loads(saved['draft']['configuration_json']), saved['dataset_packet'], saved['draft'].get('budget_plan'),
+                                                 dataset_catalog=saved['request'].get('dataset_catalog'))
+            built = await owned_to_thread(candidate, engine, run_id, saved['draft'], original)
         except ValueError as exc:
             from .dataset_configuration_repair import NeedsRepair
             raise NeedsRepair(str(exc)) from exc
         from .dataset_runtime_contract import describe
+        if design.get('dataset_catalog'):
+            built['program']['dataset_catalog'] = copy.deepcopy(design['dataset_catalog'])
         evidence = {'binding': {'transition_id': receipt['id'], 'plan_sha256': sha(plan)},
             'host_runtime_contract': describe(),
             'code_sources': built['code_sources'], 'configuration': json.loads(saved['draft']['configuration_json']),
             'rationale': saved['draft']['rationale'], 'budget_plan': saved['draft'].get('budget_plan'),
             'task_requirements': engine.store.get('runs', run_id).get('objective', '')}
+        project_protocol = saved.get('project_protocol')
+        if project_protocol:
+            from .weather_project_protocol import verify, check_profiles
+            approved = verify(engine.store, run_id, project_protocol)
+            check_profiles(evidence['configuration'], approved['proposal'])
+            evidence['project_protocol'] = {'receipt': project_protocol, 'proposal': approved['proposal'], 'votes': approved['votes']}
         ref = _archive(engine, run_id, evidence)
         review_context = {'training_context_protocol': 1, 'experiment_workflow_protocol': 1,
             'research_cycle': engine.cycle(run_id), 'stage': saved['request']['stage'],
             'validation_evidence': ref, 'evidence_sha256': ref['sha256'],
             'dataset_configuration': {'amendment_sha256': built['amendment_sha256'],
                 'candidate_sha256': built['bundle']['sha256'], 'checks_sha256': built['checks_sha256'],
+                **({'project_protocol': {'path': '/project_protocol', **project_protocol},
+                    'review_scope': '三方已单独确认项目窗口。读 /project_protocol 核对当前实现、真实 CSV 与测试隔离。'} if project_protocol else {}),
                 'changed_ranges': built['changed_ranges'], 'checks': saved['draft']['checks'],
                 'trial_budget': None if (queue.budget(engine.store, run_id) or {}).get('status') == 'unlimited'
                     else dataset_budgets.total(saved['draft']['budget_plan']) if saved['draft'].get('budget_plan') else saved['request'].get('trial_budget'),
@@ -685,6 +785,9 @@ async def _ensure_once(engine, harness, run_id):
                 'budget_plan': saved['draft'].get('budget_plan'),
                 'planned_trials': plan['planned_trials'], 'datasets': list(json.loads(saved['draft']['configuration_json'])['datasets'])}}
         saved.update(candidate=built, program=built['program'], design=design, plan=plan, review_context=review_context, status='reviewing')
+        if saved['request'].get('dataset_catalog'):
+            saved['review_context'].update(dataset_catalog=copy.deepcopy(saved['request']['dataset_catalog']),
+                                           dataset_request_protocol=2)
         engine.store.put(COLLECTION, saved['id'], saved)
     try:
         dataset_budgets.propose(engine, run_id, saved)
@@ -717,13 +820,21 @@ def validate_program(engine, run_id, program):
     saved = current(engine, run_id)
     if not saved or saved.get('status') != 'ready' or saved['program'] != program:
         raise ValueError('新数据配置与兼容性尚未完成核验。')
+    if saved.get('codex_job_id'):
+        from .dataset_codex import COLLECTION as CODE_JOBS
+        from .code_model_migration import job_profile
+        job = engine.store.get(CODE_JOBS, saved['codex_job_id'])
+        if not job or job.get('run_id') != run_id or job.get('setup_id') != saved['id']:
+            raise ValueError('Dataset code delivery lost its frozen job identity')
+        job_profile(engine, run_id, job)
     original = _source_gate(engine, run_id)
     if sha(original['program']) != saved['source_program_sha256'] or sha(saved['draft']) != saved['candidate']['amendment_sha256']:
         raise ValueError('数据适配的原实现或配置版本发生变化。')
     from .dataset_transition import current as transition
     if saved['dataset_packet']['sha256'] != transition(engine.store, run_id)['sha256']:
         raise ValueError('数据配置未绑定当前切换请求。')
-    design, plan = compile_configuration(engine, run_id, json.loads(saved['draft']['configuration_json']), saved['dataset_packet'], saved['draft'].get('budget_plan'))
+    design, plan = compile_configuration(engine, run_id, json.loads(saved['draft']['configuration_json']), saved['dataset_packet'], saved['draft'].get('budget_plan'),
+                                         dataset_catalog=saved['request'].get('dataset_catalog'))
     if design != saved['design'] or plan != saved['plan'] or program['dependencies'] != original['program']['dependencies']:
         raise ValueError('实验配置或依赖与同版本独立核验内容不一致。')
     _reviews(engine, run_id, saved)

@@ -95,20 +95,31 @@ def _submitted_manifests(store, run_id, role, handoff_id, request_ids):
         from .context_manifest import validate_manifest
         result = {}
         material_fields = ('kind', 'compiled', 'submitted', 'text_deliverable',
-            'source_id', 'document_id', 'sha256', 'text_sha256', 'char_start',
+            'source_id', 'document_id', 'artifact_id', 'sha256', 'text_sha256', 'char_start',
             'char_end', 'delivered_text_sha256')
-        for key, row in manifests.items():
+        from .harness_activity import checkpoint
+        checkpoint('validation_manifests', 0, len(manifests), '份投递清单', role)
+        for position, (key, row) in enumerate(manifests.items(), 1):
             if not validate_manifest(store, row):
+                checkpoint('validation_manifests', position, len(manifests), '份投递清单', role)
                 continue
             compact = {name: row[name] for name in ('id', 'snapshot_id') if name in row}
             if 'materials' in row:
                 compact['materials'] = [{name: item[name] for name in material_fields if name in item}
-                    for item in row['materials'] if item.get('kind') == 'evidence']
+                    for item in row['materials'] if item.get('kind') == 'evidence'
+                    and item.get('compiled') is True and item.get('submitted') is True
+                    and item.get('text_deliverable') is True]
             result[key] = compact
+            checkpoint('validation_manifests', position, len(manifests), '份投递清单', role)
         return result
 
     if getattr(store, 'is_read_snapshot', False):
-        return store.memoized_read(('submitted_delivery_manifests', run_id, role, handoff_id, wanted), authenticate)
+        from .architecture_validation import source_read
+        identity = ('submitted_delivery_manifests', run_id, role, handoff_id, wanted)
+        # Keep compact operands in the bounded validation scope while a large
+        # source/read ledger churns the snapshot's general LRU. Consumers only
+        # inspect these private maps; no approval or physical file is cached.
+        return source_read(store, identity, lambda: store.memoized_read(identity, authenticate), borrowed=True)
     return authenticate()
 
 
@@ -119,8 +130,8 @@ def delivery_spans(store, run_id, role, identifier, sha256, *, identity_key='sou
     Candidate/compiled manifests, search excerpts, unknown network attempts and
     another role's independent thread never confer reading credit.
     """
-    if identity_key not in {'source_id', 'document_id'}:
-        raise ValueError('Evidence identity must be a source or document ID')
+    if identity_key not in {'source_id', 'document_id', 'artifact_id'}:
+        raise ValueError('Evidence identity must be an exact source, document or artifact ID')
     manifests = _submitted_manifests(store, run_id, role, handoff_id, request_ids)
     spans = []
     if hasattr(store, 'record_keys'):

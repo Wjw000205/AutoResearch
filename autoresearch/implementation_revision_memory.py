@@ -64,7 +64,8 @@ def _current_output(base, previous_fields, fields, *, saved, priority_fields=())
         'saved_in_this_handoff': saved}
 
 
-def _restore_reading(engine, run_id, directories, history, hid, *, current_document=None, priority_ranges=()):
+def _restore_reading(engine, run_id, directories, history, hid, *, current_document=None, priority_ranges=(),
+                     max_reads=None, text_limit=None):
     """Refresh from exact durable reads first, then retain older delivered text.
 
     Retrieval may precede delivery. Including retrieved text in this new packet
@@ -73,6 +74,9 @@ def _restore_reading(engine, run_id, directories, history, hid, *, current_docum
     from . import document_index
     from .document_read_index import _known_read, _in_directory, _merge
     from .engine import ResearchBlocked
+    from .implementation_revision_worklist import MAX_READS
+    max_reads = MAX_READS if max_reads is None else max_reads
+    text_limit = SOURCE_TEXT_LIMIT if text_limit is None else text_limit
     current_document = current_document or {}
     current_identity = (current_document.get('document_id'), current_document.get('sha256'))
     allowed = {did: doc for did, doc in directories.items()
@@ -120,10 +124,9 @@ def _restore_reading(engine, run_id, directories, history, hid, *, current_docum
                 candidates.append((doc, section, start, end, 'historical_delivery'))
 
     if priority_ranges:
-        from .implementation_revision_worklist import MAX_READS
         # Keep an entire fresh read batch deliverable before restoring pending
         # findings' older evidence. Never turn a locator into a new read receipt.
-        fresh = [c for c in candidates if c[4] == 'current_handoff_read'][:MAX_READS]
+        fresh = [c for c in candidates if c[4] == 'current_handoff_read'][:max_reads]
         preferred = []
         for ref in priority_ranges:
             for doc, section, start, end, origin in candidates:
@@ -146,7 +149,7 @@ def _restore_reading(engine, run_id, directories, history, hid, *, current_docum
                 for piece in ((a, min(b, left)), (max(a, right), b)) if piece[0] < piece[1]]
         _, text = source(doc)
         for start, end in sorted(spans):
-            end = min(end, start + SOURCE_TEXT_LIMIT - used)
+            end = min(end, start + text_limit - used)
             if start >= end:
                 continue
             value = text[start:end]
@@ -344,7 +347,10 @@ def prepare(engine, run_id, role, hid, context):
         'working_notes': _notes(engine, run_id, sources, allowed), 'historical_reading': history,
         'current_output': _current_output(current, selected, set(current['spec']), saved=bool(latest), priority_fields=changed),
         'restored_reading': _restore_reading(engine, run_id, directories, history, hid,
-            current_document=current['document'], priority_ranges=plan['source_ranges'] if plan else ()),
+            current_document=current['document'], priority_ranges=plan['source_ranges'] if plan else (),
+            max_reads=plan['max_read_calls'] if plan else None,
+            text_limit=max(SOURCE_TEXT_LIMIT, plan['max_read_calls'] * worklist.PAGE_CHARS)
+                if plan and context.get(worklist.KEY_BATCH) == 1 else None),
         'freshness': {'handoff_id': hid, 'document_id': current['document']['document_id'],
             'document_sha256': current['document']['sha256'], 'spec_hash': current['spec_hash'],
             'ledger_receipts': len(ledger), 'ledger_sha256': digest(ledger),

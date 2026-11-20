@@ -26,7 +26,8 @@ def derive_source(harness, run_id, key, original):
         prepared = original['prepared']
         if original.get('prepared_sha256', digest(prepared)) != digest(prepared):
             return None
-        provider = harness.intelligence.provider_for(prepared['role'])
+        from .task_reasoning import request_provider
+        provider = request_provider(harness.intelligence, prepared)
         if provider.get('protocol') == 'local_codex':
             from .codex_reasoning import key_for, profile, TRANSPORT_SCHEMA
             from .intelligence import parse_provider_json

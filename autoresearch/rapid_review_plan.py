@@ -1,4 +1,6 @@
 """Versioned review scope for generated metadata; original assignments stay frozen."""
+
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
 import asyncio
 import copy
 import hashlib
@@ -129,13 +131,37 @@ def role_context(engine, run_id, record, common, role):
 
 
 async def collect(engine,harness,run_id,record,common):
-    from .rapid_experiment_revision import REVIEW,VOTE,COLLECTION
+    from . import independent_full_review as full
+    from .rapid_experiment_revision import COLLECTION
+    record['review_contexts'] = {role: copy.deepcopy(common) for role in full.REVIEWERS}
+    engine.store.put(COLLECTION, record['id'], record)
+    return await full_collect(engine,harness,run_id,record,common)
+
+
+async def full_collect(engine,harness,run_id,record,common):
+    from . import independent_full_review as full
+    from .rapid_experiment_revision import review_instruction, VOTE, review_receipts
+    from .engine import ResearchBlocked
+    purpose=record.get('review_purpose') or 'rapid_review:'+record['candidate']['amendment_sha256']
+    def verify(vote):
+        try:
+            review_receipts(engine,run_id,record,vote,common,require_complete=True)
+        except ResearchBlocked as exc:
+            error=ValueError(str(exc))
+            error.covered_chars=full.read_progress(engine.store,run_id,vote,{'experiments.inspect_module'})
+            error.missing_read_targets=common.get('rapid_revision',{}).get('changed_ranges') or record['candidate']['changed_ranges']
+            raise error from exc
+    return await full.group(harness,run_id,purpose,review_instruction(record),common,record.get('review_schema') or VOTE,validator=verify)
+
+
+async def _legacy_collect(engine,harness,run_id,record,common):
+    from .rapid_experiment_revision import review_instruction,VOTE,COLLECTION
     from .rapid_review_rejection import authenticate_vote
     schema=record.get('review_schema') or VOTE
     contexts={role:role_context(engine,run_id,record,common,role) for role in ROLES}
     record['review_contexts']=contexts
     engine.store.put(COLLECTION,record['id'],record)
-    tasks={asyncio.create_task(harness.ask(run_id,role,record['review_purpose'],REVIEW,contexts[role],schema)):role
+    tasks={asyncio.create_task(harness.ask(run_id,role,record['review_purpose'],review_instruction(record),contexts[role],schema)):role
            for role in ROLES}
     votes=[]
     try:
@@ -149,14 +175,14 @@ async def collect(engine,harness,run_id,record,common):
             if any(v.get('approve') is False and v.get('issues') for v in votes):
                 record['review_interruption']={'reason':'authenticated_veto','pending_roles':sorted(tasks[t] for t in pending),
                     'completed_roles':sorted(v['role'] for v in votes),'created_at':now(), 'approval_inherited':False}
-                for task in pending: task.cancel()
-                await asyncio.gather(*pending,return_exceptions=True)
+                for task in pending: cancel_owned(task)
+                await gather_owned(*pending,return_exceptions=True)
                 engine.store.put(COLLECTION,record['id'],record)
                 break
     finally:
         for task in tasks:
-            if not task.done(): task.cancel()
-        await asyncio.gather(*tasks,return_exceptions=True)
+            if not task.done(): cancel_owned(task)
+        await gather_owned(*tasks,return_exceptions=True)
     return sorted(votes,key=lambda v:ROLES.index(v['role']))
 
 
@@ -188,7 +214,7 @@ def prepare(engine, run_id, record_id, instruction):
     prior={}
     for role in ROLES:
         prior_context=prior_record.get('review_contexts',{}).get(role,original_context)
-        key=Harness.decision_key(run_id,role,purpose,rapid.REVIEW,prior_context,prior_record.get('review_schema') or rapid.VOTE)
+        key=Harness.decision_key(run_id,role,purpose,rapid.review_instruction(prior_record),prior_context,prior_record.get('review_schema') or rapid.VOTE)
         frozen=engine.store.get('handoff_inputs',key)
         if frozen:
             prior[role]={'handoff_id':key,'input_sha256':sha(frozen),

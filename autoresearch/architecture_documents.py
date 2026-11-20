@@ -33,13 +33,15 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
 
 
-def render(design, proposal_hash, *, cycle, provenance):
+def render(design, proposal_hash, *, cycle, provenance, combinations=None):
     from .engine import digest
     lines = ['# 架构设计', '', f'设计版本：`{digest(design)}`',
              f'对应共识方案：`{proposal_hash}`', f'研究轮次：{cycle}',
              f'来源：{provenance}；本文件描述待验证设计，不包含实验结果。', '']
     known = set()
-    for title, fields in GROUPS:
+    groups = [(title, (*fields, 'dataset_description') if fields == ('dataset',)
+               and 'dataset_description' in design else fields) for title, fields in GROUPS]
+    for title, fields in groups:
         lines += ['## ' + title, '']
         for field in fields:
             known.add(field)
@@ -50,11 +52,51 @@ def render(design, proposal_hash, *, cycle, provenance):
                 continue
             value = design[field]
             lines += ['### ' + field, '']
+            if field == 'benchmark_tasks' and combinations is not None:
+                from .benchmark_matrix import PLAN_FIELDS, metadata
+                from .fair_comparison import strict_equal
+                first = value[0]
+                lines += ['共用模板按 comparison_task 的实际路径替换表中的输入、输出维度。'
+                          '各行的模型、训练参数、数据划分和评价设置均已逐字段与模板核对。', '']
+                # Legacy designs can have inert root defaults. Show all differences
+                # needed to recover the actual shared runtime template.
+                overrides = {k: first[k] for k in PLAN_FIELDS if not strict_equal(first[k], design.get(k))}
+                lines += ['模板任务元数据', '```json', _json(metadata(first)), '```', '']
+                if overrides:
+                    lines += ['模板中覆盖根级默认值的完整配置', '```json', _json(overrides), '```', '']
+                lines += ['输入输出组合（每行一个任务）', '```jsonl']
+                lines.extend(json.dumps(row, ensure_ascii=False, separators=(',', ':')) for row in combinations)
+                lines += ['```', '']
+                continue
             lines += ([value, ''] if isinstance(value, str) else ['```json', _json(value), '```', ''])
     extra = {k: v for k, v in design.items() if k not in known}
     if extra:
         lines += ['## 其他设计字段', '', '```json', _json(extra), '```', '']
     return '\n'.join(lines)
+
+
+def _review_content(engine, run_id, design, proposal_hash, cycle, provenance, *, template):
+    from .experiment_protocols import resolve_design
+    from .io_matrix import review_layout
+    protocols = resolve_design(engine, run_id, design) if 'benchmark_tasks' in design else {}
+    combinations = review_layout(design) if template and protocols else None
+    content = render(design, proposal_hash, cycle=cycle, provenance=provenance, combinations=combinations)
+    if 'benchmark_tasks' in design:
+        content += '\n\n## 论文实验参数与原文来源\n\n以下为已读片段的结构化提取，仍须核对适用设置与语义；保存不代表科学审批。\n\n```json\n' + _json(protocols) + '\n```\n'
+    return content, combinations
+
+
+def _template_eligible(engine, prior):
+    if not prior or prior.get('io_template_review') == 1:
+        return True
+    if prior.get('architecture_review_read_budget'):
+        return False  # A reading-plan migration never changes its immutable document.
+    # A pending first read may be superseded. Decisions or delivery repairs
+    # already received belong to their original review and must be resolved there.
+    active = prior.get('active_review_handoff', {}).get('handoff_id')
+    return (prior.get('status') == 'reviewing' and prior.get('review_recovery_protocol') == 1
+            and not any(prior.get(k) for k in ('unit_reviews', 'reviews', 'review_delivery_validation'))
+            and not (active and engine.store.get('decisions', active)))
 
 
 def save(engine, harness, run_id, design):
@@ -65,11 +107,11 @@ def save(engine, harness, run_id, design):
     run, cycle = engine.store.get('runs', run_id), engine.cycle(run_id)
     dh = digest(design)
     base = f'cycle-{cycle}/architecture/{dh}'
-    content = render(design, ph, cycle=cycle, provenance=run['mode'])
-    if 'benchmark_tasks' in design:
-        from .experiment_protocols import resolve_design
-        protocols = resolve_design(engine, run_id, design)
-        content += '\n\n## 论文实验参数与原文来源\n\n以下为已读片段的结构化提取，仍须核对适用设置与语义；保存不代表科学审批。\n\n```json\n' + _json(protocols) + '\n```\n'
+    key = f'{run_id}:architecture:{cycle}:{dh}'
+    prior = engine.store.get('architecture_reviews', key)
+    template = (run['config'].get('architecture_review_recovery_protocol', 1) == 1
+                and _template_eligible(engine, prior))
+    content, combinations = _review_content(engine, run_id, design, ph, cycle, run['mode'], template=template)
 
     def immutable(name, text, kind):
         existing = engine.store.get('artifacts', run_id + ':' + name)
@@ -80,18 +122,20 @@ def save(engine, harness, run_id, design):
             return existing
         return engine.artifact(run_id, name, text, kind)
 
-    artifact = immutable(base + '/architecture.md', content, 'architecture_design')
+    filename = '/io-template-v1.md' if combinations else '/architecture.md'
+    artifact = immutable(base + filename, content, 'architecture_design')
     directory = document_index.index(engine, harness.intelligence, run_id, artifact['id'], kind='architecture_design')
     approved = immutable('ideas/' + ph + '/approved-proposal.md',
         '# 已通过共识的方案\n\n方案指纹：`' + ph + '`\n\n```json\n' + _json(proposal) + '\n```\n', 'approved_proposal')
     proposal_index = document_index.index(engine, harness.intelligence, run_id, approved['id'], kind='approved_proposal')
-    return {'id': f'{run_id}:architecture:{cycle}:{dh}', 'run_id': run_id, 'cycle': cycle,
+    return {'id': key, 'run_id': run_id, 'cycle': cycle,
+            **({'io_template_review': 1, 'combination_count': len(combinations)} if combinations else {}),
             'version': VERSION, 'design_hash': dh, 'proposal_hash': ph,
             'document': directory, 'approved_proposal': proposal_index, 'provenance': run['mode']}
 
 
 def units(engine, run_id, document, *, cap=None):
-    """Every character inspected, but never the complete document in one input."""
+    """Partition every character into groups of independently bounded read pages."""
     cap = min(6000, max(800, document['total_chars'] // 2)) if cap is None else cap
     rows, current, chars = [], [], 0
     for section in document['sections']:
@@ -100,7 +144,7 @@ def units(engine, run_id, document, *, cap=None):
             if chars == cap:
                 rows.append(current)
                 current, chars = [], 0
-            limit = min(cap - chars, section['chars'] - offset)
+            limit = min(6000, cap - chars, section['chars'] - offset)
             args = {'document_id': document['document_id'], 'expected_sha256': document['sha256'],
                     'section_id': section['id'], 'offset': offset, 'limit': limit}
             page = document_index.read(engine, run_id, args)
@@ -132,6 +176,9 @@ def _seed(engine, harness, run_id, role, purpose, instruction, context, schema, 
 
 def bounded_tool_result(context, receipts, call, output):
     """Supplemental reads cannot accumulate the whole Markdown in one request."""
+    if call.get('name') == 'materials.request_read':
+        from .supplemental_reads import bounded_output
+        return bounded_output(context, call, output)
     if (context.get('architecture_diagram_authoring_protocol') == 2
             and call.get('name') == 'architecture.draw_diagrams'):
         return output  # Compact tool save receipt, not additional document text.
@@ -173,7 +220,16 @@ def gate(engine, run_id, design, *, source_cycle=None):
     if (not record or record.get('status') != 'approved' or record.get('design_hash') != digest(design)
             or record.get('proposal_hash') != digest(engine.store.get('consensus', run_id, {}).get('proposal'))):
         raise ResearchBlocked('架构 Markdown 尚未取得同一文档版本的独立评议通过；代码实现与实验不会推进。')
-    document_index.load(engine, run_id, record['document']['document_id'], record['document']['sha256'])
+    _, text = document_index.load(engine, run_id, record['document']['document_id'], record['document']['sha256'])
+    if record.get('io_template_review') == 1:
+        expected, combinations = _review_content(engine, run_id, design, record['proposal_hash'],
+                                            record['cycle'], record['provenance'], template=True)
+        if not combinations or text != expected or record.get('combination_count') != len(combinations):
+            raise ResearchBlocked('实际任务与已审模板或输入输出组合表不一致。')
+    from .architecture_full_review import FIELD as FULL
+    if FULL in record:
+        from .architecture_full_review import gate as full_gate
+        return full_gate(engine, run_id, record)
     if record.get('review_recovery_protocol') == 1:
         from .architecture_review_recovery import gate as recovery_gate
         return recovery_gate(engine, run_id, record)
@@ -217,9 +273,21 @@ async def review(engine, harness, run_id, design):
     await engine._read_consensus_check(run_id, engine._consensus_gate, run_id)
     saved = save(engine, harness, run_id, design)
     record = engine.store.get('architecture_reviews', saved['id'])
+    if record and saved.get('io_template_review') == 1 and not record.get('io_template_review'):
+        archived = engine.store.mutate('superseded_architecture_reviews', record['id'],
+                                       lambda previous: previous or record)
+        if archived != record or not _template_eligible(engine, record):
+            raise ResearchBlocked('原分段交接已变化，须先核对已保存的意见。')
+        record = None
     if record and record.get('status') == 'approved':
         await engine._read_consensus_check(run_id, operation(gate), engine, run_id, design)
         return record
+    from .architecture_full_review import review as full_review
+    return await full_review(engine, harness, run_id, design, saved, record)
+
+
+async def _legacy_review(engine, harness, run_id, design, saved, record):
+    from .engine import ResearchBlocked, digest
     if record and record.get('status') == 'rejected':
         raise ResearchBlocked('架构文档评议未通过；具体修改意见已保存在架构设计详情中。')
     if record is None:
@@ -240,6 +308,10 @@ async def review(engine, harness, run_id, design):
             record.update(review_recovery_protocol=1, evidence_amendment_limit=3,
                           unit_review_amendments=[], final_review_amendments=[],
                           architecture_workflow_protocol=1, document_read_window_protocol=2)
+            if not record.get('io_template_review'):
+                from .architecture_review_budget import KEY, profile
+                record[KEY] = profile(record['document'])
+                record['unit_cap'] = record[KEY]['unit_chars']
     if record.get('review_recovery_protocol') == 1:
         from .architecture_review_recovery import advance
         return await advance(engine, harness, run_id, design, record)
@@ -254,6 +326,10 @@ async def review(engine, harness, run_id, design):
                'source_tool_protocol': 1, 'research_cycle': saved['cycle'],
                'architecture_document': saved['document'], 'approved_proposal': saved['approved_proposal'],
                'design_hash': saved['design_hash'], 'execution_constraints': constraints(config)}
+    from .dataset_contract import from_design
+    request_catalog = from_design(design)
+    if request_catalog:
+        context.update(dataset_catalog=copy.deepcopy(request_catalog), dataset_request_protocol=2)
     from .dataset_transition import review_scope
     context.update(review_scope(engine.store, run_id))
     from . import design_review_policy as policy
@@ -372,7 +448,8 @@ def view(engine, run_id):
     rows = engine.store.list('architecture_reviews', run_id)
     from .architecture_review_recovery import effective_source
     for index, row in enumerate(rows):
-        if row.get('review_recovery_protocol') == 1:
+        from .architecture_full_review import FIELD as FULL
+        if row.get('review_recovery_protocol') == 1 and FULL not in row:
             effective = effective_source(row)
             rows[index] = {**row, 'effective_unit_reviews': effective['unit_reviews'],
                            'effective_reviews': effective['reviews']}

@@ -12,3 +12,41 @@
 @media(max-width:700px){.experiment-summary{padding:14px 12px}.result-methods{grid-template-columns:1fr 1fr}.result-methods>div{padding:12px}.result-methods>div:last-child{grid-column:1/-1;border-left:0;border-top:1px solid #dfe7e2}.result-methods strong{font-size:20px}.result-method-table table{min-width:590px}.experiment-summary th,.experiment-summary td{padding:10px 8px}.result-criteria table{min-width:480px}.result-heading h3{font-size:16px}.result-dataset{padding:10px}.result-table-heading>span{font-size:11px}}
 
 .dataset-experiments .experiments-view th,.dataset-experiments .experiments-view td{color:#29443b}.dataset-experiments .experiments-view td small{color:#5e7367}.dataset-experiments .experiment-logs summary{color:#435f50}
+
+.method-configurations { margin-top: 24px; }
+.method-configurations > .result-table-heading { margin-top: 0; }
+.method-configuration-block { border: 1px solid #dce6dc; border-radius: 9px; margin: 16px 0; overflow: hidden; }
+.method-configuration-block > summary { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; padding: 14px 16px; background: #f7f9f5; cursor: pointer; list-style: none; }
+.method-configuration-block > summary::-webkit-details-marker { display: none; }
+.method-configuration-block > summary:focus-visible { outline: 2px solid #4c8065; outline-offset: -2px; }
+.method-configuration-block[open] > summary { border-bottom: 1px solid #e1e8dc; }
+.method-configuration-block[open] > summary .method-config-count svg { transform: rotate(180deg); }
+.method-configuration-block h5 { font-size: 16px; line-height: 1.4; color: #2c493a; margin: 0; }
+.method-configuration-block .result-tag { margin-left: 0; }
+.method-config-meta { flex-basis: 100%; font-size: 11px; color: #6a7a6d; line-height: 1.5; overflow-wrap: anywhere; }
+.method-config-count, .method-config-highlight { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.method-config-count { color: #5e705f; margin-left: auto; }
+.method-config-highlight { color: #315e39; font-weight: 600; }
+.method-configurations .result-method-table table { min-width: 740px; }
+.method-configurations .result-method-table th, .method-configurations .result-method-table td { padding: 12px 10px; font-size: 12px; vertical-align: middle; }
+.method-configurations .result-method-table tbody th { min-width: 118px; width: 125px; background: #fafcf8; }
+.method-configurations .result-method-table thead th { background: #f0f4ed; font-size: 11px; }
+.method-configurations .result-method-table td:last-child { min-width: 125px; max-width: 240px; }
+.method-config-number { font-size: 11px; color: #73816e; display: block; }
+.method-best-badge { display: inline-flex; gap: 4px; align-items: center; border-radius: 4px; font-size: 10px; font-weight: 600; color: #fff; background: #376342; padding: 3px 5px; margin-top: 5px; white-space: nowrap; }
+.method-configurations .method-config-winner td, .method-configurations .method-config-winner th { background: #edf6e9!important; }
+.method-configurations .method-config-winner th { box-shadow: inset 3px 0 #557f46; }
+.method-configurations .method-primary-heading, .method-configurations .method-primary-value { background: #f7faf5; }
+.method-configurations .result-number.method-primary-value { color: #2c5636; font-weight: 650; font-size: 15px; }
+.method-configurations .method-config-winner .method-primary-value { color: #235c2c; font-weight: 750; }
+.method-configurations .method-parameter { color: #304939; font-weight: 500; font-variant-numeric: tabular-nums; }
+.method-unset { color: #a2aaa0; }
+.method-configurations .method-seeds { color: #617263; font-size: 12px; }
+.method-configurations .result-method-table .result-source { font-size: 10px; margin-top: 4px; }
+.method-configurations .result-source[open] { min-width: 180px; }
+.method-configurations .result-source pre { max-height: 220px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.method-configurations .result-method-table:focus-visible { outline: 2px solid #4c8065; outline-offset: -2px; }
+@media(max-width:700px) {
+  .method-configuration-block > summary { padding: 12px; }
+  .method-configurations .result-method-table th, .method-configurations .result-method-table td { padding: 10px 8px; }
+}

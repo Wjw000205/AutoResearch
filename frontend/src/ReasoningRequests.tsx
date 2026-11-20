@@ -55,6 +55,7 @@ export function ReasoningProgress({ runId, runStatus, onDetails }: { runId: stri
 
 export function ReasoningRequestContent({ value }: { value: Json }) {
   return <div><p><ReferenceText value={value.scope} /></p><dl><div><dt>模型／推理强度</dt><dd>{value.selection?.model} / {value.selection?.effort}</dd></div><div><dt>会话／回合</dt><dd><code>{value.receipt?.thread_id ?? '尚未返回'} / {value.receipt?.turn_id ?? '尚未返回'}</code></dd></div></dl>
+    {value.selection?.routing && <p><strong>Harness 分配 · {({simple: '简单', moderate: '中等', complex: '复杂'} as Record<string, string>)[value.selection.routing.tier]}</strong> · {value.selection.routing.reason}</p>}
     <h4>本会话累计 token</h4><SessionTokens usage={value.receipt?.usage?.total} /><p>按 Codex 回执记录；缓存命中属于输入，推理输出属于输出，不重复相加。未返回的字段显示“未报告”。</p>
     <details open><summary>返回结果与回执</summary><pre tabIndex={0}>{JSON.stringify({ receipt: value.receipt, result: value.result ?? '尚未返回完整结果' }, null, 2)}</pre></details>
     <details><summary>发送给模型的完整任务正文（脱敏）</summary><pre tabIndex={0}>{value.instruction}</pre></details>

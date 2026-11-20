@@ -10,6 +10,7 @@ from urllib.parse import unquote
 
 from . import literature_rounds, venue_policy, literature_relevance
 from .storage import now
+from .async_ownership import gather as gather_owned
 
 
 def current_papers(engine, run_id, papers):
@@ -140,13 +141,12 @@ async def reconcile(engine, harness, run_id, analysis, papers, *, source_handoff
         if scope['enabled']:
             # Upgrade historical task/RAG metadata using registry lookups. Never
             # turn a supplied rank into verification, or discard original notes.
-            import asyncio
             known = current_papers(engine, run_id, papers)
             pending = metadata_refresh_candidates(known, references(candidate), {p['id'] for p in papers},
                                                   literature_relevance.task_query(engine, run_id))
             for offset in range(0, len(pending), 5):
                 engine.check_active(run_id)
-                refreshed = await asyncio.gather(*(engine.literature.verify(p) for p in pending[offset:offset + 5]))
+                refreshed = await gather_owned(*(engine.literature.verify(p) for p in pending[offset:offset + 5]))
                 for p in refreshed:
                     if p.get('verified'):
                         evidence_id = f'{run_id}:{p["id"]}'

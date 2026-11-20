@@ -43,6 +43,8 @@ ENVELOPE_INSTRUCTION = ('\n\nTRANSPORT CONTRACT: Your final output must be an ob
 
 
 def profile(store, run_id, provider, context):
+    from .task_reasoning import routed_provider
+    provider = routed_provider(provider, context)
     stage = store.get('runs', run_id, {}).get('stage')
     purpose = str(context.get('_purpose', '')).split(':')[0]
     # A literature subtask keeps its own profile even inside innovation/design.
@@ -54,6 +56,12 @@ def profile(store, run_id, provider, context):
     effort = provider.get('deep_reasoning_effort', 'max') if deep else provider.get('reasoning_effort', 'high')
     if supporting and context.get('literature_reasoning_effort') in {'low', 'medium', 'high', 'xhigh', 'max'}:
         effort = context['literature_reasoning_effort']
+    if 'task_reasoning_effort' in provider:
+        route = provider.get('task_route', {})
+        return {'model': provider['model'], 'effort': provider['task_reasoning_effort'],
+                'timeout': provider.get('task_timeout', provider.get('timeout_seconds', 1800)), 'stage': stage,
+                **({'routing': {'version': 2, **route}} if route else {}),
+                'purpose': context['_purpose'], 'profile': 'task_routed'}
     return {'model': provider['model'],
             'effort': effort,
             'timeout': provider.get('deep_timeout_seconds', 3600) if deep else provider.get('timeout_seconds', 1800),
@@ -94,8 +102,11 @@ async def _prepare_context(intelligence, run_id, role, task, context, schema, pr
         # compilation neither reserves budget nor sends a native request.
         prepared_context = intelligence._context(run_id, role, task, context, provider, schema)
         system, user, cap = prepared_context
+        from .implementation_issue_output_capacity import admit
+        admit(context, cap)
         limit = int(intelligence.store.get('runs', run_id, {}).get('config', {}).get('context_tokens', 256000))
-        instruction = system + '\n\n' + user + ENVELOPE_INSTRUCTION
+        from .review_evidence_supplement import direct_output
+        instruction = system + '\n\n' + user + ('' if direct_output(context,schema) else ENVELOPE_INSTRUCTION)
         if token_estimate(instruction) + tokens(images) > min(limit, int(provider['context_window']) - cap - 256):
             raise ProviderError('Task and JSON schema exceed the configured context budget')
         from . import implementation_indexed_review as indexed
@@ -125,7 +136,7 @@ async def _prepare_context(intelligence, run_id, role, task, context, schema, pr
         raise
 
 
-async def ask(intelligence, run_id, role, task, context, schema, provider):
+async def ask(intelligence, run_id, role, task, context, schema, provider, *, native_admission=None):
     from .intelligence import ProviderError, normalize_usage, parse_provider_json
     store = intelligence.store
     from .image_inputs import resolve
@@ -141,6 +152,15 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
     async with lock:
         saved = store.get('codex_reasoning', key)
         chosen = profile(store, run_id, provider, context)
+        if native_admission is not None:
+            checkpoint = (saved or {}).get('checkpoint') or {}
+            readback = (saved and saved.get('id') == key and saved.get('operation_id') == operation
+                and saved.get('run_id') == run_id and saved.get('role') == role and saved.get('schema') == schema
+                and checkpoint.get('run_id') == run_id and checkpoint.get('operation_id') == key
+                and checkpoint.get('reasoning_only') is True and checkpoint.get('turn_dispatched_at')
+                and checkpoint.get('thread_id') and checkpoint.get('turn_id'))
+            if not readback:
+                native_admission(key)
         if saved:
             # Continue the original model/effort and frozen input after interruption.
             if saved['selection']['model'] != provider['model']:
@@ -170,6 +190,10 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
             saved = {'id': key, 'run_id': run_id, 'role': role, 'operation_id': operation,
                      'selection': chosen, 'instruction': instruction,
                      'output_limit': cap, 'schema': schema, 'transport_schema': TRANSPORT_SCHEMA, 'created_at': now()}
+            from .review_evidence_supplement import direct_output
+            if direct_output(context,schema):
+                saved.pop('transport_schema')
+                saved['native_task_schema'] = True
             binding = getattr(prepared_instruction, 'memory_capture_binding', None)
             if binding:
                 saved['memory_capture_binding'] = copy.deepcopy(binding)
@@ -218,6 +242,10 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
                 usage.update(role=role, purpose=context.get('_purpose'), backend='reasoning')
                 store.put('codex_usage', usage['id'], usage)
 
+        from . import native_preflight_retry
+        retry_unsubmitted = native_preflight_retry.eligible_checkpoint(saved.get('checkpoint'))
+        if retry_unsubmitted and not native_preflight_retry.confirmed(store, saved):
+            raise ProviderError('本机 Codex 初始化回执与提交、预算或输出记录不一致；已保留原请求，请核对执行记录。')
         active()
         if not saved.get('reservation'):
             # The operation id allows a crash between admission and its mirror
@@ -233,6 +261,14 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
             status='prepared', wire_sha256=hashlib.sha256(saved['instruction'].encode('utf-8')).hexdigest())
         manifest_status = 'prepared'
         started = time.monotonic()
+        def previously_used_model():
+            binding = saved.get('memory_capture_binding') or {}
+            hid = binding.get('handoff_id')
+            owner = store.get('handoffs', hid) if hid else None
+            return bool(owner and owner.get('run_id') == run_id and owner.get('to_role') == role and any(
+                call.get('provider') == 'local_codex' and call.get('model') == chosen['model']
+                and call.get('request_id') and call['request_id'] != saved['reservation']['id']
+                for call in owner.get('model_calls', [])))
         try:
             async def read_original(remaining):
                 nonlocal client
@@ -251,10 +287,16 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
             try:
                 if native_timeout_readback.FIELD in saved:
                     native_timeout_readback.validate(saved, store=store)
+                if retry_unsubmitted:
+                    saved.setdefault('unsubmitted_preflight_history', []).append({
+                        'checkpoint': copy.deepcopy(saved['checkpoint']), 'retried_at': now(),
+                        'request_id': saved['reservation']['id']})
                 receipt = await client.run(run_id, workspace, saved['instruction'], operation_id=key,
                     checkpoint=saved.get('checkpoint'), on_progress=persist, check_active=active,
                     model=chosen['model'], effort=chosen['effort'], reasoning_only=True,
                     output_schema=saved.get('transport_schema', saved['schema']), keep_open=True,
+                    previously_used_model=previously_used_model,
+                    **({'retry_unsubmitted': True} if retry_unsubmitted else {}),
                     **({'image_inputs': native_images} if native_images else {}))
                 persist(receipt)
                 receipt = await native_timeout_readback.recover(saved, store=store,
@@ -263,7 +305,8 @@ async def ask(intelligence, run_id, role, task, context, schema, provider):
                 raise ProviderError('本机 Codex 请求未完成：' + exc.code + '；未回退到 API。') from exc
             if receipt.get('status') != 'completed' or receipt.get('public_output_truncated'):
                 from .local_codex import LocalCodexClient as NativeClient
-                if NativeClient._unsubmitted_initialization(receipt, True):
+                if (NativeClient._unsubmitted_initialization(receipt, True)
+                        or native_preflight_retry.confirmed(store, saved)):
                     raise ProviderError('本机 Codex 初始化尚未完成：' + str(receipt.get('error_code'))
                         + '；尚未提交模型回合，恢复时继续原请求的首次初始化。')
                 raise ProviderError('本机 Codex 请求尚无完整结果：' + str(receipt.get('error_code') or receipt.get('status'))

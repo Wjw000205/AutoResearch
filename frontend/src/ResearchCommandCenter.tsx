@@ -1,21 +1,24 @@
 import { ReferenceText } from './ReferenceNames';
+import { LocalPreparationProgress, localValidationHeading } from './HarnessPreparation';
 import { AgentMemoryTree } from './AgentMemoryTree';
 import { useEffect, useId, useRef, useState } from 'react';
 import { Activity, ArrowDown, ArrowRight, ArrowUpRight, BookOpen, Check, ChevronDown, CircleAlert, Code2, Compass, FileText, GitBranch, LoaderCircle, RefreshCw, ShieldCheck, SkipForward, Terminal, Workflow, Wrench, X } from 'lucide-react';
-import { date, number, textOf, type CurrentExecution, type AgentActivityProgress, type AgentCurrentActivity, type AgentHistoryEntry, type Json, type ResearchMap, type ResearchMapAgent, type ResearchMapLink } from './api';
+import { date, number, textOf, type CurrentExecution, type AgentActivityProgress, type AgentCurrentActivity, type AgentHistoryEntry, type DispatchSubject, type Json, type ResearchMap, type ResearchMapAgent, type ResearchMapLink } from './api';
 import { isNativeCodexGate, requestRecoveryText } from './RequestRecoveryDiagnostic';
 import { HumanMessage, humanizeMessage, sourceSupplementTaskSummary } from './localization';
 import { CitationDiscardNotice } from './CitationDiscardNotice';
 import { ToolEventSummary } from './ToolEventSummary';
 import { historyDisplay } from './AgentHistoryFocus';
-import { agentTaskCard } from './AgentTaskCard';
+import { agentTaskCard, metricReviewLabels } from './AgentTaskCard';
 import { experimentTaskDescription } from './ExperimentTaskDescriptions';
+import { parameterName, parameterValue } from './ParameterMatrix';
 import { conversationGeometry, useConversationLayout } from './ConversationLayout';
 import { codexParticipant, codexExchanges, type CodexParticipant } from './CommandCodex';
 import { ReviewFeedback } from './ReviewFeedback';
 import { createAgentHistoryLoader, mergeAgentHistory, type AgentHistoryPages } from './AgentHistoryPagination';
 import { useRemoteResource, useProjectionSnapshot } from './useRemoteResource';
 import { optimizationDisplayStage } from './OptimizationDisplayStage';
+import { currentReviewLinks, revisionReviewCards } from './implementationCodeReview';
 import type { RunProjection } from './RunProjections';
 export { createAgentHistoryLoader, fetchAgentHistory, mergeAgentHistory, mergeAgentHistoryPage } from './AgentHistoryPagination';
 
@@ -34,6 +37,8 @@ Object.assign(purposeNames, { dataset_select: '选择实验数据集', dataset_w
 const purposeName = (value: string) => { const experimentTask = experimentTaskDescription(value); if (experimentTask) return experimentTask.name; const supplement = sourceSupplementTaskSummary(value); if (supplement) return supplement; const [base, ...suffix] = value.split(':'); if (base === 'evidence' || base === 'amendment') return purposeNames[base]; return `${purposeNames[base] ?? humanizeMessage(base)}${suffix.length ? ` · ${suffix.join(' / ')}` : ''}`; };
 
 interface CommandMap extends Omit<ResearchMap, 'mainline'> {
+  harness_activity?: import('./api').HarnessActivity | null;
+  dispatch_event?: DispatchEvent | null;
   projection?: string;
   branches_loaded?: boolean;
   run_status?: string; run_error?: string | null; current_execution?: CurrentExecution | null;
@@ -41,6 +46,8 @@ interface CommandMap extends Omit<ResearchMap, 'mainline'> {
   mainline: (ResearchMap['mainline'][number] & {is_current?: boolean; activity_status?: string | null; reason?: string | null})[];
 }
 const overallStatusNames: Record<string, string> = { running: '研究进行中', blocked: '研究已阻塞', paused: '研究已暂停', completed: '研究已完成', failed: '研究失败', cancelled: '研究已取消', draft: '研究待启动' };
+purposeNames.implementation_evidence_review = '定向补证任务';
+Object.assign(purposeNames, metricReviewLabels);
 
 export function ResearchOutcome({ outcome }: { outcome?: CommandMap['outcome'] }) {
   const labels: Record<string, string> = { positive: '正向证据', negative: '负结果', inconclusive: '证据不足' };
@@ -66,7 +73,7 @@ export function ExecutionActivity({ execution }: { execution?: CurrentExecution 
 export function AgentOrbit({ status, role }: { status: string; role: string }) {
   const Icon = roles[role]?.icon ?? Activity;
   const subject = role === 'harness' ? '流程调度' : '此智能体';
-  return <span className={`command-orbit ${status === 'running' ? 'is-running' : ''}`} data-running={status === 'running'} aria-label={status === 'running' ? `${subject}正在运行` : `${subject}当前未运行`}><span className="command-orbit-track" aria-hidden="true" /><span className="command-orbit-center"><Icon size={23} strokeWidth={1.5} /></span>{status === 'running' && <span className="command-orbit-point" aria-hidden="true" />}</span>;
+  return <span className={`command-orbit ${status === 'running' ? 'is-running' : ''}`} data-running={status === 'running'} aria-label={status === 'unconfirmed' ? `${subject}执行状态待确认` : status === 'running' ? `${subject}正在运行` : `${subject}当前未运行`}><span className="command-orbit-track" aria-hidden="true" /><span className="command-orbit-center"><Icon size={23} strokeWidth={1.5} /></span>{status === 'running' && <span className="command-orbit-point" aria-hidden="true" />}</span>;
 }
 
 function activityPercentage(value: number | null | undefined) {
@@ -101,13 +108,41 @@ const validReadingCount = (value: number | null | undefined): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const shortCharacters = (value: number) => value >= 10000 ? `${(value / 10000).toFixed(1)} 万字符` : `${value.toLocaleString('zh-CN')} 字符`;
 
+export function RequiredReadingCoverage({reading}: {reading: NonNullable<AgentCurrentActivity['reading']>}) {
+  const delivery = reading.source === 'authenticated_code_delivery_and_approved_documents';
+  const known = !reading.state && reading.reported === true && validReadingCount(reading.completed)
+    && validReadingCount(reading.total) && reading.total > 0 && reading.completed <= reading.total
+    && validReadingCount(reading.remaining) && reading.remaining === reading.total - reading.completed
+    && typeof reading.percent === 'number' && Number.isFinite(reading.percent) && reading.percent >= 0
+    && reading.percent <= 100 && Math.abs(reading.percent - (reading.completed === reading.total
+      ? 100 : Math.min(99.9, Math.round(1000 * reading.completed / reading.total) / 10))) < 0.11;
+  const split = known && validReadingCount(reading.new_delivered_chars) && validReadingCount(reading.reused_chars)
+    && reading.new_delivered_chars + reading.reused_chars === reading.completed;
+  return <section className="command-required-reading" aria-label="必读材料覆盖">
+    <ActivityProgress progress={{kind: 'reading', label: delivery ? '代码交付必读覆盖' : '必读覆盖', reported: known,
+      state: known ? undefined : reading.state ?? 'unavailable', percent: known ? reading.percent : null,
+      completed: known ? reading.completed : null, total: known ? reading.total : null, unit: 'characters', completed_label: '已确认覆盖'}} />
+    {delivery && <small className="command-reading-documents">{reading.architecture_reading === 'on_demand'
+      ? '实现文档和 Codex 交付文件。批准架构按需查阅。' : '实现文档、Codex 交付文件和批准架构'}</small>}
+    {known && <small className="command-reading-documents">剩余 {reading.remaining!.toLocaleString('zh-CN')} 字符</small>}
+    {split && <small className="command-reading-documents">本轮新增投递 {reading.new_delivered_chars!.toLocaleString('zh-CN')} · 同角色复用 {reading.reused_chars!.toLocaleString('zh-CN')} 字符</small>}
+    {known && validReadingCount(reading.materials_completed) && validReadingCount(reading.materials_total)
+      && reading.materials_total > 0 && reading.materials_completed <= reading.materials_total
+      && <small className="command-reading-documents">完整覆盖 {reading.materials_completed} / {reading.materials_total} 项必读材料</small>}
+    {known && validReadingCount(reading.pending_chars) && reading.pending_chars > 0 && reading.pending_chars <= reading.remaining!
+      && <small className="command-reading-documents">另有 {reading.pending_chars.toLocaleString('zh-CN')} 字符已取回，尚未确认投递</small>}
+    {known && reading.observed_at && <small className="command-reading-documents">核验于 {date(reading.observed_at, true)}</small>}
+    <small className="command-reading-documents">重复范围不重复计数；必读覆盖不代表审核通过。</small>
+  </section>;
+}
+
 function ReferenceReading({reading}: {reading: NonNullable<AgentCurrentActivity['reading']>}) {
   const reported = reading.reported !== false && !reading.state;
   const total = reading.catalog_chars ?? reading.total;
   const documents = reading.catalog_documents ?? reading.documents_total;
   const hasCatalog = validReadingCount(total) && validReadingCount(documents) && documents > 0;
   return <div className="command-reference-reading" aria-label="按需查阅参考资料">
-    <strong>按问题核对代码与相关条款</strong>
+    <strong>按问题核对原文与相关条款</strong>
     <small>{reported && validReadingCount(reading.completed)
       ? `本次累计${reading.source === 'same_handoff_delivered_receipts' ? '提供' : '取回'} ${reading.completed.toLocaleString('zh-CN')} 字符参考正文`
       : reading.state === 'unavailable' ? '暂无法统计已提供的参考正文' : '正在统计已提供的参考正文'}</small>
@@ -131,10 +166,14 @@ export function AgentActivityDetail({ activity }: { activity: NonNullable<Return
     && ['document_revision', 'document_saving', 'document_checking'].includes(activity.phase);
   const memory = activity.revision_memory;
   const revision = activity.revision_status;
-  const fixedReadingScope = reading?.scope === 'current_task_sources';
+  const wholeDocumentReading = reading?.scope === 'whole_document_sources';
+  const requiredReading = reading?.scope === 'full_review_sources';
+  const fixedReadingScope = wholeDocumentReading || reading?.scope === 'current_task_sources';
+  const displayProgress = wholeDocumentReading && activity.progress?.kind === 'reading'
+    ? {...activity.progress, label: '必读全文覆盖'} : activity.progress;
   // Older servers exposed the entire code-review directory as a percentage.
   // It is an on-demand catalog, even before they adopt the explicit scope.
-  const referenceCatalog = reading?.scope === 'reference_catalog' || activity.phase === 'code_review';
+  const referenceCatalog = !requiredReading && (reading?.scope === 'reference_catalog' || activity.phase === 'code_review');
   const deliveredReading = reading?.source === 'same_handoff_delivered_receipts';
   const readingReported = reading?.reported !== false && !reading?.state;
   const location = tool ? [tool.document_title, tool.section_label || tool.section_id].filter(Boolean).join(' · ') : '';
@@ -146,7 +185,8 @@ export function AgentActivityDetail({ activity }: { activity: NonNullable<Return
     <div className="command-activity-heading"><Activity size={13} /><strong><ReferenceText value={activity.label} /></strong></div>
     {(typeof activity.version === 'number' && activity.version > 0 || typeof activity.round === 'number' && activity.round > 0) && <div className="command-activity-version">{typeof activity.version === 'number' && activity.version > 0 && <span>文档第 {activity.version} 版</span>}{typeof activity.round === 'number' && activity.round > 0 && <span>审核第 {activity.round} 轮</span>}</div>}
     {activity.detail && <p className="command-activity-detail"><ReferenceText value={humanizeMessage(requestRecoveryText(activity.detail))} /></p>}
-    {activity.progress && !(referenceCatalog && activity.progress.kind === 'reading') && <ActivityProgress progress={activity.progress} />}
+    {requiredReading && <RequiredReadingCoverage reading={reading!} />}
+    {displayProgress && !(referenceCatalog && displayProgress.kind === 'reading') && (!requiredReading || displayProgress.kind !== 'reading') && <ActivityProgress progress={displayProgress} />}
     {revision && <div className="command-activity-detail" aria-label="修订保存与自检状态">
       <p>保存记录覆盖 {revision.handled} / {revision.total} 条意见，不代表整条意见已完成。</p>
       {revision.failed_units > 0 && <p>{revision.failed_units} 个修改位置待重试；已保存修改保留。</p>}
@@ -167,14 +207,15 @@ export function AgentActivityDetail({ activity }: { activity: NonNullable<Return
       历史阅读索引覆盖 {memory.historical_read_chars.toLocaleString('zh-CN')} 字符，索引不代表正文已全部载入。</p>}
     {sourceReading && revisionReading && <small className="command-reading-documents">本轮按修改意见定向修订；仅在上下文缺失、来源换版或细节需核对时补读，不要求重新通读材料。{readingReported && typeof reading.completed === 'number' && `本轮默认材料已交付 ${reading.completed.toLocaleString('zh-CN')} 字符。`}</small>}
     {reading && referenceCatalog && <ReferenceReading reading={reading} />}
-    {sourceReading && !revisionReading && !referenceCatalog && <><ActivityProgress progress={{kind: 'reading', label: fixedReadingScope ? '本轮对照材料阅读进度' : reading.source === 'same_handoff_read_receipts' ? '本次来源阅读进度' : '来源阅读进度', reported: reading.reported !== false, state: reading.state, percent: reading.percent,
-      completed: reading.completed, total: reading.total, unit: reading.unit}} />{typeof reading.documents_total === 'number' && reading.documents_total > 0
+    {!requiredReading && (sourceReading && !revisionReading && !referenceCatalog || wholeDocumentReading) && <>{sourceReading && <ActivityProgress progress={{kind: 'reading', label: wholeDocumentReading ? '必读全文覆盖' : fixedReadingScope ? '本轮对照材料阅读进度' : reading.source === 'same_handoff_read_receipts' ? '本次来源阅读进度' : '来源阅读进度', reported: reading.reported !== false, state: reading.state, percent: reading.percent,
+      completed: reading.completed, total: reading.total, unit: reading.unit}} />}{typeof reading.documents_total === 'number' && reading.documents_total > 0
       && readingReported
       && typeof reading.documents_completed === 'number' && reading.documents_completed >= 0 && reading.documents_completed <= reading.documents_total
-      && <small className="command-reading-documents">{deliveredReading ? '正文已交付' : '完整读完'} {reading.documents_completed} / {reading.documents_total} 份{fixedReadingScope ? '默认对照材料' : '来源'}</small>}
+      && <small className="command-reading-documents">{deliveredReading ? '正文已交付' : '完整读完'} {reading.documents_completed} / {reading.documents_total} 份{wholeDocumentReading ? '必读全文' : fixedReadingScope ? '默认对照材料' : '来源'}</small>}
+      {wholeDocumentReading && <small className="command-reading-documents">必读全文覆盖不代表审核通过，最终意见另行提交。</small>}
       {fixedReadingScope && <small className="command-reading-documents">总量按本轮固定范围统计；工作笔记和按需展开材料不增加总量。{deliveredReading && '进度依据实际进入模型请求的正文范围。'}</small>}
       {fixedReadingScope && typeof reading.optional_documents === 'number' && Number.isSafeInteger(reading.optional_documents) && reading.optional_documents > 0
-        && <small className="command-reading-documents">另有 {reading.optional_documents} 份按需参考资料，不要求逐份重读。</small>}</>}
+        && <small className="command-reading-documents">另有 {reading.optional_documents} 份按需参考资料{wholeDocumentReading && typeof reading.optional_chars === 'number' ? `，共 ${reading.optional_chars.toLocaleString('zh-CN')} 字符，不计入必读总量。` : '，不要求逐份重读。'}</small>}</>}
     {tool && <div className={`command-activity-tool tool-${tool.status}`}><span><Wrench size={12} />{activity.toolState}</span><code>{tool.name}</code>
       {toolLabel && <small><ReferenceText value={toolLabel} /></small>}
       {tool.status === 'failed' && (tool.validation_detail || tool.error) && <p className="command-tool-location"><ReferenceText value={tool.validation_detail || tool.error} /></p>}
@@ -184,21 +225,45 @@ export function AgentActivityDetail({ activity }: { activity: NonNullable<Return
   </div>;
 }
 
-export function AgentConversationCard({ agent, selected, onSelect }: { agent: ResearchMapAgent; selected: boolean; onSelect: (role: string, entry?: AgentHistoryEntry) => void }) {
+export function DispatchedTaskBrief({ assignment }: { assignment: ResearchMapAgent['current_assignment'] }) {
+  const brief = assignment?.task_brief;
+  if (!brief || brief.handoff_id !== assignment?.id) return null;
+  return <section className="command-dispatched-task" aria-label="本轮派发任务">
+    <strong>{brief.title} · {brief.issue_count} 项</strong>
+    {brief.inherits_previous && <p className="command-task-scope">其余{brief.inherited_issue_count > 0 ? ` ${brief.inherited_issue_count} 项` : ''}结论与已有读取沿用原记录。</p>}
+    {brief.host_constraints_handled && <p className="command-task-scope">宿主账本已由 Harness 澄清，本轮不再送审。</p>}
+    {brief.items.map(item => <details key={item.id}>
+      <summary><ChevronDown size={12} aria-hidden="true" /><span>{item.requirement_id && <b>{item.requirement_id} · </b>}<ReferenceText value={item.problem} /></span></summary>
+      {item.fixes.map((fix, index) => <dl key={index}>
+        {fix.location && <><dt>核对或修改位置</dt><dd><ReferenceText value={fix.location} /></dd></>}
+        {fix.change && <><dt>处理要求</dt><dd><ReferenceText value={fix.change} /></dd></>}
+        {fix.verification && <><dt>验收方式</dt><dd><ReferenceText value={fix.verification} /></dd></>}
+      </dl>)}
+    </details>)}
+    {brief.truncated && <small>此处显示任务摘录，完整记录保留在专属工作记录中。</small>}
+  </section>;
+}
+
+export function AgentConversationCard({ agent, selected, onSelect }: { agent: ResearchMapAgent & { review_state_label?: string }; selected: boolean; onSelect: (role: string, entry?: AgentHistoryEntry) => void }) {
   const card = agentTaskCard(agent);
   const completedReading = !card.activity && card.output && agent.current_activity?.phase === 'code_review'
-    && agent.current_activity.handoff_id === agent.current_assignment?.id ? agent.current_activity.reading : null;
+    && agent.current_activity.handoff_id === agent.current_assignment?.id
+    && agent.current_activity.reading?.scope !== 'full_review_sources' ? agent.current_activity.reading : null;
+  const completedRequiredReading = !card.activity && agent.current_activity?.handoff_id === agent.current_assignment?.id
+    && agent.current_activity?.reading?.scope === 'full_review_sources' ? agent.current_activity.reading : null;
   return <article className={`command-agent-card role-${agent.role} ${selected ? 'selected' : ''}`} data-role={agent.role}
     aria-label={`${roles[agent.role]?.name ?? agent.role}协作状态`}
     onClick={event => {
       if (!(event.target as HTMLElement).closest('details')) onSelect(agent.role, card.entry);
     }}>
-    <div className="command-agent-top"><AgentOrbit status={agent.status} role={agent.role} /><span className={`command-state state-${agent.status}`}><i />{statusNames[agent.status] ?? humanizeMessage(agent.status)}</span></div>
+    <div className="command-agent-top"><AgentOrbit status={agent.status} role={agent.role} /><span className={`command-state state-${agent.status}`}><i />{agent.review_state_label ?? statusNames[agent.status] ?? humanizeMessage(agent.status)}</span></div>
     <div className="command-agent-name"><h3><ReferenceText value={roles[agent.role]?.name ?? agent.role} /></h3><span>{roles[agent.role]?.short ?? agent.role}</span></div>
     <div className="command-agent-model" title={`${agent.provider} · ${agent.model}`}>{agent.model || '未指定模型'}<small>{agent.provider || '未绑定供应商'}</small></div>
     <div className={`command-speech-bubble ${card.output ? 'has-task-output' : ''} ${card.feedback.fixes.length ? 'has-review-fixes' : ''}`}>
       <span className="command-task-label">{card.title}{(agent.current_assignments_count ?? 0) > 1 && <small> · {agent.current_assignments_count} 项同时进行</small>}</span>
       <strong className="command-task-title" title={card.task}><ReferenceText value={card.task} /></strong>
+      <DispatchedTaskBrief assignment={agent.current_assignment} />
+      {completedRequiredReading && <RequiredReadingCoverage reading={completedRequiredReading} />}
       {card.activity && <AgentActivityDetail activity={card.activity} />}
       {card.verdict && <span className="command-output-verdict">{card.verdict}</span>}
       {card.summary && <p className="command-output-summary" title={card.summary}><ReferenceText value={card.summary} /></p>}
@@ -248,14 +313,125 @@ function ExchangeRecord({ link }: { link: ResearchMapLink }) {
   return <div className={`exchange-${link.status}`}><span><ReferenceText value={roles[link.from_role]?.name ?? link.from_role} /><ArrowRight size={12} /><ReferenceText value={roles[link.to_role]?.name ?? link.to_role} /></span><small>{exchangePurpose(link)} · {exchangeStatus(link)}</small></div>;
 }
 
-export function AgentConversation({ agents, links = [], selectedRole, onSelect, codex = codexParticipant(), codexModel, onCodexDetails, runStatus, executionStatus }: {
+function dispatchSubject(subject?: DispatchSubject) {
+  if (!subject) return '';
+  const variants: Record<string, string> = {baseline: '基线', proposed: 'Proposed', ablation: '消融', shared: '共享参数'};
+  const candidates = subject.combination_candidates;
+  return [subject.document_title, subject.dataset, subject.combination_control != null ? '组合验证' : null,
+    subject.variant && (variants[subject.variant] ?? subject.variant),
+    subject.factor && parameterName(subject.factor),
+    subject.proposed_value != null ? `提案值 ${parameterValue(subject.proposed_value)}` : null,
+    subject.combination_control != null ? `对照 ${parameterValue(subject.combination_control)}` : null,
+    Array.isArray(candidates) && candidates.length ? `待评值 ${candidates.map(parameterValue).join(' / ')}` : null,
+    subject.seed != null ? `种子 ${subject.seed}` : null,
+    subject.trial || (!subject.factor && subject.review_batch ? `复核批次 ${subject.review_batch}` : null),
+  ].filter(Boolean).join(' · ');
+}
+
+type DispatchEvent = { kind: string; at: string; role?: string | null; tool?: string | null };
+const dispatchEvents: Record<string, string> = {
+  'stage.started': '已进入当前阶段', 'run.resume_authorized': '已接收恢复请求', 'run.blocked': '任务已阻塞', 'run.paused': '任务已暂停',
+  'context.preparation_started': '开始准备本地上下文', 'context.preparation_completed': '本地上下文准备完成',
+  'context.preparation_stalled': '本地上下文准备超时', 'context.compiled': '已组装本轮请求上下文',
+  'handoff.queued': '交接已入队', 'handoff.completed': '已收取角色交付', 'agent.started': '开始处理角色请求',
+  'provider.completed': '模型回复已保存', 'handoff.native_readback': '开始读取原请求回执',
+  'tool.started': '开始调用工具', 'tool.completed': '工具调用已返回', 'experiment.decision': '已记录实验评审决定',
+  'experiment.started': '试验已启动', 'experiment.finished': '试验已结束', 'experiment.batch_finished': '批次已结束',
+};
+
+const localCheckLabels: Record<string, string> = {
+  checked: '核对冻结实验计划与指标合同', verify_sources: '核对已批准计划与原始来源',
+  validate_vote: '校验角色交付与来源绑定', build_source: '汇总评审意见与待处理问题',
+  verify: '核对冻结来源与评审回执', verify_saved: '复核已保存的评审结果',
+  _finalize: '汇总并核验本组角色交付', _validate_current_source: '核对当前问题集与冻结来源',
+  preflight_batch: '检查下一组任务的派发条件', _consensus_gate: '核对已有共识与执行条件',
+};
+
+export function HarnessWorkGroups({ activity, running = true }: {activity?: CommandMap['harness_activity']; running?: boolean}) {
+  if (!activity) return null;
+  const names: Record<string,string> = {queued:'排队中',running:'执行中',evidence_ready:'证据已保存',reviewing:'组内并行复核',completed:'已完成',blocked:'待处理'};
+  return <section className="dispatch-work-groups" aria-label="Harness 当前工作与任务队列">
+    <LocalPreparationProgress value={activity.local_validation} running={running}
+      label={activity.local_validation?.phase ? activity.local_validation.label : localCheckLabels[activity.local_validation?.step ?? ''] ?? activity.local_validation?.label} />
+    {activity.tasks.length>0 && <><strong>任务组串行 · 组内 Agent 并行</strong><ol>{activity.tasks.map(task=><li key={task.id} data-status={task.status}>
+      <b>{task.label}</b><span> · {roles[task.owner]?.name ?? (task.owner==='harness'?'Harness':task.owner)} · {names[task.status] ?? task.status}</span>
+      {task.message && <p><ReferenceText value={task.message} /></p>}
+    </li>)}</ol></>}
+    {activity.block_reason && <p className="dispatch-group-blocker"><b>当前阻塞原因</b> <ReferenceText value={activity.block_reason} /></p>}
+  </section>;
+}
+
+function DispatchActivity({ agents, execution, codex, runStatus, stage, event, onSelect, harnessActivity }: {
+  agents: ResearchMapAgent[]; execution?: CurrentExecution | null; codex: CodexParticipant;
+  runStatus?: string; stage?: string; event?: DispatchEvent | null; onSelect: (role: string) => void; harnessActivity?: CommandMap['harness_activity'];
+}) {
+  const running = runStatus === 'running';
+  const assigned = agents.filter(a => a.current_assignment);
+  const open = assigned.filter(a => !['completed', 'cancelled', 'idle'].includes(a.status));
+  const latest = [...assigned].sort((a, b) => (b.current_assignment?.updated_at ?? '').localeCompare(a.current_assignment?.updated_at ?? ''))[0];
+  const groups = new Map<string, ResearchMapAgent[]>();
+  for (const agent of open.length ? open : latest ? [latest] : []) {
+    const a = agent.current_assignment!;
+    const key = JSON.stringify([a.purpose, a.label, dispatchSubject(a.subject)]);
+    groups.set(key, [...(groups.get(key) ?? []), agent]);
+  }
+  const active = open.some(a => a.status === 'running');
+  const queued = open.some(a => ['queued', 'pending'].includes(a.status));
+  const recovering = open.some(a => a.status === 'recovering');
+  const executing = execution?.status === 'running' || codex.status === 'running';
+  const processingGroup = harnessActivity?.tasks.find(task => ['running', 'reviewing', 'evidence_ready'].includes(task.status));
+  const coordinating = running && Boolean(queued || active || recovering || executing || harnessActivity?.local_validation || processingGroup);
+  const blockedGroup = harnessActivity?.block_reason || harnessActivity?.tasks.some(task => task.status === 'blocked');
+  const pendingExecutor = codex.dispatched && ['pending', 'blocked', 'failed', 'paused'].includes(codex.status);
+  const unreported = running && !coordinating && !open.length && !execution && !blockedGroup && !pendingExecutor;
+  const heading = !running ? (overallStatusNames[runStatus ?? ''] ?? '调度记录')
+    : harnessActivity?.local_validation ? localValidationHeading(harnessActivity.local_validation)
+    : executing ? '执行中' : recovering ? '正在核验原请求' : active ? '已派发，等待角色回执'
+    : queued ? '已入队，等待接收' : processingGroup?.status === 'reviewing' ? '正在汇总角色交付并核验回执'
+    : processingGroup?.status === 'evidence_ready' ? '正在安排新增证据复核' : processingGroup ? '正在处理当前任务组'
+    : execution?.status === 'awaiting_confirmation' ? '等待执行确认'
+    : pendingExecutor ? '等待执行状态核对'
+    : blockedGroup ? '当前任务组待处理'
+    : unreported ? '运行中 · 等待进度回传'
+    : open.length ? '上次交接待处理' : '等待新任务派发';
+  return <div className="command-dispatcher" data-role="harness" data-active={coordinating} data-status={unreported ? 'running-unreported' : undefined} aria-label="流程调度明细">
+    <strong>流程调度</strong>
+    <div className="dispatch-content">
+      <div className="dispatch-heading"><strong>{heading}</strong>{stage && <small>{humanizeMessage(stage)}</small>}</div>
+      {unreported && <p role="status">当前步骤进度尚未上报。</p>}
+      <HarnessWorkGroups activity={harnessActivity} running={running} />
+      {execution && <div className="dispatch-subject"><b>{execution.kind === 'experiment' ? '实验执行器' : 'Codex'}</b><HumanMessage text={execution.action} /></div>}
+      {!execution && codex.dispatched && codex.status === 'running' && <p className="dispatch-subject">Codex · {codex.phase} · {codex.summary}</p>}
+      {[...groups.values()].map(group => {
+        const assignment = group[0].current_assignment!;
+        const task = experimentTaskDescription(assignment.purpose)?.name || (assignment.label !== assignment.purpose && assignment.label) || purposeName(assignment.purpose.split(':')[0]);
+        const subject = dispatchSubject(assignment.subject);
+        return <div className="dispatch-assignment" key={assignment.id}>
+          <strong>{open.length ? '' : '最近交接 · '}<ReferenceText value={task} /></strong>
+          {subject && <p className="dispatch-subject">{subject}</p>}
+          <div className="dispatch-recipients">{group.map(a => {
+            const status = !running && ['paused','blocked','failed','cancelled'].includes(runStatus ?? '') && ['running','recovering','queued'].includes(a.status) ? runStatus! : a.status;
+            const activity = a.current_activity?.handoff_id === a.current_assignment!.id && running && ['running','recovering'].includes(status)
+              ? a.current_activity : null;
+            return <button key={a.role} type="button" onClick={() => onSelect(a.role)} title={a.current_assignment!.updated_at ? `交接更新于 ${date(a.current_assignment!.updated_at, true)}` : undefined}>
+              <b>{roles[a.role]?.name ?? a.role}</b><span>{[statusNames[status] ?? humanizeMessage(status), activity?.label,
+                activity?.tool?.status === 'running' && (activity.tool.label || activity.tool.name)].filter(Boolean).join(' · ')}</span><ArrowUpRight size={12} />
+            </button>;
+          })}</div>
+        </div>;
+      })}
+      {!assigned.length && !execution && !executing && <p className="dispatch-subject">尚无已记录的角色派发</p>}
+      {event && dispatchEvents[event.kind] && <small className="dispatch-receipt">最近记录 · {date(event.at, true)} · {[roles[event.role ?? '']?.name, dispatchEvents[event.kind], event.tool].filter(Boolean).join(' · ')}</small>}
+    </div>
+    <AgentOrbit role="harness" status={coordinating ? 'running' : unreported ? 'unconfirmed' : 'idle'} />
+  </div>;
+}
+
+export function AgentConversation({ agents, links = [], selectedRole, onSelect, codex = codexParticipant(), codexModel, onCodexDetails, runStatus, execution, stage, event, harnessActivity }: {
   agents: ResearchMapAgent[]; links?: ResearchMapLink[]; selectedRole: string; onSelect: (role: string, entry?: AgentHistoryEntry) => void;
   codex?: CodexParticipant; codexModel?: string; onCodexDetails?: () => void;
-  runStatus?: string; executionStatus?: CurrentExecution['status'];
+  runStatus?: string; execution?: CurrentExecution | null; stage?: string; event?: DispatchEvent | null; harnessActivity?: CommandMap['harness_activity'];
 }) {
-  const dispatching = runStatus === 'running' && agents.length > 0
-    && !agents.some(agent => agent.status === 'running') && codex.status !== 'running'
-    && executionStatus !== 'running' && executionStatus !== 'awaiting_confirmation';
   const marker = `conversation-arrow-${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   const { canvas, layout } = useConversationLayout(['harness', 'codex', ...agents.map(agent => agent.role)].join(':'));
   const latestLinks = new Map<string, ResearchMapLink>();
@@ -271,23 +447,28 @@ export function AgentConversation({ agents, links = [], selectedRole, onSelect, 
           const geometry = conversationGeometry(layout.nodes, link.from_role, link.to_role);
           if (!geometry) return null;
           const { path, label } = geometry;
-          const active = link.status === 'running' && link.active === true;
-          return <g className={`conversation-link link-${link.status} ${active ? 'is-active' : ''}`} key={link.id} data-from-role={link.from_role} data-to-role={link.to_role}>
+          const pendingAssignment = link.from_role === 'harness' && agents.some(agent =>
+            agent.role === link.to_role && agent.current_assignment?.id === link.id
+            && ['queued', 'pending', 'running', 'recovering'].includes(agent.status));
+          const active = (!runStatus || runStatus === 'running')
+            && ['queued', 'pending', 'running', 'recovering'].includes(link.status)
+            && (link.active === true || pendingAssignment);
+          return <g className={`conversation-link link-${link.status} ${active ? 'is-active' : ''}`} key={link.id} data-from-role={link.from_role} data-to-role={link.to_role} data-flowing={active}>
             <path d={path} markerEnd={`url(#${marker})`} />
             <title>{`${roles[link.from_role]?.name ?? link.from_role} → ${roles[link.to_role]?.name ?? link.to_role}：${exchangePurpose(link)} · ${exchangeStatus(link)}`}</title>
             {(link.from_role === 'harness' || link.purpose === 'codex_receipt') && <text className="conversation-link-label" x={label.x} y={label.y - 12} textAnchor="middle">{exchangePurpose(link)}</text>}
-            {active && <><path className="conversation-flow-trail" d={path} pathLength={100} /><circle className="conversation-flow-dot" r="3.5"><animateMotion dur="2.8s" repeatCount="indefinite" path={path} /></circle></>}
+            {active && <><path className="conversation-flow-glow" d={path} pathLength={100} /><path className="conversation-flow-trail" d={path} pathLength={100} /><circle className="conversation-flow-dot" r="3.5"><animateMotion dur="2.8s" repeatCount="indefinite" path={path} /></circle></>}
           </g>;
         })}
       </svg>
-      <div className={`command-dispatcher ${dispatching ? 'is-running' : ''}`} data-role="harness"><strong>流程调度</strong><span>{dispatching ? '正在调度 · 派发与收集' : '派发任务 · 收集回执'}</span><AgentOrbit role="harness" status={dispatching ? 'running' : 'idle'} /></div>
+      <DispatchActivity agents={agents} codex={codex} execution={execution} runStatus={runStatus} stage={stage} event={event} onSelect={onSelect} harnessActivity={harnessActivity} />
       {agents.map(agent => <AgentConversationCard key={agent.role} agent={agent} selected={selectedRole === agent.role} onSelect={onSelect} />)}
       <CodexConversationCard codex={codex} model={codexModel} onDetails={onCodexDetails} />
     </div>
     <details className="command-exchanges"><summary>交互记录 · {exchanges.length} 条<ChevronDown size={13} /></summary><div className="command-exchange-list">
       {exchanges.length ? exchanges.map(link => <ExchangeRecord key={link.id} link={link} />) : <p>尚未记录任务派发。</p>}
     </div></details>
-    <div className="command-discussion-note"><span className="command-connection-sample" />箭头来自已保存的交接与请求回执；流动光点表示正在执行，返回不代表验收通过。</div>
+    <div className="command-discussion-note"><span className="command-connection-sample" />箭头来自已保存的交接与请求回执；持续流光表示交接正在排队、执行或恢复，返回不代表验收通过。</div>
   </section>;
 }
 
@@ -400,7 +581,14 @@ export function ResearchCommandCenter({ map: sourceMap, datasetAdaptation = fals
     setFocus(entry ? { runId, role, entry, nonce: ++focusSequence.current } : undefined);
     void loadHistory(role);
   }
-  const agents = (Array.isArray(map?.agents) ? map.agents : []).map(agent => ({ ...agent, history: mergeAgentHistory(agent.history ?? [], historyLoader.current.get(agent.role)?.history ?? []) }));
+  const reviewVisible = implementationProgress?.phase === 'code_review' && implementationProgress.run_id === runId;
+  const reviewDetail = useRemoteResource<Json>(reviewVisible ? `/runs/${encodeURIComponent(runId)}/implementation-progress` : null,
+    `${runId}:${implementationProgress?.workflow?.id}:${implementationProgress?.workflow?.revision}:${implementationProgress?.workflow?.updated_at}`,
+    map?.run_status === 'running' ? 5000 : 15000);
+  const sourceAgents = Array.isArray(map?.agents) ? map.agents : [];
+  const currentAgents = reviewVisible ? revisionReviewCards(sourceAgents, map?.links ?? [], implementationProgress!, reviewDetail.data, runId) : sourceAgents;
+  const visibleLinks = reviewVisible ? currentReviewLinks(map?.links ?? [], implementationProgress!, reviewDetail.data, runId) : map?.links;
+  const agents = currentAgents.map(agent => ({ ...agent, history: mergeAgentHistory(agent.history ?? [], historyLoader.current.get(agent.role)?.history ?? []) }));
   const activeRole = agents.some(agent => agent.role === selectedRole) ? selectedRole : map?.projection === 'summary' ? '' : agents.find(agent => agent.status === 'running')?.role ?? agents[0]?.role ?? '';
   async function loadHistory(role: string, mode: 'refresh' | 'older' = 'refresh') {
     await historyLoader.current.load(role, mode, () => historyChanged(value => value + 1));
@@ -438,7 +626,7 @@ export function ResearchCommandCenter({ map: sourceMap, datasetAdaptation = fals
     else if (d.status === 'blocked' || d.status === 'rejected') nextAction = `处理具体定义的未决项或必改意见：${d.reason ?? '查看上方定义文档与意见。'}`;
   }
   return <div className="research-command-center"><header className="command-header"><div className="command-eyebrow"><span /><span>研究指挥</span><span>{map.run_status ? overallStatusNames[map.run_status] ?? humanizeMessage(map.run_status) : '多智能体协作'}</span></div><div className="command-title-row"><div><h2>研究指挥台<span>从共同想法，到可验证的证据。</span></h2><p><ReferenceText value={humanizeMessage(stage || '等待开始')} /><span> / </span>第 {number(map.current_cycle, 1)} 轮研究</p></div><div className="command-progress"><strong>{progress.toFixed(progress % 1 ? 1 : 0)}<small>%</small></strong><span>当前流程进度</span></div></div><div className="command-progress-track" role="progressbar" aria-label="当前流程阶段进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: `${progress}%` }} /></div><div className="command-next"><span><ArrowRight size={13} />下一步</span><HumanMessage text={isNativeCodexGate(nextAction) ? requestRecoveryText(nextAction) : nextAction} /></div><ResearchOutcome outcome={map.outcome} /><ExecutionActivity execution={map.current_execution} /></header>
-    <div ref={discussion}><AgentConversation agents={agents} links={map.links} selectedRole={activeRole} onSelect={selectAgent} codex={codexParticipant(implementationProgress, map.current_execution?.kind === 'local_codex' ? map.current_execution : null, map.run_status)} codexModel={codexModel} onCodexDetails={onCodexDetails} runStatus={map.run_status} executionStatus={map.current_execution?.status} /></div>
+    <div ref={discussion}><AgentConversation agents={agents} links={visibleLinks} selectedRole={activeRole} onSelect={selectAgent} codex={codexParticipant(implementationProgress, map.current_execution?.kind === 'local_codex' ? map.current_execution : null, map.run_status)} codexModel={codexModel} onCodexDetails={onCodexDetails} runStatus={map.run_status} execution={map.current_execution} stage={stage} event={map.dispatch_event} harnessActivity={map.harness_activity} /></div>
     {chosenAgent && <div className={`command-memory-workspace ${memoryOpen ? '' : 'memory-is-collapsed'}`}>{memoryOpen && <AgentMemoryTree runId={runId} role={chosenAgent.role} onRoleChange={role => selectAgent(role)} onCollapse={() => setMemoryOpen(false)} />}<div ref={historyPanel} className="command-history-slot">{!memoryOpen && <button type="button" className="btn small command-memory-reopen" onClick={() => setMemoryOpen(true)}><GitBranch size={14} />展开四层记忆树</button>}<button className="command-return" onClick={() => scrollTo(discussion.current)}><ArrowUpRight size={13} />返回讨论画布</button><AgentHistoryPanel key={JSON.stringify([runId, chosenAgent.role])} agent={chosenAgent} focus={focusedRequest} pages={pages} loading={Boolean(pages?.loading)} error={pages?.error ?? ''} onRefresh={() => void loadHistory(chosenAgent.role)} onLoadOlder={() => void loadHistory(chosenAgent.role, 'older')} /></div></div>}
     <ResearchRoute map={map} runId={runId} revision={revision} refreshRevision={refreshRevision} /><div className="command-footer"><ShieldCheck size={14} /><span>公开输出与决策依据可追溯 · 流程进度不代表实验达标概率</span></div></div>;
 }

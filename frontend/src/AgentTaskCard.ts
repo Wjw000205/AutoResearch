@@ -1,9 +1,33 @@
-import { textOf, type ResearchMapAgent } from './api';
+import { textOf, type ResearchMapAgent, type ResearchMapLink } from './api';
 import { publicSummary } from './AgentHistoryFocus';
 import { humanizeMessage } from './localization';
 import { requestRecoveryText } from './RequestRecoveryDiagnostic';
 import { reviewFeedback } from './ReviewFeedback';
 import { experimentTaskDescription } from './ExperimentTaskDescriptions';
+
+export const metricReviewLabels: Record<string,string> = {
+  metric_contract_capability_review: '复核 Harness 指标执行能力',
+  metric_capability_evidence: '复核指标执行证据',
+};
+
+/** Older servers publish active execution reviews in links but omit them from role cards. */
+export function liveReviewAgents(agents: ResearchMapAgent[], links: ResearchMapLink[], stage: string,
+  status: string, startedAt?: string) {
+  if (status !== 'running' || !['experiments','tuning'].includes(stage) || !startedAt) return agents;
+  return agents.map(agent => {
+    if (!['completed','idle'].includes(agent.status)) return agent;
+    const reviews = links.filter(link => link.active && link.status === 'running' && link.from_role === 'harness'
+      && link.to_role === agent.role && Object.hasOwn(metricReviewLabels, link.purpose.split(':')[0])
+      && link.created_at && Date.parse(link.created_at) >= Date.parse(startedAt));
+    if (!reviews.length) return agent;
+    const latest = reviews.sort((a,b) => b.created_at!.localeCompare(a.created_at!))[0];
+    const round = latest.purpose.match(/:full-reading:(\d+)$/);
+    const label = metricReviewLabels[latest.purpose.split(':')[0]] + (round ? ` · 补读材料（第 ${round[1]} 轮）` : '');
+    return {...agent, status: 'running', current_task: label, current_action: label,
+      current_assignment: {...latest, status:'running', label, updated_at:latest.at},
+      current_assignments_count:reviews.length, current_activity:null, current_output:null};
+  });
+}
 
 const outputs: Record<string, string> = {
   implementation_spec: '实现文档与保存提交记录',

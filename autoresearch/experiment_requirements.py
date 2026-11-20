@@ -25,6 +25,13 @@ def new_design_schema(schema):
     remains part of the independent task-requirement review.
     """
     result = copy.deepcopy(schema)
+    if 'benchmark_tasks' in result.get('properties', {}):
+        from .io_matrix import author_schema
+        result['properties']['benchmark_io_matrix'] = author_schema()
+        result.setdefault('allOf', []).extend([
+            {'not': {'required': ['benchmark_tasks', 'benchmark_io_matrix']}},
+            {'if': {'required': ['benchmark_io_matrix']},
+             'then': {'required': ['ablation_search_space', 'validation_seeds', 'final_test_seeds']}}])
     result.setdefault('allOf', []).append({
         'if': {'not': {'required': ['benchmark_tasks']}},
         'then': {'required': ['validation_seeds', 'final_test_seeds']}})

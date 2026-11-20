@@ -6,6 +6,8 @@ against the original scientific sources before a new code instruction exists.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
+
 import asyncio
 import copy
 
@@ -16,6 +18,38 @@ FIELD = 'implementation_definition_repair'
 PROTOCOL = 'implementation_definition_repair_protocol'
 MAX_ADDITION = 6000
 AUTHORIZATIONS = 'implementation_timing_authorizations'
+
+
+def _review_votes(packets):
+    from . import independent_full_review as full
+    values = []
+    for packet in packets:
+        binding = packet.get('context', {}).get(full.KEY)
+        values.append(full.stamp_vote(packet['role'], packet['result'], packet['handoff_id'], binding)
+            if binding else {'role': packet['role'], 'handoff_id': packet['handoff_id'], **packet['result']})
+    return values
+
+
+def _review_members(packets):
+    from .independent_full_review import members
+    return members(_review_votes(packets))
+
+ENGINEERING_AUTHOR_TASK = '''你是实现文档作者。本轮补齐原代码审查明确指出的工程定义缺口。
+只在原 algorithm 末尾追加独立的“工程定义补充”小节；原正文和其他字段逐字保留。
+definition_repair 中包含原问题、批准条款及原作者暂缓理由。实际读取相关批准来源和
+definition_code_sources 中的同版本代码/配置，明确缺失概念的来源、实际消费和校验绑定。
+不能把实现中的猜测当批准依据。已有科学来源足以决定的工程语义由你明确；与批准来源真正矛盾、
+需要改变模型/数据/参数空间/验收标准的项目必须保留未解决并给出具体原因，不得悄悄改科学方案。
+不新增实验、种子、预算或执行授权；不把缺执行回执写成通过。逐项回应原缺口，保留已完成工作。
+用 implementation.edit_document 保存追加条款并读回新增正文，再提交真实保存回执。'''
+
+ENGINEERING_REVIEW_TASK = '''独立审核同版本新实现文档的工程定义补充。原 SPEC 正文及其他字段已逐字保留。
+只评审 definition_repair 的原缺口和新增条款。实际读取完整 definition_addition、相关批准科学来源，
+并按需读取 definition_code_sources 中实际配置/实现，检查来源、消费、校验是否明确且一致。
+resolutions 只列 definition_repair.issues 中的 issue_id，每项恰好一次。deferred_findings 供查阅；
+其他暂缓项保留在原台账中。不能用原实现常量或他人意见代替批准来源。真正冲突、定义不完整时给出具体修订意见。
+保留旧修改的暂缓理由、未运行检查和实验回执，不重复扩大验收或要求重跑已完成训练。
+approve=true 仅批准新增工程定义交给 Codex 实现，不代表代码已修复、测试通过或新增执行许可。'''
 
 # This is a host/operator control, deliberately not an agent tool. The human
 # may authorize a scoped exception without approving the resulting definition.
@@ -63,7 +97,8 @@ def authorize_timing(engine, run_id, *, workflow_id, proposal, user_messages, wa
     engine.store.put(AUTHORIZATIONS,key,entry)
     state.setdefault('definition_repair_history',[]).append(copy.deepcopy(record))
     next_record = {k:copy.deepcopy(record[k]) for k in
-        ('base_index','base_row_sha256','source_sha256','attempt_index','request_ids','source_kind') if k in record}
+        ('base_index','base_row_sha256','source_sha256','attempt_index','request_ids','source_kind',
+         'kind','source_record_key','deferred_packet_sha256') if k in record}
     next_record.update(previous_repair_id=record['id'], predecessor_index=previous['index'],
         timing_authorization_id=key, timing_authorization_sha256=entry['sha256'])
     next_record = {'id':repair.sha(next_record), **next_record, 'status':'authoring',
@@ -150,7 +185,7 @@ def validate_candidate(spec, state, binding):
             or len(spec['algorithm']) <= len(base['algorithm'])
             or not spec['algorithm'][len(base['algorithm']):].strip()):
         raise SaveConflict('definition_scope_changed',
-            '只允许在原 algorithm 末尾补齐必要资源定义；原文及其他字段必须逐字保留。')
+            '只允许在原 algorithm 末尾补齐必要工程定义；原文及其他字段必须逐字保留。')
 
 
 def _source(engine, run_id, state, record):
@@ -158,8 +193,9 @@ def _source(engine, run_id, state, record):
     base_row(state, record)
     timing_authorization(engine, state)
     attempt = next(a for a in state['attempts'] if a['index'] == record['attempt_index'])
-    source = (verify_saved(engine, run_id, state, attempt, attempt['verification_followup'])
-        if record.get('source_kind') == 'verification_followup' else
+    source_key = record.get('source_record_key', record.get('source_kind'))
+    source = (verify_saved(engine, run_id, state, attempt, attempt[source_key])
+        if source_key in {'verification_followup', 'deferred_repair_clarification', 'deferred_repair_execution', 'host_constraint_followup', 'deferred_evidence_clarification'} else
         repair.build_source(engine, run_id, state, base_row(state,record), attempt))
     if repair.sha(source) != record['source_sha256']:
         _fail('原始缺口证据发生变化。')
@@ -168,15 +204,42 @@ def _source(engine, run_id, state, record):
         if (not request or request['workflow_id'] != state['id']
                 or request['source_sha256'] != record['source_sha256']):
             _fail('缺少同一交付的真实定义请求。')
+        if record.get('kind') == 'engineering_definition':
+            issue = next((i for i in source['issues'] if i['issue_id'] == request['issue']['issue_id']),None)
+            expected = {k:v for k,v in request.items() if k not in {'id','created_at'}}
+            if (key != run_id+':'+repair.sha(expected) or request.get('run_id') != run_id
+                    or issue != request['issue']
+                    or (issue.get('binding') or {}).get('disposition') not in {'needs_definition','spec_conflict'}
+                    or request['references'] != [source['role_evidence'][issue['role']][i]
+                        for i in issue['binding']['evidence_indices']]):
+                _fail('工程定义请求与原审查证据不一致。')
+    if record.get('deferred_packet_sha256'):
+        from .code_repair_deferred import validate_scope, scope_for
+        packet = engine.store.get('code_repair_packets',record['deferred_packet_sha256'],{}).get('packet')
+        if not packet:
+            _fail('暂缓修改原清单缺失。')
+        original = repair.build_source(engine,run_id,state,base_row(state,record),attempt)
+        validate_scope(engine,run_id,original,scope_for(packet))
     return source
 
 
-def begin(engine, run_id, state, specification, attempt, source, requests, save):
+def begin(engine, run_id, state, specification, attempt, source, requests, save,
+          *, kind=None, source_key=None, deferred_packet_sha256=None):
     if not requests:
         _fail('没有待补定义。')
     value = {'base_index':specification['index'], 'base_row_sha256':repair.sha(specification),
         'source_sha256':repair.sha(source), 'attempt_index':attempt['index'], 'request_ids':requests,
         'source_kind':'verification_followup' if attempt.get('verification_followup',{}).get('status')=='completed' else 'review_votes'}
+    if kind is not None:
+        if kind != 'engineering_definition':
+            _fail('未知补定义范围。')
+        value['kind'] = kind
+    if source_key is not None:
+        if source_key not in {'review_votes','verification_followup','deferred_repair_clarification','deferred_repair_execution','host_constraint_followup','deferred_evidence_clarification'}:
+            _fail('未知缺口来源。')
+        value['source_record_key'] = source_key
+    if deferred_packet_sha256 is not None:
+        value['deferred_packet_sha256'] = deferred_packet_sha256
     key = repair.sha(value)
     previous = state.get(FIELD)
     if previous:
@@ -207,6 +270,16 @@ def author_capacity(context, state):
     return result
 
 
+def _next_revision(state, record, previous_index):
+    archived = state.get('host_constraint_definition_routes', {})
+    skipped = {index for old in state.get('definition_repair_history', [])
+        if old['id'] in archived and old['id'] != record['id'] for index in old['revision_indices']}
+    index = previous_index + 1
+    while index in skipped:
+        index += 1
+    return index
+
+
 def validate_previous(engine, run_id, state, context, revision):
     """Authenticate the approved base or the last scoped rejection for a save."""
     from . import implementation_documents as documents
@@ -220,7 +293,7 @@ def validate_previous(engine, run_id, state, context, revision):
     indices = record['revision_indices']
     index = indices[-1] if indices else record.get('predecessor_index',base['index'])
     rows = [r for r in state['specifications'] if r['index'] == index]
-    if len(rows) != 1 or revision != index + 1:
+    if len(rows) != 1 or revision != _next_revision(state, record, index):
         _fail('保存续接不是当前补定义版本。')
     previous = rows[0]
     if indices or record.get('previous_repair_id'):
@@ -232,7 +305,7 @@ def validate_previous(engine, run_id, state, context, revision):
             scope = {**state,FIELD:ancestors[0]}
         packets = previous.get('definition_reviews', [])
         if (previous.get('approved') is not False or previous.get('definition_repair_id') != scope[FIELD]['id']
-                or len(packets) != 3 or {p['role'] for p in packets} != set(repair.ROLES)):
+                or not _review_members(packets)):
             _fail('补定义修订缺少同版本三方真实审核。')
         for packet in packets:
             validate_vote(engine, run_id, scope, previous, packet)
@@ -252,10 +325,17 @@ def issue_context(engine, state):
     authorization = timing_authorization(engine,state)
     if authorization:
         result['timing_authorization'] = copy.deepcopy(authorization)
+    if record.get('kind') == 'engineering_definition':
+        result['scope'] = '只在 algorithm 末尾补齐原审查缺失的工程定义；批准正文、科学方案和验收要求逐字保留。'
+        if record.get('deferred_packet_sha256'):
+            from .code_repair_deferred import findings
+            packet = engine.store.get('code_repair_packets',record['deferred_packet_sha256'],{})['packet']
+            result['deferred_packet_sha256'] = record['deferred_packet_sha256']
+            result['deferred_findings'] = findings(packet)
     return result
 
 
-def addition_ref(engine, run_id, state, row):
+def addition_refs(engine, run_id, state, row):
     from . import document_index
     base = base_row(state, state[FIELD])
     # Inter-section whitespace may belong to the preceding indexed section.
@@ -266,14 +346,27 @@ def addition_ref(engine, run_id, state, row):
     if text.count(suffix) != 1:
         _fail('补充段无法在保存的 Markdown 中唯一定位。')
     start = text.index(suffix)
-    for section in row['document']['sections']:
-        if section['start'] <= start and start + len(suffix) <= section['end']:
-            return {'document_id':row['document']['document_id'], 'document_sha256':row['document']['sha256'],
-                'section_id':section['id'], 'offset':start-section['start'], 'limit':len(suffix)}
-    _fail('补充段跨越多个索引章节。')
+    from .document_reference_spans import references
+    try:
+        return references({**row['document'],'sections':doc['sections']},start,start+len(suffix))
+    except ValueError as exc:
+        _fail('补充段无法按当前文档索引分页：'+str(exc))
 
 
-def review_schema(authorized=False):
+def addition_ref(engine, run_id, state, row):
+    """Legacy short-addition locator; full coverage always uses addition_refs."""
+    return addition_refs(engine,run_id,state,row)[0]
+
+
+def addition_context(engine, run_id, state, row):
+    refs = addition_refs(engine,run_id,state,row)
+    return {'definition_addition':refs[0], **({'definition_additions':refs,
+        'definition_addition_instruction':'definition_additions 是完整补充段的全部分页，必须逐页读完；'
+            'definition_addition 仅是第一页，不能代表整段。每页 limit 不超过6000，不裁剪尾部或跳过章节。'}
+        if len(refs)>1 else {})}
+
+
+def review_schema(authorized=False, *, issue_ids=None, whole=False):
     from .implementation_alignment import SOURCE_REFS
     fields = {'approve':{'type':'boolean'}, 'proposal_hash':repair.TEXT, 'spec_hash':repair.TEXT,
         'document_sha256':repair.TEXT, 'rationale':repair.TEXT,
@@ -283,152 +376,138 @@ def review_schema(authorized=False):
         'resolutions':{'type':'array','items':repair.obj({'issue_id':repair.TEXT,
             'resolved':{'type':'boolean'},'reason':repair.TEXT})},
         'definition_refs':copy.deepcopy(SOURCE_REFS),'source_refs':copy.deepcopy(SOURCE_REFS)}
+    if issue_ids is not None:
+        resolutions = fields['resolutions']
+        resolutions.update(minItems=len(issue_ids), maxItems=len(issue_ids))
+        resolutions['items']['properties']['issue_id'] = {'type':'string', 'enum':list(issue_ids)}
     if authorized:
         fields['timing_authorization_sha256'] = repair.TEXT
+    if whole:
+        fields['fixes']['items']['properties']['location'] = copy.deepcopy(SOURCE_REFS['items'])
+        fields['fixes']['items']['required'].append('location')
     return repair.obj(fields)
+
+
+def validate_resolutions(scope, result):
+    required = {issue['issue_id'] for issue in scope['issues']}
+    historical = {issue['issue_id'] for issue in scope.get('deferred_findings', [])} - required
+    seen = set()
+    for entry in result['resolutions']:
+        issue_id = entry['issue_id']
+        if issue_id in seen:
+            _fail('定义审核重复回答同一问题：' + issue_id)
+        seen.add(issue_id)
+        if issue_id in required:
+            if result['approve'] and not entry['resolved']:
+                _fail('同意补定义时仍有本轮缺口标记为未闭合：' + issue_id)
+        elif issue_id not in historical or entry['resolved']:
+            _fail('定义审核引用未知问题或试图关闭本轮以外的待办：' + issue_id)
+        # Older frozen assignments invited readers to retain deferred findings.
+        # An explicit unresolved entry for one is informational in that ballot.
+    if missing := required - seen:
+        _fail('定义审核漏答本轮缺口：' + '、'.join(sorted(missing)))
+    if {f['issue_index'] for f in result['fixes']} != set(range(len(result['issues']))):
+        _fail('定义审核的修订建议必须对应本次提出的每一条问题。')
+    if result['approve'] == bool(result['issues']):
+        _fail('定义审核同意时须闭合当前缺口，退回时须列出具体修订问题。')
+
+
+def _definition_sources(engine, run_id, state, issues):
+    """Resolve issue citations against the reviewed delivery and its exact diff base."""
+    from . import code_revision_review as revision
+    from .code_whole_policy import _specification
+    from .codex_workflow import _snapshot_artifacts
+    record = state[FIELD]
+    attempt = next(a for a in state['attempts'] if a['index'] == record['attempt_index'])
+    marker = attempt.get(revision.KEY)
+    if marker is None:
+        return _snapshot_artifacts(engine,run_id,attempt['snapshot'])
+    current = list(revision._directory(engine,run_id,attempt).values())
+    current_ids = {r['artifact_id']:r['sha256'] for r in current}
+    prior_refs = [ref for issue in issues for ref in issue['references'] if 'artifact_id' in ref
+                  and current_ids.get(ref['artifact_id']) != ref['sha256']]
+    if not prior_refs:
+        return current
+    spec = _specification(state,attempt,base_row(state,record))
+    compiled = revision.compile_context(engine,run_id,state,spec,attempt)
+    if compiled[revision.KEY] != marker:
+        _fail('定义引用的原代码差异版本与冻结审核不一致。')
+    changes = compiled['revision_material']['changes']
+    before = {(src['artifact_id'],src['sha256']):change for change in changes if (src := change['before'])}
+    historical = {}
+    for ref in prior_refs:
+        change = before.get((ref['artifact_id'],ref['sha256']))
+        if ref['artifact_id'] in current_ids or not change or not revision._supported_evidence(ref,[],[change]):
+            _fail('定义引用缺少原审核差异中的精确基线范围。')
+        historical[ref['artifact_id']] = {**change['before'],'base_attempt':marker['base_attempt']}
+    return [*current,*historical.values()]
 
 
 def validate_vote(engine, run_id, state, row, packet):
     from .implementation_acceptance_flow import check_packet, validate_refs
+    from . import implementation_definition_review_scope as scope
+    from . import host_asset_definition_recovery as asset_recovery
     context = check_packet(engine, run_id, packet)
+    if scope.REVISION in context or (row.get('definition_review_purpose') or '').endswith(':scoped-v4'):
+        if context.get(scope.REVISION) != scope.revision_comparison(engine, run_id, state, row):
+            _fail('工程定义修订复审未绑定上一版本的差异和原评审意见。')
+    if scope.enabled(context):
+        original_issues = issue_context(engine,state)['issues']
+        attempt = next(a for a in state['attempts'] if a['index'] == state[FIELD]['attempt_index'])
+        current = {(r['artifact_id'],r['sha256']) for r in attempt['delivery_artifacts']}
+        cited = {(r['artifact_id'],r['sha256']) for i in original_issues for r in i['references'] if 'artifact_id' in r}
+        version = context.get('definition_code_source_version')
+        if 'definition_code_source_version' in context or cited - current or any(
+                'base_attempt' in r for r in context['definition_code_sources']):
+            if type(version) is not int or version != 2:
+                _fail('混合版本的工程定义代码目录缺少已知版本。')
+            catalog = _definition_sources(engine,run_id,state,original_issues)
+            addition = row['spec']['algorithm'][row['definition_base_algorithm_length']:]
+            expected = scope.attach({**context,'definition_code_sources':catalog},row['document'],addition)
+            if any(context.get(k) != expected.get(k) for k in (
+                    'definition_code_source_version','definition_code_sources','definition_required_code_ranges')):
+                _fail('工程定义审核的来源版本或必读范围发生变化。')
+    if context.get(asset_recovery.KEY) != asset_recovery.author_evidence(engine, run_id, state, row):
+        _fail('工程定义复审未绑定作者实际收到的同一宿主资产证据。')
+    from . import independent_full_review as full
+    if full.KEY in context:
+        full.validate_delivery(engine.store, run_id, _review_votes([packet])[0], engine=engine)
     result = packet['result']
+    scope.validate_citation(context, result)
     authorization = timing_authorization(engine,state)
     if authorization and result.get('timing_authorization_sha256') != authorization['sha256']:
         _fail('审核没有确认本轮用户计时授权，不能复用旧范围结论。')
     if (context.get(PROTOCOL) != 1 or context.get('definition_repair') != issue_context(engine, state)
             or context.get('definition_addition') != addition_ref(engine, run_id, state, row)
+            or context.get('definition_additions',[context.get('definition_addition')]) != addition_refs(engine,run_id,state,row)
             or result['spec_hash'] != row['spec_hash'] or result['proposal_hash'] != state['proposal_hash']
             or result['document_sha256'] != row['document']['sha256']):
         _fail('审核没有绑定当前定义和原问题。')
-    ids = {i['issue_id'] for i in context['definition_repair']['issues']}
-    if (len(result['resolutions']) != len(ids) or {i['issue_id'] for i in result['resolutions']} != ids
-            or {f['issue_index'] for f in result['fixes']} != set(range(len(result['issues'])))
-            or result['approve'] and (result['issues'] or not all(i['resolved'] for i in result['resolutions']))
-            or not result['approve'] and not result['issues']):
-        _fail('审核必须逐项闭合原缺口或给出可修订的具体意见。')
-    validate_refs(engine, run_id, packet['handoff_id'], context, result['definition_refs'], current=row['document'])
+    validate_resolutions(context['definition_repair'], result)
+    if asset_recovery.KEY in context:
+        asset_recovery.validate_review(context[asset_recovery.KEY], result)
+    if context.get('whole_definition_review_protocol') == 2:
+        for fix in result['fixes']:
+            validate_refs(engine,run_id,packet['handoff_id'],context,[fix['location']],
+                current=row['document'],field='fixes.location')
+    validate_refs(engine, run_id, packet['handoff_id'], context, result['definition_refs'],
+        current=row['document'], field='definition_refs')
     # The *whole addition* is new; its review cannot be based on reading only its title.
-    validate_refs(engine, run_id, packet['handoff_id'], context, [context['definition_addition']], current=row['document'])
+    validate_refs(engine, run_id, packet['handoff_id'], context, addition_refs(engine,run_id,state,row), current=row['document'])
     scientific = context['architecture_document']
-    validate_refs(engine, run_id, packet['handoff_id'], context, result['source_refs'], current=scientific)
+    if full.KEY in context and not scope.enabled(context) and not any(
+            (ref['document_id'], ref['document_sha256']) == (scientific['document_id'], scientific['sha256'])
+            for ref in result['source_refs']):
+        scope.request_citation(engine, run_id, packet)
+    validate_refs(engine, run_id, packet['handoff_id'], context, result['source_refs'],
+        current=None if scope.enabled(context) else scientific, field='source_refs')
     return result
 
 
 def validate_author_read(engine,run_id,state,row):
-    from .implementation_acceptance_flow import validate_refs
-    hid=row['authoring_handoff_id']
-    context=copy.deepcopy(engine.store.get('handoff_inputs',hid)['context'])
-    context['indexed_documents']=[*context['indexed_documents'],row['document']]
-    validate_refs(engine,run_id,hid,context,[addition_ref(engine,run_id,state,row)],current=row['document'])
-
-
-async def advance(engine, h, run_id, state, common, save):
-    """One durable author/review round; rejection feeds back without stopping the run."""
-    from . import implementation_documents as documents, implementation_authoring as author
-    from . import implementation_alignment as alignment
-    from .codex_workflow import SPEC, _frozen_spec_author
-    from .implementation_authoring_completion import ask as ask_author
-    from .implementation_failures import ImplementationSpecificationPending
-    from .implementation_acceptance_flow import authenticate
-    record = state.get(FIELD)
-    if not record or record['status'] == 'approved':
-        return
-    await engine._read_consensus_check(run_id, _source, engine, run_id, state, record)
-    base = base_row(state, record)
-    indices = record['revision_indices']
-    row = next((r for r in state['specifications'] if indices and r['index'] == indices[-1]), None)
-    if not row or row.get('approved') is False:
-        previous = state['specifications'][-1]
-        index = previous['index'] + 1
-        purpose = f'implementation_spec:definition-{record["id"]}:{index}'
-        frozen = _frozen_spec_author(engine, run_id, purpose)
-        if frozen:
-            task, context = frozen['instruction'], frozen['context']
-        else:
-            context = alignment.attach(copy.deepcopy(common))
-            context.update({PROTOCOL:1, 'definition_repair':issue_context(engine, state),
-                'implementation_indexed_review_protocol':1, 'implementation_document_authoring_protocol':1,
-                'implementation_document_edit_protocol':1,'implementation_document_locate_protocol':1,
-                'implementation_document_readability_protocol':base.get('implementation_document_readability_protocol',1),
-                'implementation_document_authoring':{'workflow_id':state['id'],'revision':index,
-                    'specification_schema':alignment.author_schema(SPEC)},
-                'previous_specifications':[{k:copy.deepcopy(previous[k]) for k in ('index','spec_hash','document')}],
-                'definition_review_feedback':[{k:copy.deepcopy(p['result'][k]) for k in ('issues','fixes','resolutions')}
-                    for p in (row or previous).get('definition_reviews',[])],
-                'objective':engine.store.get('runs',run_id)['objective']})
-            context = author_capacity(context, state)
-            if timing_authorization(engine,state):
-                from .codex_workflow import _snapshot_artifacts
-                attempt = next(a for a in state['attempts'] if a['index']==record['attempt_index'])
-                context['definition_code_sources'] = await engine._read_consensus_check(
-                    run_id,_snapshot_artifacts,engine,run_id,attempt['snapshot'])
-            context['indexed_documents'] += [previous['document']]
-            if previous['document'] != base['document']:
-                context['indexed_documents'].append(base['document'])
-            task = AUTHOR_TASK + (AUTHORIZED_TIMING if timing_authorization(engine,state) else '')
-        record['status'] = 'authoring'
-        save(status='specification',current_revision=index,blocked_kind=None,reason=None)
-        result, hid = await ask_author(engine,h,run_id,state,purpose,task,context)
-        row = await author.submit_async(engine,run_id,state,hid,result)
-        validate_candidate(row['spec'],state,binding(state))
-        await engine._read_consensus_check(run_id,validate_author_read,engine,run_id,state,row)
-        row.update({PROTOCOL:1,'definition_repair_id':record['id'],'implementation_indexed_review_protocol':1,
-                    'definition_base_algorithm_length':len(base['spec']['algorithm'])})
-        state['specifications'].append(row)
-        indices.append(index)
-        save()
-    record['status'] = 'reviewing'
-    save(status='spec_review',current_revision=row['index'],blocked_kind=None,reason=None)
-    context = {**copy.deepcopy(common),PROTOCOL:1,'definition_repair':issue_context(engine,state),
-        'definition_addition':addition_ref(engine,run_id,state,row),'spec_hash':row['spec_hash'],
-        'document_sha256':row['document']['sha256'],
-        'indexed_documents':[*copy.deepcopy(common['indexed_documents']),base['document'],row['document']]}
-    context['indexed_documents'] = list({d['document_id']:d for d in context['indexed_documents']}.values())
-    if timing_authorization(engine,state):
-        from .codex_workflow import _snapshot_artifacts
-        attempt = next(a for a in state['attempts'] if a['index']==record['attempt_index'])
-        context['definition_code_sources'] = await engine._read_consensus_check(
-            run_id,_snapshot_artifacts,engine,run_id,attempt['snapshot'])
-    purpose = f'implementation_definition_review:{record["id"]}:{row["index"]}'
-    row['definition_review_purpose'] = purpose
-    save()
-    async def review(role):
-        from .codex_workflow import _frozen_spec_assignment
-        frozen = _frozen_spec_assignment(engine,run_id,purpose,role)
-        task, ctx, schema = ((frozen[k] for k in ('instruction','context','schema')) if frozen else
-                            (REVIEW_TASK + (AUTHORIZED_TIMING if timing_authorization(engine,state) else ''),
-                             context,review_schema(bool(timing_authorization(engine,state)))))
-        hid = h.decision_key(run_id,role,purpose,task,ctx,schema)
-        result = await h.ask(run_id,role,purpose,task,ctx,schema)
-        await engine._read_consensus_check(run_id,authenticate,engine,run_id,role,hid,result)
-        packet = {'role':role,'handoff_id':hid,'result':result,'context':copy.deepcopy(ctx)}
-        await engine._read_consensus_check(run_id,validate_vote,engine,run_id,state,row,packet)
-        return packet
-    tasks = [asyncio.create_task(review(role)) for role in repair.ROLES]
-    try:
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-    except BaseException:
-        for task in tasks: task.cancel()
-        await asyncio.gather(*tasks,return_exceptions=True)
-        raise
-    for outcome in outcomes:
-        if isinstance(outcome,BaseException): raise outcome
-    engine.check_active(run_id)
-    row['definition_reviews'] = outcomes
-    row['review_votes'] = [{'role':p['role'],'handoff_id':p['handoff_id'],**p['result']} for p in outcomes]
-    row['approved'] = all(p['result']['approve'] for p in outcomes)
-    if not row['approved']:
-        record['status'] = 'authoring'
-        save(status='specification',current_revision=row['index']+1)
-        raise ImplementationSpecificationPending()
-    record.update(status='approved',approved_index=row['index'],approved_at=now())
-    await engine._read_consensus_check(run_id,validate_release,engine,run_id,state,row)
-    record['previous_input_bundle'] = copy.deepcopy(state.get('input_bundle'))
-    state['input_bundle'] = documents.export_bundle(engine,run_id,state,row)
-    save(status='implementing',spec_hash=row['spec_hash'],blocked_kind=None,reason=None)
-    engine.store.event(run_id,'implementation.definition_approved',
-        '资源估算补充定义已获同版本三方审核，继续定向修订代码；不重跑已完成阶段。',
-        {'workflow_id':state['id'],'document_sha256':row['document']['sha256']})
+    from .definition_readback import coverage
+    if not coverage(engine,run_id,state,row)['complete']:
+        _fail('已保存定义仍有未实际读取的正文；继续定向补读，不重新生成文档。')
 
 
 def validate_release(engine, run_id, state, row):
@@ -463,12 +542,12 @@ def validate_release(engine, run_id, state, row):
     validate_candidate(row['spec'],state,binding(state))
     validate_author_read(engine,run_id,state,row)
     packets = row.get('definition_reviews',[])
-    if len(packets) != 3 or {p['role'] for p in packets} != set(repair.ROLES):
+    if not _review_members(packets):
         _fail('需要同一文档的三方独立审核。')
     for packet in packets:
         if not validate_vote(engine,run_id,state,row,packet)['approve']:
             _fail('仍有未通过的定义。')
-    expected = [{'role':p['role'],'handoff_id':p['handoff_id'],**p['result']} for p in packets]
+    expected = _review_votes(packets)
     if row.get('review_votes') != expected:
         _fail('审核票据发生变化。')
     return row
@@ -501,7 +580,7 @@ def validate_recovery_extension(engine, run_id, state, original_count):
                 validate_release(engine, run_id, scoped, row)
             elif row.get('approved') is False:
                 packets = row.get('definition_reviews', [])
-                if len(packets) != 3 or {p['role'] for p in packets} != set(repair.ROLES):
+                if not _review_members(packets):
                     _fail('退回版本缺少真实三方审核。')
                 for packet in packets:
                     validate_vote(engine, run_id, scoped, row, packet)
@@ -509,18 +588,70 @@ def validate_recovery_extension(engine, run_id, state, original_count):
                     _fail('退回状态与真实审核不一致。')
 
 
-def instruction(state, row):
+def instruction(state, row, *, detailed=False, work_order_version=1):
     from pathlib import Path
     bundle = state['input_bundle']
     doc = Path(bundle['manifest']).parent / bundle['documents'][0]['file']
     from .code_bundle import INSTRUCTION
-    return ('仅实现已经通过三方审核的“资源估算定义补充”，依原代码审查对应的资源估算缺口做最小修改。'
+    prefix = ('仅实现已经通过三方审核的“工程定义补充”，依原代码审查对应的工程定义缺口做最小修改。'
+              if state.get(FIELD,{}).get('kind') == 'engineering_definition' else
+              '仅实现已经通过三方审核的“资源估算定义补充”，依原代码审查对应的资源估算缺口做最小修改。')
+    task = (prefix +
         '保留当前工作目录及全部已完成实现；不要重新实现其他阶段或追加文档未定义的要求。'
         f'批准实现文档："{doc}"；索引："{bundle["manifest"]}"。'
         '使用索引按需读取 algorithm 末尾的新定义及相关代码，不加载完整文档/历史。'
         '已通过项目以保存的宿主回执为准，不重跑训练/资源探针，不自行执行测试来消耗原共同预算；'
         '更新代码及 implementation.json 的实现文档绑定，按原验收要求如实记录待宿主执行的项目。'
         '缺执行证据保留 not_run，不能伪造 passed 或通过放松资源门禁来补缺口。\n' + INSTRUCTION)
+    if state.get('hyperparameter_yaml_protocol') == 1:
+        from .yaml_migration import instructions as yaml_instructions
+        yaml_contract = yaml_instructions(state.get('yaml_configuration_scope', 'hyperparameters'))
+        task += '\n' + yaml_contract
+    if detailed:
+        review = row['definition_reviews'][0]
+        issues = review['context']['definition_repair']['issues']
+        reasons = {r['issue_id']:r['reason'] for r in review['result']['resolutions'] if r['resolved']}
+        lines = ['本次定向修改依据']
+        for issue in issues:
+            lines.extend([f"{issue['requirement_id']} 原问题：{issue['issue']}",
+                          f"本轮已核准的处理：{reasons[issue['issue_id']]}"])
+        if work_order_version == 2:
+            approved = row['document']
+            lines.append(f'当前批准文档 {approved["title"]}，document_id={approved["document_id"]}，'
+                         f'SHA256={approved["sha256"]}。')
+            requirements = {issue['requirement_id'] for issue in issues}
+            lines.extend(f'{item["requirement_id"]} 实现位置：{item["location"]}'
+                for item in row['spec']['implementation_map'] if item['requirement_id'] in requirements)
+            sources = {s['artifact_id']: s for s in review['context'].get('definition_code_sources', [])}
+            for issue in issues:
+                for ref in issue['references']:
+                    source = sources.get(ref.get('artifact_id'))
+                    if source and source['sha256'] == ref['sha256']:
+                        version = f"（基线交付 {source['base_attempt']}）" if 'base_attempt' in source else ''
+                        lines.append(f'{issue["requirement_id"]} 已审核源码范围{version}：{source["path"]}，'
+                            f'SHA256={ref["sha256"]}，offset={ref["offset"]}，limit={ref["limit"]}。')
+            previous = max((item for item in state['specifications'] if item['index'] < row['index']),
+                key=lambda item: item['index'])
+            algorithm = row['spec']['algorithm']
+            prefix = previous['spec']['algorithm']
+            latest = algorithm[len(prefix):].strip() if algorithm.startswith(prefix) else ''
+            references = [ref for packet in row['definition_reviews'] for ref in packet['result']['definition_refs']]
+            inline_latest = bool(latest) and len(latest) <= 12000
+            if not inline_latest:
+                references.extend(review['context'].get('definition_additions', []))
+            ranges = {(ref['section_id'], ref['offset'], ref['limit']) for ref in references
+                if ref['document_id'] == approved['document_id'] and ref['document_sha256'] == approved['sha256']}
+            lines.extend(f'同版审核对应的文档位置：{section}，offset={offset}，limit={limit}。'
+                for section, offset, limit in sorted(ranges))
+            lines.append('按同版实现位置及工程定义增补落实修改；架构按需核对。')
+            if inline_latest:
+                lines.extend(['当前文档本次追加的原文：', latest])
+            task = task.replace('通过三方审核的', '通过独立审核的', 1)
+        else:
+            appendix = row['spec']['algorithm'][row['definition_base_algorithm_length']:].strip()
+            lines.extend(['实现位置、修改步骤与验收条件以本次三方批准的增补原文为准。', appendix])
+        task += '\n' + '\n'.join(lines)
+    return task
 
 
 def validate_dispatch(engine, run_id, state, attempt):
@@ -530,7 +661,35 @@ def validate_dispatch(engine, run_id, state, attempt):
         _fail('代码交付没有绑定批准的定义续接。')
     row = next(r for r in state['specifications'] if r['index'] == record['approved_index'])
     validate_release(engine,run_id,state,row)
-    if attempt.get('instruction') != instruction(state,row):
+    version = attempt.get('definition_work_order_version')
+    if version is not None and (type(version) is not int or version not in (1, 2)):
+        _fail('未知的工程定义工作单版本。')
+    expected = instruction(state, row, detailed=version in (1, 2), work_order_version=version)
+    if (version == 2 or attempt.get('directory_layout_version') == 2) and not attempt.get('delivery_manifest_schema'):
+        _fail('代码指令缺少绑定批准文档的交付结构。')
+    if attempt.get('delivery_manifest_schema') is not None:
+        import hashlib
+        import json
+        from pathlib import Path
+        from . import code_review_partition, code_whole_review, delivery_manifest_contract
+        from .codex_workflow import writer_instruction
+
+        bundle = state['input_bundle']
+        frozen = Path(bundle['manifest']).read_bytes()
+        manifest = json.loads(frozen)
+        primary = bundle['documents'][0]
+        document_sha256 = row['document']['sha256']
+        if (hashlib.sha256(frozen).hexdigest() != bundle['manifest_sha256']
+                or manifest['run_id'] != run_id or manifest['proposal_hash'] != state['proposal_hash']
+                or manifest['spec_hash'] != row['spec_hash'] or state['spec_hash'] != row['spec_hash']
+                or manifest['documents'] != bundle['documents']
+                or {key: value for key, value in primary.items() if key != 'file'} != row['document']
+                or attempt['delivery_manifest_schema'] != delivery_manifest_contract.schema(document_sha256=document_sha256)):
+            _fail('代码指令的输入目录或交付结构未绑定最新批准的实现文档。')
+        expected = writer_instruction(expected, document_sha256,
+            whole_delivery=version != 2 and code_whole_review.enabled(state),
+            source_plan=attempt.get(code_review_partition.PLAN_FIELD))
+    if attempt.get('instruction') != expected:
         _fail('代码指令与批准的定义续接不一致。')
 
 

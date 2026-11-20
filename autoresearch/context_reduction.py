@@ -54,10 +54,19 @@ PREVIOUS_TASK = TASK
 TASK += (' kind必须使用给定枚举：背景说明归入other，不能填写background；'
          'epistemic_status独立判断，作者解释仍为author_interpretation，不能因分类为other改变其认识状态。')
 
+# Earlier dispatched contracts retain their original schema and prompt.
+# New extraction quotes have no minimum length: a short formula stays literal.
+LENGTH_BOUND_SCHEMA, LENGTH_BOUND_TASK = copy.deepcopy(SCHEMA), TASK
+SCHEMA = copy.deepcopy(SCHEMA)
+SCHEMA['properties']['pages']['items']['properties']['findings']['items']['properties']['quote'].pop('minLength')
+TASK = TASK.replace('至少20个字符，', '引用不设最小长度；短公式按原样保留，')
+CONTRACTS = ((TASK, SCHEMA), (LENGTH_BOUND_TASK, LENGTH_BOUND_SCHEMA),
+             (PREVIOUS_TASK, LENGTH_BOUND_SCHEMA), (LEGACY_TASK, LEGACY_SCHEMA))
+
 
 def supported(prepared):
     return any(prepared.get('task') == task and prepared.get('schema') == schema
-               for task, schema in ((TASK, SCHEMA), (PREVIOUS_TASK, SCHEMA), (LEGACY_TASK, LEGACY_SCHEMA)))
+               for task, schema in CONTRACTS)
 
 
 def saved_identity(saved):
@@ -70,7 +79,7 @@ def reuse_plan(store, run_id, plan):
     """Resume an identical pre-upgrade paid job with its frozen request contract."""
     scope = plan['prepared']['context']['extraction_scope']
     previous_ids = [fingerprint({'version': 1, 'scope': scope, 'pages': plan['pages'], 'schema': schema, 'task': task})
-                    for task, schema in ((PREVIOUS_TASK, SCHEMA), (LEGACY_TASK, LEGACY_SCHEMA))]
+                    for task, schema in CONTRACTS[1:]]
     for key in (plan['id'], *(f'{run_id}:context-evidence:{sha}' for sha in previous_ids)):
         saved = store.get('context_evidence', key)
         if not saved:
@@ -143,7 +152,7 @@ def validate(plan, response):
         findings = []
         for finding in row['findings']:
             quote = finding['quote']
-            offset = source['text'].find(quote) if isinstance(quote, str) and len(quote) >= 20 else -1
+            offset = source['text'].find(quote) if isinstance(quote, str) and quote else -1
             if offset < 0 or source['text'].find(quote, offset+1) >= 0:
                 raise ValueError('Evidence extraction quote does not match its exact source page')
             anchors = {}
@@ -319,7 +328,7 @@ async def ensure(intelligence, run_id, requests):
                     'completed_at': now()})
                 if response.get('json_format_repair'):
                     intelligence.store.event(run_id, 'provider.json_format_repaired',
-                        '已兼容证据分类并通过逐字原文核验；原始回答保留，未为修复重发模型请求。',
+                        '已在本地修复证据格式并通过逐字原文核验；原始回答保留，未为修复重发模型请求。',
                         {'extraction_id': plan['id'], 'request_id': response.get('request_id'),
                          'transcript_id': response.get('transcript_id'), 'json_format_repair': response['json_format_repair']})
                 intelligence.store.event(run_id, 'context.evidence_compiled', '已生成有原文定位的工作证据卡；原文与异议记录保留。',

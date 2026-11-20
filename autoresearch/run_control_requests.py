@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 import psutil
@@ -9,7 +10,8 @@ import psutil
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .storage import now, redact
+from .storage import now, redact, RunDeletedError
+from .async_ownership import cancel as cancel_owned, finish as finish_owned
 
 
 COLLECTION = 'run_control_requests'
@@ -36,10 +38,13 @@ class RunControls:
         for key in self.store.record_keys(COLLECTION,
                 predicate="json_extract(data,'$.status') IN ('accepted','running')"):
             row = self.store.get(COLLECTION, key)
-            if self.engine.owner_alive(row):
+            if not isinstance(row, dict) or self.store.get('run_deletions', row.get('run_id')) or self.engine.owner_alive(row):
                 continue
-            self.store.put(COLLECTION, key, {**row, 'status': 'interrupted',
-                'updated_at': now(), 'error': '服务在操作回执完成前退出；请核对当前任务状态后重新操作，原请求不会自动重发。'})
+            try:
+                self.store.put(COLLECTION, key, {**row, 'status': 'interrupted',
+                    'updated_at': now(), 'error': '服务在操作回执完成前退出；请核对当前任务状态后重新操作，原请求不会自动重发。'})
+            except RunDeletedError:
+                continue  # Deletion won after the scan; keep recovering other runs.
 
     def submit(self, run_id, request):
         if self.closing:
@@ -47,6 +52,8 @@ class RunControls:
         key = f'{run_id}:{request.request_id}'
         created = False
         run = self.store.get('runs', run_id)
+        if not run:
+            raise HTTPException(404, 'Research task not found')
 
         def claim(existing):
             nonlocal created
@@ -64,7 +71,18 @@ class RunControls:
         receipt = self.store.mutate(COLLECTION, key, claim)
         if created:
             # No await between the durable claim and registering the detached task.
-            task = asyncio.create_task(self.execute(key), name=f'run-control:{key}')
+            work = self.execute(key)
+            try:
+                task = asyncio.create_task(work, name=f'run-control:{key}')
+            except BaseException as exc:
+                work.close()
+                try:
+                    self.store.put(COLLECTION, key, {**receipt, 'status': 'interrupted',
+                        'execution_started': False, 'updated_at': now(),
+                        'error': '操作尚未开始，控制调度未能建立。'})
+                except Exception as audit:
+                    exc.add_note('Control scheduling failure could not be persisted: ' + type(audit).__name__)
+                raise
             self.tasks[key] = task
             task.add_done_callback(lambda done: self.finished(key, done))
         return receipt
@@ -73,12 +91,32 @@ class RunControls:
         self.tasks.pop(key, None)
         if not task.cancelled():
             task.exception()  # persistence errors must not become unobserved task errors
+        try:
+            # Cancellation before execute's first step never enters its try/finally.
+            # Also settle a pending receipt after an unexpected persistence failure;
+            # an uncertain action is never replay authority.
+            row = self.store.get(COLLECTION, key)
+            if isinstance(row, dict) and row.get('status') in {'accepted', 'running'}:
+                self.store.put(COLLECTION, key, {**row, 'status': 'interrupted',
+                    'execution_started': row['status'] == 'running', 'updated_at': now(),
+                    'error': '控制任务已结束但没有完成回执；请核对任务状态，原请求不会自动重发。'})
+        except RunDeletedError:
+            pass
+        except Exception as exc:
+            logging.getLogger(__name__).error('Unable to settle interrupted control receipt: %s', type(exc).__name__)
 
     async def execute(self, key):
         row = self.store.get(COLLECTION, key)
+        # A delayed callback must not revive a terminal receipt or a deleted task.
+        if not isinstance(row, dict) or row.get('status') != 'accepted':
+            return
         try:
-            self.store.put(COLLECTION, key, {**row, 'status': 'running', 'updated_at': now()})
+            row = {**row, 'status': 'running', 'execution_started': True, 'updated_at': now()}
+            self.store.put(COLLECTION, key, row)
             if row['action'] in {'start', 'resume'}:
+                from .implementation_restart import require_no_pending_cleanup
+                from .async_ownership import to_thread
+                await to_thread(require_no_pending_cleanup, self.engine, row['run_id'])
                 run = await self.engine.start(row['run_id'])
             else:
                 run = await self.engine.stop(row['run_id'], cancel=row['action'] == 'cancel')
@@ -99,8 +137,8 @@ class RunControls:
         self.closing = True
         tasks = list(self.tasks.values())
         for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+            cancel_owned(task)
+        await finish_owned(asyncio.gather(*tasks, return_exceptions=True))
 
 
 def register(app, controls, task_runtime, require_run):

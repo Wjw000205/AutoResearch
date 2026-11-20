@@ -16,9 +16,12 @@ LABELS = {'intake': '目标与资源', 'literature': '文献检索与核验', 'i
           'tuning': '验证集调参', 'architecture_tuning': '架构微调', 'validation_review': '三方结果评议', 'revision': '修订研究方案',
           'final_tests': '冻结后最终测试', 'report': '结果与复现报告', 'end': '本轮流程完成'}
 PURPOSES = {'innovation_candidate': '独立提出创新点', 'innovation_compare': '比较并收束创新点',
+            'metric_contract_capability_review': '复核 Harness 指标执行能力',
+            'metric_capability_evidence': '复核指标执行证据',
             'dataset_configure': '配置实验数据与运行接口', 'dataset_config_review': '复核实验配置与数据接口',
             'dataset_select': '选择任务数据集', 'dataset_work_order': '编写配置与代码任务单',
             'dataset_plan_review': '复核数据选型与实现任务单',
+            'dataset_project_protocol': '独立核验数据集项目协议',
             'proposal': '提出研究方案', 'vote': '独立立项投票', 'revise': '根据异议修订方案',
             'evidence': '文献补充核验', 'amendment': '提交修改方案',
             'discussion_action': '交付讨论阻塞项的具体修正', 'literature_reading': '补读并保存文献证据',
@@ -32,6 +35,8 @@ PURPOSES = {'innovation_candidate': '独立提出创新点', 'innovation_compare
             'architecture_definition_work_plan': '整理定义依赖与评议范围',
             'architecture_component_review': '审议相关定义与具体修正',
             'implementation_document_section': '历史分段实现文档评议', 'implementation_document_review': '三方整篇架构与实现对齐',
+            'implementation_acceptance_whole_review': '独立审核整份实现文档',
+            'implementation_acceptance_whole_clarification': '澄清整篇审核的原文缺口',
             'implementation_document_sections_v1': '历史批次实现文档评议',
             'review': '独立审查代码', 'repair': '修复实验代码', 'tune': '提出参数候选',
             'cycle_review': '评议本轮验证结果', 'protocol_review': '审查预定执行与停止规则', **LABELS}
@@ -378,7 +383,7 @@ def codex_execution_activity(run, workflows, cycle):
     elif phase == 'acceptance':
         status, action = 'running', '本机代码验收正在运行；检查实际文件与本地执行结果，尚未通过三方代码评审。'
     elif phase == 'code_review':
-        action = '本机 Codex 已返回产物，正在等待三方对同一代码版本完成独立评审。'
+        action = '本机 Codex 已返回产物，正在等待独立审核同一代码版本。'
     elif checkpoint.get('status') == 'running':
         status, action = 'running', '本机 Codex 正在独立目录实现代码；尚未完成产物核验与三方代码评审。'
     elif checkpoint.get('status') == 'completed':
@@ -397,7 +402,7 @@ def codex_execution_activity(run, workflows, cycle):
 
 def research_map(engine, run_id, *, orchestration=None):
     from .consensus_status import view as consensus_status_view
-    from .run_views import agent_assignment_summary
+    from .run_views import agent_assignment_summary, latest_dispatch_event
     store = engine.store
     run = store.get('runs', run_id)
     cycle = engine.cycle(run_id)
@@ -520,9 +525,9 @@ def research_map(engine, run_id, *, orchestration=None):
     elif run['status'] == 'draft':
         next_action = '启动研究，先解析用户目标与资源'
     elif execution and execution['kind'] == 'local_codex':
-        next_action = ('等待三方对同一代码版本完成评审，再推进实验。' if execution['phase'] == 'code_review' else
+        next_action = ('等待同一代码版本通过独立审核，再推进实验。' if execution['phase'] == 'code_review' else
                        '先核对本机 Codex 原请求与实现缺项；未验收前不推进实验。' if execution['status'] == 'awaiting_confirmation' else
-                       '等待本机 Codex 实现与本地验收，再由三方评审实际代码。')
+                       '等待本机 Codex 实现与本地验收，再进行独立代码审核。')
     elif execution and execution['status'] == 'running':
         next_action = '等待当前试验完成并核验输出，再继续：' + LABELS.get(next_stage, next_stage)
     elif execution and execution['status'] == 'preparing':
@@ -551,6 +556,7 @@ def research_map(engine, run_id, *, orchestration=None):
     return redact({'current_stage': run['stage'], 'current_stage_label': LABELS.get(run['stage'], run['stage']),
                    'current_cycle': cycle, 'progress': run['progress'], 'progress_scope': '当前流程阶段进度，非研究达标概率',
                    'run_status': run['status'], 'run_error': run.get('error'), 'current_execution': execution,
+                   'dispatch_event': latest_dispatch_event(store, run_id),
                    'next_action': next_action, 'mainline': mainline, 'branches': branches, 'agents': agents, 'links': links,
                    'current_debate': pending_debate, 'consensus_activity': consensus_status_view(engine, run_id, pending_debate), 'context_reference_check': reference_check,
                    **({'outcome': outcome} if isinstance(outcome, dict) else {})})

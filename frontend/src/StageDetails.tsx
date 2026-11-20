@@ -19,6 +19,7 @@ import { ImplementationSidebar } from './ImplementationSidebar';
 import { NativeCodeProgress } from './NativeCodeProgress';
 import { ExperimentView } from './ExperimentView';
 import { ParameterGrid } from './ParameterGrid';
+import { DatasetTuningDetail } from './DatasetTuningDetail';
 import { ValidationReviewDetail } from './ValidationReviewDetail';
 import { useRemoteResource, useProjectionSnapshot } from './useRemoteResource';
 import { mergeRunProjection, projectionRevision, runStagePath, type RunProjection } from './RunProjections';
@@ -30,7 +31,7 @@ const purpose: Record<string, string> = {
   related_work: '围绕创新点检索最相近论文，比较实质重合与差异，未通过审查则退回重想。',
   debate: '三位角色独立审查科学问题、证据、可行性和资源计划。', design: '将已通过共识的方案转为可执行实验设计。',
   implementation: '先编写实现文档，通过同版本独立审计后交给本机 Codex 实现，再验收实际代码。', experiments: '运行基线、候选和消融实验，保存真实测量。',
-  tuning: '使用验证集选择参数并比较改进。', architecture_tuning: '依据验证证据微调既有架构，三方复审和检查通过后返回实验验证；与参数优化循环进行。', validation_review: '审查验证结果，决定继续改进或进入独立测试。',
+  tuning: '使用验证集选择参数。采用贝叶斯优化时，先评审搜索脚本和参数范围，再按批准的预算批量验证。', architecture_tuning: '依据初始实验评估架构。需要调整时，复审并验证修改后的架构，再进入参数微调。', validation_review: '审查验证结果，决定继续改进或进入独立测试。',
   revision: '根据失败证据修订方案。', final_tests: '在冻结方案后进行独立测试。', report: '汇总研究结论、证据、局限和可复现记录。',
 };
 
@@ -39,9 +40,12 @@ function definitionDissent(value?: Json): number {
     vote.approve === false || vote.required_changes_count > 0 || (Array.isArray(vote.required_changes) && vote.required_changes.length > 0)).length;
 }
 
-export function stageSummary(stage: string, step?: Json, data?: Detail): string {
+export function stageSummary(stage: string, step?: Json, data?: Detail, activeStage = data?.run?.stage): string {
   const output = step?.output;
-  if (stage === 'tuning' && (step?.activity ?? output?.activity) === 'diagnostic_repair') return '正在参数微调阶段处理诊断补修；补修和 CPU 检查不代表参数搜索完成，验证评审尚未开始。已有实验与原始回执保留。';
+  if (stage === 'tuning' && (step?.activity ?? output?.activity) === 'batch_script_review') return '正在评审贝叶斯搜索脚本和参数计划。';
+  if (stage === 'tuning' && (step?.activity ?? output?.activity) === 'batch_search_finished') return '本次贝叶斯验证批次已结束，接下来核对搜索进度和测量结果。';
+  if (['architecture_tuning', 'tuning'].includes(stage) && (step?.activity ?? output?.activity) === 'diagnostic_repair')
+    return activeStage === stage ? '正在处理本阶段的诊断补修。候选须经代码复审后才能执行。' : '本阶段记录了一次诊断补修。';
   if (stage === 'tuning' && (step?.tuning_pending || output?.tuning_pending)) return '当前批次已记录，仍需依据验证结果决定下一步；参数微调尚未完成。';
   const holdLabel = data?.run && validationStageLabel(data.run, stage);
   if (holdLabel) return `${holdLabel}。核对已保存的失败指标、验收完整性与三方意见后，按停止规则收尾。`;
@@ -66,7 +70,7 @@ export function stageSummary(stage: string, step?: Json, data?: Detail): string 
     const response = data.architecture_review.revision.author_response;
     return `架构作者已交付，仍有 ${response.unresolved_issues?.length ?? 0} 项意见未闭合。${response.requires_new_consensus ? '需补齐定义并重新取得三方共识。' : '需闭合具体意见并完成独立评议。'}`;
   }
-  if (stage === 'design' && data?.architecture_review?.current) return `${data.architecture_review.current.status === 'approved' ? '架构文档评议通过，准备推进代码实现。' : data.architecture_review.current.status === 'rejected' ? '架构文档需要修改，点击查看具体意见。' : '架构 Markdown 已保存，正在按索引分段评议。'}`;
+  if (stage === 'design' && data?.architecture_review?.current) return `${data.architecture_review.current.status === 'approved' ? '架构文档评议通过，准备推进代码实现。' : data.architecture_review.current.status === 'rejected' ? '架构文档需要修改，点击查看具体意见。' : data.architecture_review.current.io_template_review === 1 ? `正在审核一份完整模板和 ${data.architecture_review.current.combination_count} 个输入输出组合。` : '架构 Markdown 已保存，正在按索引分段评议。'}`;
   if (stage === 'implementation' && data?.local_codex?.current) {
     const workflow = data.local_codex.current;
     const status: Record<string, string> = { specification: '正在编写代码实现文档。', spec_review: '实现 Markdown 已保存，三方通过目录和工具阅读全文审核。', implementing: '实现文档已批准，本机 Codex 正在实现。', acceptance: 'Codex 已交付文件，正在进行本地验收。', code_review: '本地验收已记录，正在独立评议实际代码。', completed: '实现与交付验收已完成，准备进入实验。', blocked: '实现流程等待处理，点击查看具体原因。' };
@@ -92,6 +96,8 @@ export function stageSummary(stage: string, step?: Json, data?: Detail): string 
 
 const labels: Record<string, string> = { summary: '摘要', research_question: '研究问题', method: '方法与架构', datasets: '数据集', baselines: '比较基线', limitations: '局限', relevance: '对当前研究的意义', missing_information: '尚未读到或待核实', domain: '研究领域', success_criteria: '成功标准', constraints: '约束', architecture: '架构', dataset: '数据', evaluation: '评估方法', rationale: '判断依据', hypothesis: '假设', novelty: '创新点', risks: '风险', explanation: '实现说明', decision: '阶段决定' };
 
+Object.assign(labels, {dataset_description: '数据说明与限制'});
+
 function Fields({ value }: { value?: Json }) {
   return <dl className="stage-detail-fields">{Object.entries(labels).filter(([key]) => value?.[key] != null).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{Array.isArray(value?.[key]) ? <ul>{value[key].map((line: unknown, i: number) => <li key={i}><ReferenceText value={line} /></li>)}</ul> : textOf(value?.[key])}</dd></div>)}</dl>;
 }
@@ -109,26 +115,37 @@ export function LiteratureStageDetail({ output, literature }: { output?: Json; l
   })}</div>;
 }
 
+function OptimizationDetails({ data, run }: {data?: Detail; run: Run}) {
+  const [open, setOpen] = useState(false);
+  const saved = data?.optimization_loop;
+  const path = open && !saved?.progress ? `/runs/${encodeURIComponent(run.id)}/optimization-progress` : null;
+  const snapshot = useProjectionSnapshot(path, projectionRevision(data), data?.client_refresh ?? 0);
+  const request = useRemoteResource<Json>(path, snapshot.key, 0, true);
+  const value = saved?.progress ? saved : request.data;
+  return <details className="optimization-loop-note" onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary>修改尝试与优化进展</summary>
+    {value ? <OptimizationProgress value={value} /> : open && (request.error
+      ? <div role="alert"><p>{request.error}</p><button className="btn small" onClick={snapshot.refresh}>重新读取进展</button></div>
+      : <p role="status">正在读取修改与训练记录…</p>)}
+    <p>实验验证 → 架构评估与调整 ↺ 验证 → 参数微调（含贝叶斯优化） → 稳定性复核</p>
+    <p>{value?.completion_rule ?? '架构与参数经实际结果和三方评审确认稳定后才切换数据集；首数据集模型源码冻结复用。覆盖完成或停止不等于稳定。'}</p>
+  </details>;
+}
+
 export function StageDetailBody({ stage, step, data, run }: { stage: string; step?: Json; data?: Detail; run: Run }) {
   if (stage === 'architecture_tuning') {
     const loop = data?.architecture_tuning;
     return <section className="architecture-tuning-detail">
       <ArchitectureAdjustmentDetails key={run.id} runId={run.id} value={data?.architecture_adjustments} />
-      <details><summary>阶段进展与优化流程</summary><h3>验证与架构微调循环</h3>
-      <p>实验验证 → 架构评估与调整 ↺ 验证 → 参数微调 → 稳定性复核</p>
-      <p>三方先检查已有对照、消融、训练统计和模型源码，评估架构合理性；必要时修改并复验。架构通过后才调参数，原始实验和回执继续保留。</p>
-      <p>{data?.optimization_loop?.completion_rule ?? '架构与参数经实际结果和三方评审确认稳定后才切换数据集；首数据集模型源码冻结复用。覆盖完成或停止不等于稳定。'}</p>
+      <details><summary>阶段流程记录</summary>
       {step?.output?.decision_id && <Fields value={step.output} />}
-      <OptimizationProgress value={data?.optimization_loop ?? loop} />
-      {loop ? <><Fields value={loop.result ?? loop.review} /><details><summary>阶段流程记录</summary><pre><ReferenceText value={loop} /></pre></details></> : <p>尚无已批准的架构修改；先评估已有验证证据，不因实验覆盖完成自动进入调参或下一数据集。</p>}
+      {loop ? <><Fields value={loop.result ?? loop.review} /><pre><ReferenceText value={loop} /></pre></> : <p>尚无已批准的架构修改；先评估已有验证证据，不因实验覆盖完成自动进入调参或下一数据集。</p>}
       </details>
     </section>;
   }
   const output = step?.output;
   if (stage === 'validation_review') return <ValidationReviewDetail output={output} run={run} />;
-  if (['experiments', 'tuning', 'final_tests'].includes(stage)) return <>
-    {stage === 'tuning' && <ParameterGrid value={data?.parameter_grid} experiments={data?.experiments} runId={run.id} />}
-    {data?.dataset_configuration && <section className="panel dataset-configuration-panel" aria-label="实验数据配置"><h3>实验数据配置</h3>
+  const configurationPanel = data?.dataset_configuration && <section className="panel dataset-configuration-panel" aria-label="实验数据配置"><h3>实验数据配置</h3>
       <p className="dataset-config-overview"><strong>{data.dataset_configuration.queue?.active_dataset ?? data.dataset_configuration.datasets.join('、')}</strong><span>{data.dataset_configuration.queue?.attempts_unlimited ? '实验不限次数' : '按任务执行策略运行'}</span><span>待运行：{data.dataset_configuration.queue?.pending_datasets.join('、') || '无'}</span></p>
       <details className="dataset-config-details"><summary>配置状态、执行策略与实现记录</summary>
       <p>复用原架构与模型实现，通过配置文件和命令行参数选择数据集。数据接口检查通过后开始成对验证。</p>
@@ -166,7 +183,12 @@ export function StageDetailBody({ stage, step, data, run }: { stage: string; ste
       {data.dataset_configuration.error && <p role="alert">{data.dataset_configuration.error}</p>}
       {data.dataset_configuration.reviews?.length > 0 && <details><summary>本次配置核验意见</summary><Fields value={data.dataset_configuration.reviews} /></details>}
       </details>
-    </section>}
+    </section>;
+  if (stage === 'tuning' && data?.tuning_datasets?.datasets.length) return <DatasetTuningDetail key={run.id} data={{...data, run}}
+    currentConfig={<>{configurationPanel}<OptimizationDetails data={data} run={run} /></>} stageResult={output && <details><summary>阶段结论与参数选择</summary><Fields value={output} /></details>} />;
+  if (['experiments', 'tuning', 'final_tests'].includes(stage)) return <>
+    {stage === 'tuning' && <ParameterGrid value={data?.parameter_grid} experiments={data?.experiments} runId={run.id} />}
+    {configurationPanel}
     {data?.dataset_configuration && !(data.experiments ?? []).some(item => (item.research_cycle ?? 1) === (run.state?.research_cycle ?? 1))
       ? <><p>本轮数据配置尚未产生实验测量。</p><details><summary>查看此前轮次的实验记录</summary>
         <ExperimentView runId={run.id} experiments={data?.experiments ?? []} evaluation={data?.evaluation} summary={data?.experiment_summary} datasetQueue={data?.dataset_configuration?.queue} currentCycle={run.state?.research_cycle} />
@@ -234,6 +256,7 @@ export function ArchitectureStageEntry({ data, run, openLimits, prepared, extern
 }
 
 export function stageDetailRequestPath(runId: string, stage: string, lazy: boolean, implementationRecordsOpen: boolean) {
+  if (lazy && stage === 'architecture_tuning') return runStagePath(runId, stage) + '?include_progress=false';
   return lazy && (stage !== 'implementation' || implementationRecordsOpen) ? runStagePath(runId, stage) : null;
 }
 
@@ -255,7 +278,7 @@ export function StageDetails({ stage, label, step, data, run, close }: { stage: 
     && implementationProgress?.code_generation_started && implementationProgress.workflow?.id
     && ['code_generation', 'acceptance', 'code_review', 'completed'].includes(implementationProgress.phase);
   useEffect(() => { button.current?.focus(); }, []);
-  return <ReferenceNames records={[selectedData, selectedStep, run]}><div className="stage-detail-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section className={`stage-detail-dialog ${stage==='design'?'stage-detail-design':''} ${stage==='implementation'?'stage-detail-implementation':''} ${trainingStage?'stage-detail-experiments':''} ${stage==='validation_review'?'stage-detail-validation':''}`} role="dialog" aria-modal="true" aria-labelledby="stage-detail-title"><header><div><small>研究阶段详情</small><h2 id="stage-detail-title"><ReferenceText value={label} /></h2></div><button ref={button} type="button" className="btn" aria-label="关闭阶段详情" onClick={close}><X size={20} /></button></header><div className="stage-detail-content">{stage !== 'implementation' && <p className="stage-detail-purpose"><ReferenceText value={purpose[stage]} /></p>}{stage === 'implementation' && <><div className="implementation-detail-layout"><ImplementationSidebar progress={implementationProgress} runId={run.id} localCodex={selectedData?.local_codex} />
+  return <ReferenceNames records={[selectedData, selectedStep, run]}><div className="stage-detail-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section className={`stage-detail-dialog ${stage==='design'?'stage-detail-design':''} ${stage==='implementation'?'stage-detail-implementation':''} ${trainingStage?'stage-detail-experiments':''} ${stage==='validation_review'?'stage-detail-validation':''}`} role="dialog" aria-modal="true" aria-labelledby="stage-detail-title"><header><div><small>研究阶段详情</small><h2 id="stage-detail-title"><ReferenceText value={label} /></h2></div><button ref={button} type="button" className="btn" aria-label="关闭阶段详情" onClick={close}><X size={20} /></button></header><div className="stage-detail-content">{stage !== 'implementation' && <p className="stage-detail-purpose"><ReferenceText value={purpose[stage]} /></p>}{(stage === 'architecture_tuning' || (stage === 'tuning' && !selectedData?.tuning_datasets?.datasets.length)) && <OptimizationDetails key={recordScope} data={selectedData} run={run} />}{stage === 'implementation' && <><div className="implementation-detail-layout"><ImplementationSidebar progress={implementationProgress} runId={run.id} localCodex={selectedData?.local_codex} />
       {showCodeProgress && <NativeCodeProgress runId={run.id} workflowId={implementationProgress.workflow.id}
         cycle={implementationProgress.cycle} runStatus={run.status} />}
     </div><details className="implementation-source-records" open={recordsOpen} onToggle={event => setRecordSelection(event.currentTarget.open ? recordScope : null)}><summary>完整版本、交付与验收记录</summary>{recordsOpen && <><p><ReferenceText value={purpose[stage]} /></p>{lazy && detail.data && snapshot.stale && !trainingStage && <button className="btn small" onClick={snapshot.refresh}>有新记录，刷新阶段详情</button>}{lazy && !detail.data ? detail.error ? <div role="alert"><p>{detail.error}</p><button className="btn" onClick={snapshot.refresh}>重新读取阶段详情</button></div> : <p role="status">正在读取代码实现详情…</p> : <ViewBoundary key={`${run.id}:${stage}`} label={label}><StageDetailBody stage={stage} step={selectedStep} data={selectedData} run={run} /></ViewBoundary>}</>}</details></>}{run.mode === 'demo' && <p className="inline-info">演示模拟记录，不构成真实 AI 研究。</p>}{stage !== 'implementation' && <>{lazy && detail.data && snapshot.stale && !trainingStage && <button className="btn small" onClick={snapshot.refresh}>有新记录，刷新阶段详情</button>}{lazy && !detail.data ? detail.error ? <div role="alert"><p><ReferenceText value={detail.error} /></p><button className="btn" onClick={snapshot.refresh}>重新读取阶段详情</button></div> : <p role="status">正在读取{label}详情…</p> : <ViewBoundary key={`${run.id}:${stage}`} label={label}><StageDetailBody stage={stage} step={selectedStep} data={selectedData} run={run} /></ViewBoundary>}</>}</div></section></div></ReferenceNames>;

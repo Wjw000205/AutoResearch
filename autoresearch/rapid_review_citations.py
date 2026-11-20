@@ -13,13 +13,13 @@ from .storage import now
 
 def inventory(engine, run_id, record, vote, context):
     from .rapid_review_rejection import authenticate_vote
-    from .rapid_experiment_revision import REVIEW,VOTE
+    from .rapid_experiment_revision import review_instruction,VOTE
     from .engine import Harness
     from .rapid_review_plan import inherited_rows
     from .dataset_review_protocol import remaining_ranges
     authenticate_vote(engine,run_id,record,vote,context)
     key=Harness.decision_key(run_id,vote['role'],record.get('review_purpose') or
-        'rapid_review:'+record['candidate']['amendment_sha256'],REVIEW,context,record.get('review_schema') or VOTE)
+        'rapid_review:'+record['candidate']['amendment_sha256'],review_instruction(record),context,record.get('review_schema') or VOTE)
     progress=engine.store.get('handoff_progress',key) or {}
     evidence=engine.store.get('experiment_evidence',context['validation_evidence']['id']) or {}
     if evidence.get('run_id')!=run_id or sha(evidence.get('summary'))!=context['validation_evidence']['sha256']:
@@ -89,6 +89,12 @@ def verify(engine,run_id,record,vote,context,assignment):
 
 
 async def repair(engine,harness,run_id,record,votes,context):
+    from . import independent_full_review as full
+    if any(full.KEY in v for v in votes):
+        from .rapid_experiment_revision import review_receipts
+        full.authenticate_complete(engine.store,run_id,votes)
+        for vote in votes: review_receipts(engine,run_id,record,vote,context)
+        return votes
     from .rapid_experiment_revision import review_receipts,COLLECTION,_base_unchanged,_candidate_unchanged
     from .engine import ResearchBlocked
     from .training_adjustment import obj

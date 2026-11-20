@@ -20,7 +20,7 @@ const labels: Record<string, string> = {
   cached_live_provider: '复用真实模型缓存', lexical_hash_v1: '词项与特征哈希检索（第 1 版）',
   baseline: '基线方法', proposed: '候选方法', ablation: '消融实验', validation: '验证集', test: '测试集',
   'literature.search': '检索文献', 'literature.survey': '检索近期进展', 'literature.verify': '核验文献来源',
-  'literature.read_papers': '获取并索引论文', 'sources.read': '读取文献内容', 'evidence.request': '委派证据核验',
+  'literature.read_papers': '获取并索引论文', 'sources.read': '读取文献内容', 'sources.identity': '检索来源身份与版本记录', 'evidence.request': '委派证据核验',
   'web.search': '学术网络检索', 'papers.download': '下载论文至本地', 'pdf.info': '查看本地 PDF 目录',
   'pdf.search': '检索 PDF 页内内容', 'pdf.read': '按页读取本地 PDF',
   'memory.search': '检索持久记忆', 'memory.write': '保存持久记忆', 'artifacts.read': '读取研究产物', 'documents.list': '查看文档索引', 'documents.search': '检索文档片段', 'documents.read': '按索引读取文档章节',

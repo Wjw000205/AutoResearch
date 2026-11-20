@@ -5,6 +5,8 @@ Each reviewer reads approved architecture, the current SPEC and its own replies.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
+
 import asyncio
 import copy
 import hashlib
@@ -25,46 +27,6 @@ class SpecificationTooLarge(ValueError):
         self.actual_bytes, self.limit_bytes = actual_bytes, limit_bytes
 
 
-async def _collect_admitted(collector, prepared):
-    """Drain ordinary peer failures, but stop every peer promptly on pause."""
-    tasks = []
-    started = asyncio.Event()
-    cancellation_sent = False
-
-    def cancel_pending(exclude=None):
-        nonlocal cancellation_sent
-        cancellation_sent = True
-        for task in tasks:
-            if task is not exclude and not task.done() and not task.cancelling():
-                task.cancel()
-
-    async def collect(scope, value):
-        try:
-            await started.wait()
-            return await collector(scope, value)
-        except asyncio.CancelledError:
-            if not cancellation_sent:
-                cancel_pending(asyncio.current_task())
-            raise
-
-    try:
-        for scope, value in prepared:
-            tasks.append(asyncio.create_task(collect(scope, value)))
-        started.set()
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-    except BaseException:
-        cancel_pending()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    # A pause wins over an ordinary invalid opinion from another role.
-    for outcome in outcomes:
-        if isinstance(outcome, asyncio.CancelledError):
-            raise outcome
-    for outcome in outcomes:
-        if isinstance(outcome, BaseException):
-            raise outcome
-
-
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
 
@@ -81,20 +43,34 @@ def _save(engine, h, run_id, name, text, kind):
     return document_index.index(engine, h.intelligence, run_id, artifact['id'], kind=kind)
 
 
+def original_plan_text(plan):
+    from .engine import digest
+    lines = ['# 冻结实验计划', '', '计划版本：`' + digest(plan) + '`',
+             '本文件保留原计划全部字段；没有实验结果。', '']
+    for field, value in plan.items():
+        lines += ['## ' + field, '', '```json', _json(value), '```', '']
+    return '\n'.join(lines)
+
+
 def _save_planning_context(engine, h, run_id, common, code_contract, format_contract, repair, *,
                            protocol, read_window_protocol, checked_inputs):
     """Keep document writes on the caller after the pure ancestry validation."""
     from .engine import digest
     saved = architecture.save(engine, h, run_id, common['design'])
     plan = common.get('experiment_plan') or {}
-    lines = ['# 冻结实验计划', '', '计划版本：`' + digest(plan) + '`',
-             '本文件保留原计划全部字段；没有实验结果。', '']
-    for field, value in plan.items():
-        lines += ['## ' + field, '', '```json', _json(value), '```', '']
-    directory = _save(engine, h, run_id,
-        f'cycle-{engine.cycle(run_id)}/implementation/plans/{digest(plan)}.md',
-        '\n'.join(lines), 'frozen_experiment_plan')
-    docs = [saved['document'], saved['approved_proposal'], directory]
+    definitions = []
+    if common.get('task_document_projection_protocol') == 1:
+        from .task_document_projection import brief, render
+        view, text = brief(plan, '冻结实验计划任务字段')
+        base = f'cycle-{engine.cycle(run_id)}/task-documents/v1/{view["source_sha256"]}'
+        directory = _save(engine, h, run_id, base + '-experiment_plan-brief.md', text, 'frozen_experiment_plan')
+        definitions = [_save(engine, h, run_id, base + '-definitions.md', render(view, '任务资料精确定义'),
+                             'task_document_definitions')]
+    else:
+        directory = _save(engine, h, run_id,
+            f'cycle-{engine.cycle(run_id)}/implementation/plans/{digest(plan)}.md',
+            original_plan_text(plan), 'frozen_experiment_plan')
+    docs = [saved['document'], saved['approved_proposal'], directory, *definitions]
     context = {'document_index_protocol': 1, 'indexed_document_context': True,
         'source_tool_protocol': 1, 'research_cycle': engine.cycle(run_id),
         'indexed_documents': docs, 'architecture_document': saved['document'],
@@ -138,6 +114,9 @@ def _save_planning_context(engine, h, run_id, common, code_contract, format_cont
     context['implementation_capability_evidence'] = evidence
     context['implementation_capability_document'] = capability_document
     context['indexed_documents'].append(capability_document)
+    if common.get('dataset_catalog'):
+        context['dataset_catalog'] = copy.deepcopy(common['dataset_catalog'])
+        context['dataset_request_protocol'] = 2
     return context
 
 
@@ -160,6 +139,114 @@ async def planning_context_async(engine, h, run_id, common, code_contract, forma
     engine.check_active(run_id)
     return _save_planning_context(engine, h, run_id, common, code_contract, format_contract, repair,
         protocol=protocol, read_window_protocol=read_window_protocol, checked_inputs=checked)
+
+
+def committed_review_context(engine, run_id, state):
+    """Recover a submitted v1 materials review; never renew prospective author code.
+
+    None means the existing author/legacy path owns admission. Once a current
+    compact review is identified, failed authentication must propagate.
+    """
+    from . import implementation_whole_review as whole
+    if whole.enabled(state):
+        return whole.committed_review_context(engine, run_id, state)
+    from . import implementation_acceptance as policy, implementation_acceptance_flow as flow
+    from . import implementation_authoring as author, experiment_materials as materials
+    from .codex_workflow import _frozen_spec_assignment
+    from .engine import digest
+    from .implementation_definition_repair import FIELD as DEFINITION_REPAIR
+    from .implementation_phase_binding import code_planning_document
+    if not policy.enabled(state):
+        return None
+    if state.get(DEFINITION_REPAIR, {}).get('status') not in (None, 'approved'):
+        return None  # A separate author/definition transition retains admission.
+    code_row = code_planning_document(state)
+    pending = [code_row] if code_row is not None else [r for r in state['specifications'] if r.get('approved') is None]
+    repairing = False
+    if not pending:
+        ledger = state[policy.FIELD]
+        last = state['specifications'][-1] if state['specifications'] else None
+        if (last and last.get('approved') is False and ledger.get('outcome') == 'REPAIR'
+                and ledger['rounds'][-1].get('scoped_supplement')):
+            # Both pending endpoint evidence and confirmed endpoint defects
+            # use the submitted author's authenticated compact materials.
+            # validate_repair_previous below replays the actual disposition;
+            # selecting this source view grants no author or reviewer approval.
+            pending = [last]
+            repairing = True
+    if not pending:
+        # A released document can be resumed before code dispatch too. It does
+        # not reopen authorship; authenticate its ordinary release below.
+        pending = [r for r in reversed(state['specifications']) if r.get('approved') is True][:1]
+        if not pending:
+            return None
+    if len(pending) != 1:
+        policy.fail('Ambiguous submitted review cursor')
+    row = pending[0]
+    hid = row.get('authoring_handoff_id')
+    context = engine.store.get('handoff_inputs', hid or '', {}).get('context', {})
+    assignment = engine.store.get('handoffs', hid or '', {})
+    frozen = _frozen_spec_assignment(engine, run_id, assignment.get('purpose'), 'engineer')
+    if not frozen or frozen['id'] != hid:
+        policy.fail('Submitted review lacks its exact frozen author')
+    author.validate_submission(engine, run_id, state, row)
+    if materials.FIELD not in context:
+        return None  # Historical protocols retain their original admission.
+    ledger = state[policy.FIELD]
+    slots = [s for s in ledger['rounds'] if s['revision'] == row['index']]
+    released = row.get('approved') is True
+    if (len(slots) != 1 or slots[0].get('complete') is not (released or repairing)
+            or slots[0] != ledger['rounds'][-1]
+            or (code_row is None and state.get('current_revision') not in
+                ([row['index'], row['index'] + 1] if repairing else [row['index']]))
+            or ledger.get('binding') != {'revision': row['index'], 'spec_hash': row['spec_hash'],
+                                       'document_sha256': row['document']['sha256']}):
+        policy.fail('Submitted review does not match the current acceptance binding')
+    decision = engine.store.get('decisions', hid, {})
+    from .harness_delivery import authenticate
+    from .intelligence import parse_json
+    parse_json(json.dumps(decision.get('result'), ensure_ascii=False), frozen['schema'])
+    if authenticate(engine, run_id, 'engineer', hid, decision.get('result')) != context:
+        policy.fail('Submitted author delivery differs from its frozen context')
+    context = copy.deepcopy(context)
+    binding = context.get('implementation_document_authoring', {})
+    if (binding.get('workflow_id') != state['id'] or binding.get('revision') != row['index']
+            or context.get('acceptance_contract') != ledger['contract']
+            or context.get('acceptance_budget') != ledger['budget']
+            or context.get('research_cycle') != engine.cycle(run_id)
+            or any(context.get(key + '_hash') != digest(state['common'][key])
+                   for key in ('proposal', 'design', 'experiment_plan'))):
+        policy.fail('Submitted author scientific source or acceptance contract changed')
+    available = {}
+    for doc in [*context['indexed_documents'], *context.get('implementation_on_demand_documents', [])]:
+        if doc['document_id'] in available and available[doc['document_id']] != doc:
+            policy.fail('Conflicting frozen common document versions')
+        available[doc['document_id']] = doc
+    context['indexed_documents'] = list(available.values())
+    materials.verify_frozen(engine, run_id, state['common']['experiment_plan'], context)
+    flow.validate_contract(engine, run_id, state, context)
+    if released:
+        flow.validate_release(engine, run_id, state, row)
+    if repairing:
+        flow.validate_repair_previous(engine, run_id, state, row['index'] + 1)
+    # Authenticate existing base review packets as well as their source view.
+    # The scoped scheduler authenticates its reports, obligations and successor
+    # lineage before dispatch, with its original deadline and budget intact.
+    for role in ('director', 'engineer', 'scout'):
+        packet = _frozen_spec_assignment(engine, run_id,
+            f'implementation_acceptance_review:{digest(state["id"])}:{row["index"]}', role)
+        if packet:
+            review = packet['context']
+            scope = review.get(policy.CONTEXT, {})
+            if (review.get('acceptance_workflow_id') != state['id']
+                    or scope.get('contract') != ledger['contract']
+                    or scope.get('document') != row['document']
+                    or scope.get('document_revision') != row['index']
+                    or scope.get('spec_hash') != row['spec_hash']
+                    or scope.get('self_check') is not (role == 'engineer')
+                    or review.get(materials.FIELD) != context[materials.FIELD]):
+                policy.fail('Frozen review differs from submitted author acceptance binding')
+    return context
 
 
 def save_specification(engine, h, run_id, state, row, context):
@@ -238,9 +325,8 @@ def require_indexed_review(engine, run_id, state, row=None):
             or state.get('implementation_whole_alignment_protocol') == 1
             or state.get('implementation_incremental_review_protocol') == 1
             or state.get('document_protocol') != 2
-            or state.get('implementation_document_authoring_protocol') != 1
-            or engine.store.get('runs', run_id, {}).get('config', {}).get('implementation_review_strategy') not in {'whole_alignment', 'acceptance_contract'}):
-        _fail('旧实现审查派发已经删除；请使用新索引全文审核及真实作者保存流程，历史付费输入保持原样。')
+            or state.get('implementation_document_authoring_protocol') != 1):
+        _fail('历史文档与其冻结的作者或审核协议不一致。')
     candidates = [row] if row is not None else state.get('specifications', [])
     if any(entry.get('implementation_whole_alignment_protocol') == 1
            or entry.get('implementation_incremental_review_protocol') == 1
@@ -249,17 +335,6 @@ def require_indexed_review(engine, run_id, state, row=None):
                 ('review_batch', 'review_multiunit_batch', 'review_followup', 'review_wait',
                  'implementation_incremental_target')) for entry in candidates):
         _fail('新流程不能转换旧整篇全文、单问题或章节分组的冻结审查。')
-
-
-async def reviews(engine, h, run_id, state, row, context, persist):
-    """Dispatch exactly the new three independent indexed full-text reviews."""
-    from .implementation_review_flow import run_indexed
-    engine.check_active(run_id)
-    require_indexed_review(engine, run_id, state, row)
-    from . import implementation_acceptance as acceptance, implementation_acceptance_flow as flow
-    if acceptance.enabled(state):
-        return await flow.review(engine, h, run_id, state, row, context, persist)
-    return await run_indexed(engine, h, run_id, state, row, context, persist)
 
 
 def _read_coverage_spans(engine, run_id, doc, handoff_id):
@@ -275,6 +350,11 @@ def _read_coverage_spans(engine, run_id, doc, handoff_id):
             identity_key='document_id', handoff_id=handoff_id, text=text)
     spans = {}
     for receipt in progress.get('tool_results', []):
+        if receipt.get('call', {}).get('name') == 'materials.request_read':
+            if receipt.get('result', {}).get('error'):
+                continue
+            from .supplemental_reads import normal_read
+            receipt = normal_read(engine, run_id, handoff_id, receipt)
         call, page = receipt.get('call', {}), receipt.get('result', {})
         if call.get('name') != 'documents.read' or not isinstance(page, dict) or page.get('error'):
             continue
@@ -330,6 +410,9 @@ def read_coverage(engine, run_id, doc, required, handoff_id):
 @architecture.operation
 def validate_review(engine, run_id, state, row):
     """Authorize only a current authentic new-protocol three-role approval."""
+    from . import implementation_cycle as cycle
+    if cycle.active(row):
+        return cycle.validate_document(engine,run_id,state,row)
     from .implementation_authoring import validate_submission
     from .implementation_indexed_replies import validate_documents
     from . import implementation_indexed_review as indexed
@@ -357,6 +440,14 @@ def validate_review_snapshot(engine, run_id, state, row):
 
 
 def bounded_tool_result(context, receipts, call, output):
+    from . import independent_full_review as full
+    if full.tool_available(context) and call.get('name') in {full.TOOL, 'reviews.record_notes'}:
+        # Execution authenticates the exact immutable virtual material. Its
+        # actual pages share the final combined 50k presentation window.
+        return output
+    if call.get('name') == 'materials.request_read':
+        from .supplemental_reads import bounded_output
+        return bounded_output(context, call, output)
     if context.get('indexed_document_context') is not True or context.get('document_index_protocol') != 1:
         return output
     if call.get('name') in {'code.locate', 'code.read', 'code.record_notes', 'documents.recall'}:
@@ -380,6 +471,10 @@ def bounded_tool_result(context, receipts, call, output):
         return output
     from .document_working_notes import read_directories
     docs = read_directories(context)
+    scoped_code_delivery = full.code_delivery_scope(context)
+    if scoped_code_delivery:
+        from .code_whole_review import scope_directory
+        docs = scope_directory(context, docs)
     if (call.get('name') == 'artifacts.list' and context.get('delivery_directory_protocol') == 1
             and context.get('implementation_alignment_protocol') == 1):
         return output  # Frozen assignment scope is checked by the directory tool.
@@ -390,9 +485,16 @@ def bounded_tool_result(context, receipts, call, output):
         # Host receipts are a separate, immutable evidence class. They may be
         # read on demand, but are never added to delivery_artifacts or accepted
         # as code_evidence by the implementation alignment validator.
-        host_artifacts=(context.get('host_verification') or {}).get('artifacts',[])
+        args = call.get('arguments') or {}
+        host_artifacts, call_identity = [], args.get('id')
+        if not scoped_code_delivery:
+            from .host_execution_artifacts import catalog as host_catalog, resolve as host_resolve
+            host_artifacts = [*(context.get('host_verification') or {}).get('artifacts', []), *host_catalog(context).values()]
+            host_bound = host_resolve(context, args)
+            if host_bound:
+                call_identity = host_bound['artifact_id']
         matches = [item for item in [*context.get('delivery_artifacts', []),*host_artifacts]
-                   if item.get('artifact_id') == (call.get('arguments') or {}).get('id')]
+                   if item.get('artifact_id') == call_identity]
         if (len(matches) != 1 or not isinstance(output, dict)
                 or output.get('artifact_id') != matches[0]['artifact_id']
                 or output.get('sha256') != matches[0].get('sha256')):
@@ -408,6 +510,8 @@ def bounded_tool_result(context, receipts, call, output):
                     or output[0].get('sha256') != match[0]['sha256']):
                 return {'error': '目录不属于本次固定输入版本', 'text_returned': False}
             return output
+        if scoped_code_delivery and isinstance(output, list):
+            return scope_directory(context, output)
         return docs
     if call.get('name') not in {'documents.search', 'documents.read', 'hardware.inspect', 'resources.assess'}:
         raise ValueError('Indexed implementation requires scoped document tools')
@@ -425,6 +529,10 @@ def bounded_tool_result(context, receipts, call, output):
             chars -= min(length, len(row.get('excerpt', '')))
         return {**output, 'hits': hits}
     from .document_read_window import enabled, bound_read
+    if full.tool_available(context) or context.get('scientific_author_protocol') == 1:
+        if len(output.get('text', '')) > full.PAGE_LIMIT:
+            raise ValueError('Full-review document page exceeds its frozen per-page limit')
+        return output
     if enabled(context):
         return bound_read(doc, output)
     pages = [v['result'] for v in receipts if v.get('call', {}).get('name') == 'documents.read'
@@ -445,7 +553,9 @@ def export_bundle(engine, run_id, state, row):
     """Read-only Codex inputs live outside its writable delivery workspace."""
     from .codex_workflow import _checked_workspace
     _checked_workspace(state['project_root'], run_id, state['workspace'])
-    require_indexed_review(engine, run_id, state, row)
+    from .implementation_cycle import active
+    if not active(state):
+        require_indexed_review(engine, run_id, state, row)
     name = row['spec_hash'][:16]
     target = Path(state['workspace']).parent / 'inputs' / name
     from .deletion import _plain_path
@@ -502,44 +612,4 @@ def verify_bundle(bundle):
                 or hashlib.sha256(path.read_bytes()).hexdigest() != feedback['sha256']):
             raise ValueError('Frozen Codex review feedback changed')
 
-
-def codex_instruction(state, row, feedback):
-    bundle = state['input_bundle']
-    implementation = Path(bundle['manifest']).parent / bundle['documents'][0]['file']
-    instruction = '按照 "' + str(implementation) + '" 实现代码。'
-    focused = any(item.get('repair_contract', {}).get('audit_revision') for item in feedback)
-    if focused:
-        from .code_repair_audit_view import view
-        feedback = copy.deepcopy(feedback)
-        for item in feedback:
-            packet = item.get('repair_contract')
-            if packet and packet.get('audit_revision'):
-                item['repair_contract'] = {**view(packet), 'instruction': packet['instruction'],
-                    'repair_receipt_schema': packet['repair_receipt_schema']}
-        instruction = ('本轮仅按修改清单修复已有代码，保留已正确实现和已完成研究阶段。'
-            '清单逐项给出审查意见、实现文档具体位置、代码位置、修改办法和验证要求。'
-            '仅按需补读所引章节或代码附近，不把整份文档、源码或评审历史加入上下文。'
-            '批准实现文档位置："' + str(implementation) + '"；文档索引："' + str(bundle['manifest']) + '"。')
-    from .code_bundle import INSTRUCTION as layout_instruction
-    instruction += '\n代码目录交付要求：' + layout_instruction
-    if any(item.get('repair_contract') for item in feedback):
-        from .code_repair_contract import DELIVERY_GUIDANCE
-        instruction += '\n' + DELIVERY_GUIDANCE
-    if feedback:
-        path = implementation.parent / ('review-feedback-' + hashlib.sha256(_json(feedback).encode()).hexdigest()[:16] + '.md')
-        text = ('# 当前交付修改指令\n\n仅处理本文件当前清单，不重开历史已解决意见。\n'
-                'repair_contract 内的修改已绑定批准实现文档和本次交付，由独立角色核对；'
-                '严格逐项遵守其中的原文、change 和 verification，并保存实际测试回执。'
-                '不得因自然语言建议改写批准文档或扩张需求；发现冲突须报告，不能自行猜测。\n'
-                '审查只核对要求完成情况；修改代码由 Codex 完成。\n'
-                '先核对 local_acceptance.checks 中的真实参数、退出码及 stdout/stderr，'
-                '以具体运行错误定位修复；artifact_path 保存完整运行文件。'
-                'truncated 标记表示这里只提供了摘录。不要把后续缺少指标的汇总错误当作根因，'
-                '也不要要求用户重新提供已经附带的运行信息。\n\n```json\n' + _json(feedback) + '\n```\n')
-        _write_immutable(path, text.encode('utf-8'))
-        pointer = {'path': str(path), 'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest()}
-        if pointer not in bundle.setdefault('feedback_documents', []):
-            bundle['feedback_documents'].append(pointer)
-        instruction += '\n处理审查意见："' + str(path) + '"。'
-    return instruction
 

@@ -38,6 +38,10 @@ async def plan(engine, harness, run_id, question, queries, context):
     inputs = {'question': question, 'initial_queries': queries, 'phase': engine.store.get('runs', run_id)['stage'],
               'date_policy': context.get('literature_date_policy'), 'selected_idea_hash': context.get('selected_idea_hash'),
               'literature_reasoning_effort': context.get('literature_reasoning_effort')}
+    from ...literature_discovery import enabled, POLICY, GUIDANCE
+    discovery = enabled(context)
+    if discovery:
+        inputs['literature_discovery_policy'] = POLICY
     key = f'{run_id}:literature-query-plan:{fingerprint(inputs)}'
     saved = engine.store.get('literature_inputs', key)
     if saved:
@@ -45,7 +49,7 @@ async def plan(engine, harness, run_id, question, queries, context):
             raise ValueError('Query planning checkpoint is inconsistent')
         return saved['result']
     result = await harness.ask(run_id, 'scout', 'literature_query_plan:' + fingerprint(inputs)[:20],
-        INSTRUCTION, {**context, **inputs, 'codex_literature_protocol': 1}, SCHEMA)
+        INSTRUCTION + (GUIDANCE if discovery else ''), {**context, **inputs, 'codex_literature_protocol': 1}, SCHEMA)
     engine.check_active(run_id)
     engine.store.put('literature_inputs', key, {'id': key, 'run_id': run_id, 'kind': 'literature_query_plan',
         'inputs': inputs, 'result': result, 'result_sha256': fingerprint(result), 'completed_at': now()})

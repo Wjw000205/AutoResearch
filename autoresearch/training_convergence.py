@@ -72,7 +72,32 @@ def task_monitor(engine, run_id):
     return {'metric': design.get('primary_metric'), 'direction': design.get('direction')}
 
 
-def _series(rows, metric, direction):
+def paired_fit_events(events):
+    """Separate the train and validation streams of the most recent explicitly identified fit."""
+    training, validation, previous = [], [], {}
+    current_fit = None
+    for row in events if isinstance(events, list) else []:
+        if not isinstance(row, dict) or row.get('phase') not in (None, 'train', 'validation'):
+            continue
+        step = row.get('step', row.get('epoch'))
+        if not finite(step) or 'loss' not in row:
+            continue
+        stage, fit = row.get('stage'), row.get('fit_id')
+        if stage not in ('train', 'validation') or not (type(fit) is int or isinstance(fit, str) and fit.strip()):
+            training, validation, previous, current_fit = [], [], {}, None
+            continue
+        identity = segment_identity(row)
+        prior = previous.get(stage)
+        if fit != current_fit or prior and (identity != prior[0] or step <= prior[1]
+                or finite(row.get('epoch')) and finite(prior[2]) and row['epoch'] < prior[2]):
+            training, validation, previous = [], [], {}
+        previous[stage] = (identity, step, row.get('epoch'))
+        current_fit = fit
+        (training if stage == 'train' else validation).append(row)
+    return training, validation
+
+
+def _series(rows, metric, direction, *, validation_rows=None):
     losses = [r['loss'] for r in rows if finite(r.get('loss'))]
     result = {'points': len(losses), 'status': 'insufficient_evidence',
               'reason': '同一训练阶段至少需要 15 个有序 loss 观测点。'}
@@ -92,7 +117,7 @@ def _series(rows, metric, direction):
     result.update(initial_median=initial, previous_median=previous, recent_median=recent,
                   relative_improvement=total, recent_relative_improvement=change,
                   relative_tail_range=span, direction_reversal_fraction=turns)
-    validation = monitor_values(rows, metric, direction)
+    validation = monitor_values(rows if validation_rows is None else validation_rows, metric, direction)
     validation = [v for v in validation if finite(v)]
     if len(validation) >= 2*w:
         val_change = _relative(median(validation[-2*w:-w]), median(validation[-w:])) * (-1 if direction == 'maximize' else 1)
@@ -114,7 +139,7 @@ def _series(rows, metric, direction):
     return {**result, 'status': status, 'reason': reason}
 
 
-def analyze(log, *, phase='validation', metric=None, direction=None):
+def analyze(log, *, phase='validation', metric=None, direction=None, paired_stages=False):
     declared = log.get('monitor', {}) if isinstance(log, dict) else {}
     if not isinstance(declared, dict):
         declared = {}
@@ -132,6 +157,11 @@ def analyze(log, *, phase='validation', metric=None, direction=None):
         return {**base, 'status': 'not_applicable', 'label': LABELS['not_applicable'],
                 'needs_discussion': False, 'reason': log['reason'][:500], 'reported_by_program': True}
     events = log.get('events', []) if isinstance(log, dict) else log if isinstance(log, list) else []
+    validation_rows = []
+    if paired_stages:
+        training, monitoring = paired_fit_events(events)
+        if training and monitoring:
+            events, validation_rows = training, monitoring
     segments, rows, identity, last_step = [], [], None, None
     for row in events if isinstance(events, list) else []:
         if not isinstance(row, dict) or row.get('phase') not in (None, 'train', 'validation') or not ('loss' in row or row.get('loss_nonfinite_count')):
@@ -146,7 +176,7 @@ def analyze(log, *, phase='validation', metric=None, direction=None):
         identity, last_step = current, step
         rows.append(row)
     if rows:
-        segments.append({'identity': list(identity), **_series(rows, metric, direction)})
+        segments.append({'identity': list(identity), **_series(rows, metric, direction, validation_rows=validation_rows or None)})
     latest = segments[-1] if segments else {'status': 'insufficient_evidence', 'points': 0,
         'reason': '尚无可用的有序训练 loss 日志；不能把执行完成当作已收敛。'}
     status = latest['status']
@@ -158,7 +188,8 @@ def analyze(log, *, phase='validation', metric=None, direction=None):
         terminated_by_exception = False
     nonfinite_fields = sorted({k for r in rows + [failure] for k,v in r.items()
                                if k.endswith('_nonfinite_count') and finite(v) and v > 0})
-    invalid = any(finite(r.get('loss_nonfinite_count')) and r['loss_nonfinite_count'] > 0 for r in rows + [failure])
+    invalid = (any(finite(r.get('loss_nonfinite_count')) and r['loss_nonfinite_count'] > 0 for r in rows + validation_rows + [failure])
+               or any(not finite(r.get('loss')) for r in validation_rows))
     if invalid or 'loss' in failure and not finite(failure['loss']):
         latest = {**latest, 'status': 'invalid_loss', 'reason': '保存的失败事件或数值计数报告非有限 loss；不能用之前的下降趋势掩盖异常。'}
         status = latest['status']
@@ -189,4 +220,5 @@ def read_evidence(engine, run_id, trial, *, metric=None, direction=None):
     except (OSError, ValueError):
         evidence['unavailable_reason'] = '训练日志缺失、写入未完成或无法解析。'
     monitor = {'metric': metric, 'direction': direction} if metric else task_monitor(engine, run_id)
-    return {**analyze(log, phase=trial.get('params', {}).get('phase'), **monitor), 'source': evidence}
+    return {**analyze(log, phase=trial.get('params', {}).get('phase'),
+                      paired_stages=trial.get('fit_monitor_protocol') == 1, **monitor), 'source': evidence}

@@ -17,15 +17,19 @@ rapid_revision.prior_review 保留你本人原意见；inherited_source_coverage
 def register(engine,run_id,authorization,test_evidence):
     from .causal_training_followup import COLLECTION
     from .controlled_training_checks import unchanged
+    from . import independent_full_review as full
     key=f'{run_id}:{engine.cycle(run_id)}';old=engine.store.get(COLLECTION,key)
     if (engine.store.get('runs',run_id)['status'] not in {'blocked','paused'} or not authorization
             or not old or old['status']!='rejected' or old.get('trial_id')
-            or len(old.get('votes',[]))!=3 or all(v['approve'] for v in old['votes'])):
+            or not full.members(old.get('votes',[])) or all(v['approve'] for v in old['votes'])):
         raise ValueError('Requires an explicitly authorized, rejected, unexecuted contrast')
     trial='causal-check-'+old['candidate']['amendment_sha256'][:24]
     if engine.store.get('experiments',run_id+':'+trial):raise ValueError('Executed contrasts cannot be amended or replayed')
     # This operator repair changes host code; original inputs and candidate remain immutable.
     unchanged(engine,{**old,'host_sources':{}})
+    if full.reviewers(old['votes'])==full.REVIEWERS:
+        full.authenticate_complete(engine.store,run_id,old['votes'])
+        for vote in old['votes']:full.validate_delivery(engine.store,run_id,vote,engine=engine)
     archive=key+':'+old['candidate']['amendment_sha256']
     existing=engine.store.get(ARCHIVES,archive)
     if existing and existing!=old:raise ValueError('Original rejected review archive changed')

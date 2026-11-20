@@ -9,6 +9,22 @@ from .storage import now, uid
 from .delivery_files import io_path
 
 
+def prior_check_review(engine, run_id, record):
+    from .experiment_review_reuse import unexecuted_review
+    ref = record['evidence']
+    archive = engine.store.get('experiment_evidence', ref['id']) or {}
+    material = archive.get('summary')
+    if archive.get('run_id') != run_id or sha(material) != ref['sha256']:
+        raise ValueError('Previous code review requires the frozen decision evidence')
+    prior = material.get('rapid_revision') or {}
+    if not unexecuted_review(prior) or not prior.get('votes'):
+        return None
+    return {'revision_id': prior['id'], 'sources': prior.get('code_sources'), 'evidence': ref,
+            'review_outcome': prior['review_outcome'], 'resource_admission': prior.get('resource_admission'),
+            'votes': [{k: vote[k] for k in ('role', 'approve', 'issues', 'rationale', 'amendment_sha256', 'candidate_sha256', 'checks_sha256')}
+                      for vote in prior['votes']], 'approval_inherited': False}
+
+
 async def build(engine, harness, run_id, record):
     from .rapid_experiment_revision import _bundle, _write_files, _base_unchanged, build_candidate, COLLECTION
     from .code_bundle import relative_file
@@ -20,14 +36,14 @@ async def build(engine, harness, run_id, record):
     if not job:
         from .scoped_work_order_contract import contract
         work_kind, work_contract = contract(record)
-        if work_kind == 'architecture_experiment':
+        if work_kind in {'architecture_experiment', 'implementation_correction'}:
             from .architecture_experiment_contract import validate as validate_architecture
             from .source_read_identity import source_files
             from .experiment_decisions import _pointer
             material = engine.store.get('experiment_evidence', record['evidence']['id'])['summary']
-            validate_architecture(record['decision'], material, _pointer,
-                source_files=source_files(engine.store, run_id, {
-                    'validation_evidence': record['evidence'], 'evidence_sha256': record['evidence']['sha256']}))
+            source_rows = source_files(engine.store, run_id, {
+                'validation_evidence': record['evidence'], 'evidence_sha256': record['evidence']['sha256']})
+            validate_architecture(record['decision'], material, _pointer, source_files=source_rows)
         from .candidate_repair_source import prepare, tests_only, KEY as REPAIR_SOURCE
         try:
             inherited = prepare(engine, run_id, record, base)
@@ -44,7 +60,7 @@ async def build(engine, harness, run_id, record):
         workspace = engine.run_dir(run_id).resolve() / 'codex-amendments' / sha(record['id'])[:20] / 'workspace'
         input_bundle = _write_files(workspace, {**input_runtime, **input_support})
         _write_files(workspace / '_control', base)
-        instruction = ('按 work_order.json 中三方已批准的修改单修改本工作目录文件。先读原源码和控制配置。'
+        instruction = ('按 work_order.json 中已独立批准的修改单修改本工作目录文件。先读原源码和控制配置。'
             '这是当前模型的有界修改，不重新立项。\n' + work_contract +
             '\n交付 _delivery/changes.json 数组：每个修改或新增运行文件写 {path,change_index}，对应已审 changes 索引。'
             '另交 _delivery/checks.py 和 _delivery/rationale.txt；checks.py 是由宿主运行的 CPU 行为断言。'
@@ -74,27 +90,76 @@ async def build(engine, harness, run_id, record):
                 'work_kind': work_kind, 'source_contract_version': 1,
                 'yaml_contract': work_contract,
                 'cpu_check_input': 'sys.argv[1] is the host code_check envelope, not a training config; use separate isolated fixtures'}
+        if work_kind in {'architecture_experiment', 'implementation_correction'}:
+            decision = engine.store.get('experiment_decisions', record.get('decision_id', '')) or {}
+            if decision.get('author_contract_version', decision.get('proposal_request_contract_version', 0)) >= 14:
+                from .source_read_identity import resolve
+                proposal = record['decision']
+                mechanism = proposal.get('implementation_correction')
+                if not mechanism:
+                    review = proposal['architecture_review']
+                    mechanism = next(item for item in review['candidates'] if item['id'] == review['selected_id'])
+                targets = {resolve(source_rows, name)['path'] for name in mechanism['module_paths']}
+                targets.update(change['target'] for change in proposal['changes'])
+                work['runtime_revision_targets'] = sorted(targets)
+                instruction += '\n落实修改单中运行机制或生产实现的改动。检查文件用于回归验证；实测改善由后续真实验证判定。'
+        if work_kind == 'cpu_behavior_check' and record.get('check_input_contract_version') in (1, 2):
+            from .rapid_experiment_revision import check_input_contract
+            work['check_input_contract'] = check_input_contract(record)
+            if record.get('staged_cpu_observations'):
+                previous = prior_check_review(engine, run_id, record)
+                if previous:
+                    work['previous_code_review'] = previous
+                    instruction += ('\nprevious_code_review 保留上次代码复核的原问题。按本次已审范围逐项说明'
+                                    '已修改的位置、已有源码能够回答的异议，以及仍需宿主提供的证据。')
+            if record.get('diagnostic_review_protocol') == 1:
+                from .scoped_work_order_contract import diagnostic_execution
+                work['host_execution'] = diagnostic_execution(engine.store.get('runs', run_id))
+                instruction += '\n按 work_order.host_execution 区分夹具自身行为与宿主可执行的限制。保留修改单要求的更严上限。'
+            if record.get('staged_cpu_observations'):
+                from .scoped_work_order_contract import staged_contract
+                work['observation_delivery'] = staged_contract()
+                instruction += '\n按 work_order.observation_delivery 声明所需观测名并在取得实测值时发送给宿主。'
+            from .saved_validation_configuration import work_order_inputs, input_files
+            originals = work_order_inputs(engine, run_id, record)
+            if originals:
+                work['selected_validation_inputs'] = originals
+                supplied = input_files(work)
+                if set(map(Path, supplied)) & set(map(Path, input_runtime.keys() | input_support.keys())):
+                    raise ValueError('Selected validation input path collides with a delivery file')
+                _write_files(workspace, supplied, archived_inputs=supplied)
+                instruction += '\nselected_validation_inputs.trials[].files 给出宿主提供的只读 params、YAML 和配置回执文件、候选内路径及原始字节 SHA。保留原件，按修改单在隔离副本中构造夹具。'
+        if record.get('revision_documents'):
+            from .architecture_amendment_documents import material
+            work['revision_documents'] = material(engine, run_id, record['revision_documents'])
+            instruction += '\n按 revision_documents 中的本版架构与实现条款改码，复核所列接口、验证预期和对照。'
         from .rapid_check_budget import future_policy
         check_policy = future_policy(engine, run_id, record)
         if check_policy:
             work['cpu_check_policy'] = check_policy
             instruction += ('\nCPU 验收采用 work_order.cpu_check_policy 中已保存的任务预算，实际以宿主任务上限约束；'
-                '该契约会绑定检查入口并重新交三方审核，不因预算扩大而省略行为断言。')
+                '该契约会绑定检查入口并重新交独立评审，不因预算扩大而省略行为断言。')
         from .hyperparameter_yaml import profile, render
         evidence = engine.store.get('experiment_evidence', record['evidence']['id'])['summary']
-        profiles = {}
-        for params in evidence['job_parameters'].values():
-            if params.get('variant') in ('baseline','proposed','ablation'):
-                profiles.setdefault(params['variant'], profile(params, evidence.get('parameter_capabilities', [])))
-        work['initial_yaml'] = render({'version':1,'profiles':profiles})
-        work['instruction_note'] = ('Start from the existing hyperparameter controls; keep task/data/seed/host-resource fields outside YAML. '
-            + ('Only the approved target mechanism may change behavior; preserve untouched controls.'
-               if work_kind == 'architecture_experiment' else 'New supported defaults must preserve original behavior.'))
+        yaml_contract = record['base_program'].get('hyperparameter_contract', {}).get('contract')
+        if yaml_contract:
+            work['yaml_runtime_contract'] = yaml_contract
+            work['initial_yaml'] = input_runtime[yaml_contract['defaults']].decode('utf-8')
+        else:
+            profiles = {}
+            for params in evidence['job_parameters'].values():
+                if params.get('variant') in ('baseline','proposed','ablation'):
+                    profiles.setdefault(params['variant'], profile(params, evidence.get('parameter_capabilities', [])))
+            work['initial_yaml'] = render({'version':1,'profiles':profiles})
+        work['instruction_note'] = ('按本次 yaml_contract 和现有配置入口保留任务、训练及宿主字段的归属。'
+            '只修改获批目标模块的行为，保留原对照。')
         if anchor:
             work['research_anchor'] = read_anchor(engine, run_id, anchor)
             instruction += ('\nresearch_anchor保留科学目标及反证；本工作项仅落实已批准修改单，不扩大范围或宣告科研成功。'
                 '原目标中的预算和停止条件是历史记录，当前权限以已批准工作单和宿主门禁为准；历史负结果不否决本次工程维修，也不因工程完成而关闭。')
         path = io_path(workspace/'work_order.json'); path.write_text(json.dumps(work,ensure_ascii=False,indent=2),encoding='utf-8')
+        from .request_hash_policy import instruction as hash_checked_instruction
+        instruction = hash_checked_instruction(instruction)
         job = {'operation_id': uid(), 'workspace': str(workspace), 'instruction': instruction,
                'input_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'created_at': now()}
         record['codex_work_item'] = job
@@ -102,6 +167,8 @@ async def build(engine, harness, run_id, record):
     workspace = Path(job['workspace'])
     if hashlib.sha256(io_path(workspace/'work_order.json').read_bytes()).hexdigest() != job['input_sha256']:
         raise ResearchBlocked('Codex migration work order changed')
+    from .saved_validation_configuration import input_files
+    order_files = input_files(json.loads(io_path(workspace/'work_order.json').read_bytes()))
     def save():
         record['updated_at'] = now()
         engine.store.put(COLLECTION, record['id'], record)
@@ -109,6 +176,9 @@ async def build(engine, harness, run_id, record):
         if hashlib.sha256(io_path(workspace/'work_order.json').read_bytes()).hexdigest() != job['input_sha256']:
             raise ResearchBlocked('Codex migration work order changed')
         _base_unchanged(engine, run_id, record)
+        from .candidate_repair_source import read_file
+        if any(read_file(workspace, name, archived_input=True) != raw for name, raw in order_files.items()):
+            raise ResearchBlocked('Selected validation input changed in the code work item')
         if record.get('native_delivery_protocol') == 2:
             from .candidate_repair_source import read_file, read as read_repair, tests_only, KEY as REPAIR_SOURCE
             for name, raw in base.items():
@@ -138,7 +208,8 @@ async def build(engine, harness, run_id, record):
             *support_files(workspace), '_delivery/checks.py', '_delivery/rationale.txt',
             '_delivery/changes.json', 'work_order.json'}}
         delivered.update({'_control/' + n: raw_file('_control/' + n) for n in base})
-        delivered = await repair_manifest(engine, harness, run_id, record, delivered)
+        delivered.update(order_files)
+        delivered = await repair_manifest(engine, harness, run_id, record, delivered, archived_inputs=order_files)
         original_raw_file = raw_file
         def raw_file(name):
             return delivered[name] if name in delivered else original_raw_file(name)
@@ -156,7 +227,8 @@ async def build(engine, harness, run_id, record):
     edits=[];new=[];retained=[]
     by_path = {item['path']: item for item in changes}
     runtime_names = set(parent_runtime) | {n for n in declared if not n.startswith('_delivery/')}
-    if any(n == 'work_order.json' or n.startswith('_control/') for n in runtime_names):
+    if (any(n == 'work_order.json' or n.startswith('_control/') for n in runtime_names)
+            or set(map(Path, runtime_names)) & set(map(Path, order_files))):
         raise ValueError('Delivery cannot alter host control inputs')
     check_indices = sorted({x['change_index'] for x in changes if x['path'].startswith('_delivery/')}) if modern else []
     for name in sorted(runtime_names if modern else declared):
@@ -180,9 +252,19 @@ async def build(engine, harness, run_id, record):
             if text!=old:edits.append({'path':name,'before_sha256':hashlib.sha256(base[name]).hexdigest(),
                 'change_index':item['change_index'],'old':old,'new':text})
         else:new.append({'path':name,'change_index':item['change_index'],'source':text})
+    targets = json.loads(read('work_order.json')).get('runtime_revision_targets')
+    if targets:
+        def runtime_target(name):
+            path = Path(name)
+            return (name in targets and not {'_delivery', 'tests', 'test'}.intersection(path.parts)
+                    and path.name != 'conftest.py' and not path.name.startswith('test_') and not path.name.endswith('_test.py'))
+        if not any(runtime_target(item['path']) for item in edits + new):
+            raise ValueError('Delivery must change a runtime file belonging to the approved mechanism or implementation correction')
     patch={'evidence_sha256':record['evidence']['sha256'],'decision_sha256':record['decision_sha256'],
            'summary':read('_delivery/rationale.txt'),'edits':edits,'new_files':new,
            'checks':read('_delivery/checks.py'),'check_rationale':(
+               'Reproduce the approved implementation defect and verify corrected behavior under the same inputs'
+               if record['decision'].get('implementation_correction') else
                'Approved structural intervention; actual CPU mechanism behavior and untouched-control checks required'
                if record['decision'].get('architecture_review') else
                'Agent-approved work order; actual Codex disk delivery; CPU effects and default equivalence required')}
@@ -202,7 +284,8 @@ async def build(engine, harness, run_id, record):
                '_delivery/checks.py','_delivery/rationale.txt','work_order.json'}}
     if modern:
         delivered.update({'_control/' + name: raw for name,raw in base.items()})
-    checks,rationale=await repair(engine,harness,run_id,record,delivered)
+        delivered.update(order_files)
+    checks,rationale=await repair(engine,harness,run_id,record,delivered,archived_inputs=order_files)
     if checks!=patch['checks'] or rationale!=patch['check_rationale']:
         record.setdefault('native_original_patch',copy.deepcopy(patch))
         patch={**patch,'checks':checks,'check_rationale':rationale}

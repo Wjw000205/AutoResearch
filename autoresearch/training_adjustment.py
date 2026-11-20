@@ -1,6 +1,8 @@
 """One bounded three-role discussion for each immutable validation-loss incident."""
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
+
 import asyncio
 import copy
 import json
@@ -11,6 +13,7 @@ from .storage import now
 from .training_context import KEY
 from .training_convergence import read_evidence, sha
 from .architecture_validation import operation
+from . import independent_full_review as full_review
 
 COLLECTION = 'training_adjustments'
 ROLES = ('director', 'engineer', 'scout')
@@ -124,17 +127,7 @@ def _binding(engine, run_id, trial, *, basis=None, saved_trials=None):
 
 
 async def _group(harness, run_id, purpose, instruction, context, schema):
-    tasks = [asyncio.create_task(harness.ask(run_id, role, purpose, instruction, context, schema)) for role in ROLES]
-    try:
-        results = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    for result in results:
-        validate(result, schema)
-    return [{'role': role, **result} for role, result in zip(ROLES, results)]
+    return await full_review.group(harness, run_id, purpose, instruction, context, schema)
 
 
 def _route(record, plan):
@@ -189,6 +182,12 @@ async def after_trial(engine, harness, run_id, trial, *, review_context=None):
     record = engine.store.get(COLLECTION, identifier)
     plan = basis['plan']
     if record and record['status'] not in {'diagnosing', 'proposing', 'reviewing'}:
+        if record.get('votes') and full_review.reviewers(record['votes']) == full_review.REVIEWERS:
+            full_review.authenticate_complete(engine.store,run_id,record['votes'])
+            for vote in record['votes']: full_review.validate_delivery(engine.store,run_id,vote,engine=engine)
+            if sha(record.get('proposal')) != record.get('proposal_sha256'):
+                from .engine import ResearchBlocked
+                raise ResearchBlocked('训练调整方案与同版本独立审核已不一致。')
         return _route(record, plan)
     if not record:
         record = {'id': identifier, 'run_id': run_id, 'trial_id': trial['id'], 'cycle': engine.cycle(run_id),
@@ -221,11 +220,18 @@ async def after_trial(engine, harness, run_id, trial, *, review_context=None):
         return record
     design = basis['design']
     from .rapid_continuation import trial_limit
+    if 'full_review_evidence' not in record:
+        from .experiment_decisions import _archive
+        record['full_review_evidence']=_archive(engine,run_id,{'binding':binding,'diagnosis':diagnosis,
+            'approved_design':copy.deepcopy(basis['design']),'approved_plan':copy.deepcopy(basis['plan']),
+            'implementation':copy.deepcopy(basis['program'])})
+        engine.store.put(COLLECTION,identifier,record)
     context = {KEY: 1, 'research_cycle': record['cycle'], 'evidence_sha256': evidence_hash,
         'loss_evidence': {'binding': binding, 'diagnosis': diagnosis},
         'training_scope': _scope(design),
         'iteration_policy': (plan or {}).get('iteration_policy'),
         'trial_budget': trial_limit(engine.store, run_id)}
+    context['validation_evidence']=copy.deepcopy(record['full_review_evidence'])
     guidance = GUIDANCE
     if review_context is not None:
         context['loss_review_context'] = copy.deepcopy(review_context)
@@ -297,12 +303,14 @@ def revision_context(engine, run_id, review):
     record = engine.store.get(COLLECTION, details.get('adjustment_id', '')) or {}
     proposal = record.get('proposal') or {}
     votes = record.get('votes', [])
+    if votes and full_review.reviewers(votes) == full_review.REVIEWERS:
+        full_review.authenticate_complete(engine.store,run_id,votes)
+        for vote in votes: full_review.validate_delivery(engine.store,run_id,vote,engine=engine)
     if (record.get('run_id') != run_id or record.get('cycle') != engine.cycle(run_id)
             or record.get('review_only')
             or record.get('status') != 'accepted_for_revision' or proposal.get('action') != 'adjust'
             or record.get('evidence_sha256') != details.get('evidence_sha256')
-            or sha(proposal) != details.get('proposal_sha256') or len(votes) != 3
-            or {v.get('role') for v in votes} != set(ROLES)
+            or sha(proposal) != details.get('proposal_sha256') or not full_review.members(votes)
             or any(v.get('approve') is not True or v.get('issues') != []
                 or v.get('proposal_sha256') != details.get('proposal_sha256')
                 or v.get('evidence_sha256') != details.get('evidence_sha256') for v in votes)):

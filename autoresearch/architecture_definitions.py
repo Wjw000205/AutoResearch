@@ -198,6 +198,10 @@ def _render(record, result):
 
 
 def _check_vote(engine, run_id, record, vote):
+    from .architecture_definition_full import FIELD as FULL
+    if FULL in record:
+        from .architecture_definition_full import check_vote
+        return check_vote(engine,run_id,record,vote)
     from .engine import ResearchBlocked
     from .architecture_documents import units
     from .implementation_documents import read_coverage
@@ -205,6 +209,8 @@ def _check_vote(engine, run_id, record, vote):
     decision = engine.store.get('decisions', vote['handoff_id'], {})
     expected = {k: v for k, v in vote.items() if k not in {'role', 'handoff_id'}}
     _binding(record, expected)
+    from .architecture_final_delivery import validate_repair
+    validate_repair(engine, run_id, vote)
     if record.get('review_protocol') == 3:
         from .architecture_component_review import check_final
         covered = check_final(engine, run_id, record, vote)
@@ -241,7 +247,10 @@ def _check_vote(engine, run_id, record, vote):
 def validate_adoption(engine, run_id, key):
     from .engine import ResearchBlocked
     record = _checked(engine, run_id, key)
-    if record['status'] != 'approved' or len(record['votes']) != len(ROLES):
+    from .architecture_definition_full import FIELD as FULL
+    from . import independent_full_review as full
+    expected_roles=full.REVIEWERS if FULL in record else ROLES
+    if record['status'] != 'approved' or (not full.members(record['votes']) if FULL in record else len(record['votes']) != len(ROLES)):
         raise ResearchBlocked('科学定义补充尚未取得三方同版本独立批准。')
     doc = record['document']
     _, text = document_index.load(engine, run_id, doc['document_id'], doc['sha256'])
@@ -255,7 +264,7 @@ def validate_adoption(engine, run_id, key):
             or len(ids) != len(set(ids)) or set(ids) != {i['id'] for i in record['issues']}
             or text != _render(record, candidate)):
         raise ResearchBlocked('科学定义候选缺少实际作者交付。')
-    for role in ROLES:
+    for role in expected_roles:
         matches = [v for v in record['votes'] if v['role'] == role]
         if len(matches) != 1:
             raise ResearchBlocked('科学定义独立角色票数无效。')
@@ -274,6 +283,24 @@ async def run(engine, h, run_id, revision):
         return revision
     await engine._read_consensus_check(run_id, engine._consensus_gate, run_id)
     record = await engine._read_consensus_check(run_id, _checked, engine, run_id, key)
+    from .architecture_definition_full import FIELD as FULL, advance as full_advance
+    if record.get('status')=='approved':
+        await engine._read_consensus_check(run_id,validate_adoption,engine,run_id,key)
+        if revision.get('definition_adoption_id')==key:return revision
+        from .architecture_integration import prepare_from_adoption,activate
+        return await activate(engine,h,run_id,prepare_from_adoption(engine,run_id,revision,record))
+    if FULL in record or (record.get('document') and record.get('candidate') and record.get('status')!='approved'):
+        return await full_advance(engine,h,run_id,revision,record)
+    if record['status'] == 'blocked' and record.get('invalid_review'):
+        from .architecture_definition_completion import check_candidate
+        from .architecture_final_delivery import checked
+        await engine._read_consensus_check(run_id, check_candidate, engine, run_id, record)
+        restored = await checked(engine, h, run_id, record, record['invalid_review'])
+        if any(v['role'] == restored['role'] for v in record['votes']):
+            raise ResearchBlocked('本角色已有终审，不能通过补正重复计票。')
+        record['votes'].append(restored)
+        record.update(status='reviewing', reason='原终审交付已核验或补正，继续同版本独立评议。')
+        engine.store.put('architecture_definitions', key, record)
     if record['status'] in {'rejected', 'blocked'}:
         if record['status'] == 'rejected' and record.get('architecture_progress_protocol') == convergence.VERSION:
             from .architecture_definition_completion import check_candidate, prepare as prepare_next
@@ -330,10 +357,21 @@ async def run(engine, h, run_id, revision):
             instruction += AUTHOR
         purpose = 'architecture_definitions_author:' + digest(key)
         schema = _schema()
-        hid = h._handoff(run_id, 'director', purpose, instruction, context, schema)['id']
-        record.update(status='drafting', author_handoff_id=hid)
+        author_role='engineer'
+        existing=record.get('author_handoff_id')
+        if existing:
+            owner=engine.store.get('handoffs',existing) or {}
+            frozen=engine.store.get('handoff_inputs',existing) or {}
+            author_role=owner.get('to_role')
+            if author_role not in {'director','engineer'} or owner.get('purpose')!=purpose:
+                raise ResearchBlocked('原定义作者请求的冻结角色或目的无效。')
+            instruction,context,schema=(copy.deepcopy(frozen[k]) for k in ('instruction','context','schema'))
+            if h.decision_key(run_id,author_role,purpose,instruction,context,schema)!=existing:
+                raise ResearchBlocked('原定义作者请求身份改变。')
+        hid = h._handoff(run_id, author_role, purpose, instruction, context, schema)['id']
+        record.update(status='drafting', author_handoff_id=hid,author_role=author_role)
         engine.store.put('architecture_definitions', key, record)
-        result = await h.ask(run_id, 'director', purpose, instruction, context, schema)
+        result = await h.ask(run_id, author_role, purpose, instruction, context, schema)
         ids = [row['issue_id'] for row in result['definitions']]
         try:
             _binding(record, result)
@@ -356,6 +394,13 @@ async def run(engine, h, run_id, revision):
     doc = record['document']
     from .architecture_definition_completion import check_candidate
     await engine._read_consensus_check(run_id, check_candidate, engine, run_id, record)
+    return await full_advance(engine,h,run_id,revision,record)
+
+
+async def _legacy_review_document(engine,h,run_id,revision,record,context,key):
+    from .engine import ResearchBlocked,digest
+    from . import architecture_convergence as convergence
+    doc=record['document']
     for vote in record['votes']:
         await engine._read_consensus_check(run_id, operation(_check_vote), engine, run_id, record, vote)
     context = await engine._read_consensus_check(run_id, operation(_context), engine, run_id, record)
@@ -440,7 +485,8 @@ async def run(engine, h, run_id, revision):
         result = await h.ask(run_id, role, purpose, instruction, role_context, schema)
         entry = {'role': role, 'handoff_id': hid, **result}
         try:
-            await engine._read_consensus_check(run_id, operation(_check_vote), engine, run_id, record, entry)
+            from .architecture_final_delivery import checked
+            entry = await checked(engine, h, run_id, record, entry)
         except ResearchBlocked as exc:
             record.update(status='blocked', reason=str(exc), invalid_review=entry)
             engine.store.put('architecture_definitions', key, record)
@@ -449,7 +495,7 @@ async def run(engine, h, run_id, revision):
         engine.store.put('architecture_definitions', key, record)
         engine.store.event(run_id, 'architecture.definition_vote', '已收到具体科学定义的独立意见。',
             {'role': role, 'received_votes': len(record['votes']), 'expected_votes': 3,
-             'approve': result['approve'] and not result['required_changes'], 'document_sha256': doc['sha256']})
+             'approve': entry['approve'] and not entry['required_changes'], 'document_sha256': doc['sha256']})
         if record.get('review_protocol') == 3 and len(record['votes']) < len(ROLES):
             return revisions.state(engine, run_id)
     approved = all(v['approve'] and not v['required_changes'] for v in record['votes'])
@@ -541,9 +587,11 @@ def view(engine, run_id):
     scope_issues = candidate['scope_issues'] if candidate is not None else list(dict.fromkeys(
         issue for unit in record.get('issue_drafts', []) for issue in unit['result']['scope_issues']))
     from .architecture_definition_completion import completion_status
+    from .architecture_definition_full import FIELD as FULL
+    expected=2 if FULL in record else len(ROLES)
     return {field: copy.deepcopy(record.get(field)) for field in ('id', 'status', 'reason', 'document')} | {
         'completion': completion_status(engine, run_id, record, revision),
-        'issue_count': len(record['issues']), 'received_votes': len(record['votes']), 'expected_votes': len(ROLES),
+        'issue_count': len(record['issues']), 'received_votes': len(record['votes']), 'expected_votes': expected,
         'activity': _activity(engine, run_id, record),
         'authoring_protocol': record.get('authoring_protocol', 1),
         'review_protocol': record.get('review_protocol', 1),

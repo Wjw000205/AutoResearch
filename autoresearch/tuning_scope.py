@@ -5,6 +5,8 @@ independent experiment approval, runtime capability checks and resource gates.
 """
 from __future__ import annotations
 
+from .async_ownership import gather as gather_owned, cancel as cancel_owned
+
 import copy
 import asyncio
 import math
@@ -21,6 +23,7 @@ from .tuning_scope_reads import active_vote
 REQUESTS = 'tuning_scope_requests'
 COLLECTION = 'tuning_scopes'
 ROLES = ('director', 'engineer', 'scout')
+from . import independent_full_review as full_review
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 1200}
 VALUE = {'anyOf': [{'type': 'number'}, {'type': 'boolean'}, {'type': 'string', 'minLength': 1, 'maxLength': 80},
                   {'type': 'array', 'minItems': 1, 'maxItems': 16, 'items': {'type': 'number'}}]}
@@ -98,8 +101,12 @@ def inventory(evidence):
         if params.get('variant') in {'baseline', 'proposed'}:
             walk(params, '', params['variant'])
     for c in evidence.get('parameter_capabilities', []):
+        if evidence.get('baseline_mode') == 'paper_reported' and c['variant'] == 'baseline':
+            continue
         row = found.setdefault(c['path'], {'path': c['path'], 'values_by_variant': {}, 'source_capability': c})
         for variant in ('baseline', 'proposed') if c['variant'] == 'shared' else (c['variant'],):
+            if evidence.get('baseline_mode') == 'paper_reported' and variant == 'baseline':
+                continue
             row['values_by_variant'].setdefault(variant, [c['default']])
     return sorted(found.values(), key=lambda row: row['path'])
 
@@ -173,7 +180,7 @@ def reopen(engine, run_id, decision, evidence):
 
 def schema(evidence):
     paths = [r['path'] for r in inventory(evidence)]
-    return obj({'binding_sha256': {'const': sha(evidence['binding'])},
+    result = obj({'binding_sha256': {'const': sha(evidence['binding'])},
         'strategy': TEXT, 'ordering_rationale': TEXT, 'stopping_rule': TEXT,
         'factors': {'type': 'array', 'minItems': 1, 'maxItems': 160, 'items': obj({
             'path': {'enum': paths}, 'variant': {'enum': ['shared', 'baseline', 'proposed']},
@@ -188,10 +195,18 @@ def schema(evidence):
         'read_receipts': {'type': 'array', 'minItems': 1, 'maxItems': 256, 'uniqueItems': True,
                           'items': {'type': 'string', 'pattern': '^[a-f0-9]{64}$'}},
         'execution_authorized': {'const': False}})
+    if evidence.get('combination_validation', {}).get('required'):
+        from .combination_settings import settings_schema
+        result['properties']['combination_settings'] = copy.deepcopy(settings_schema(evidence))
+        result['required'].append('combination_settings')
+    return result
 
 
 def validate_scope(plan, evidence, source_files):
     validate(plan, schema(evidence))
+    if plan.get('combination_settings'):
+        from .combination_settings import validate as validate_combinations
+        validate_combinations(plan['combination_settings'], plan['factors'], evidence)
     discovered = {r['path']: r for r in inventory(evidence)}
     covered = set()
     for f in plan['factors']:
@@ -265,10 +280,16 @@ def _verify(engine, run_id, record):
         raise ValueError('Tuning scope source code changed')
     validate_scope(plan, evidence, source['files'])
     check_reads(engine, run_id, 'engineer', author, plan, scope_record=record)
-    if record.get('plan_sha256') != sha(plan) or set(final.get('votes', {})) != set(ROLES):
+    wrappers = [active_vote(v).get('full_review_receipt') for v in final.get('votes', {}).values()]
+    roles = full_review.REVIEWERS if final.get(full_review.KEY) else ROLES
+    if (record.get('plan_sha256') != sha(plan) or set(final.get('votes', {})) != set(roles)
+            or (final.get(full_review.KEY) and not full_review.members(wrappers, final[full_review.KEY]))):
         raise ValueError('Tuning scope needs its exact plan and three independent votes')
     for role, request in final['votes'].items():
         request = active_vote(request)
+        if final.get(full_review.KEY):
+            full_review.authenticate(engine.store, run_id, request['full_review_receipt'])
+            full_review.validate_delivery(engine.store, run_id, request['full_review_receipt'], engine=engine)
         owner(engine, run_id, role, request)
         vote = request['answer']
         if not vote['approve'] or vote['issues'] or vote['proposal_sha256'] != sha(plan):
@@ -384,7 +405,14 @@ def require_complete(evidence, proposal):
         return
     if scope['status'] != 'accepted':
         raise ValueError('Agent-owned parameter scope must be independently approved before dataset completion')
-    incomplete = [f for f in coverage(evidence) if not f['complete']]
+    combo = evidence.get('combination_validation', {})
+    if combo.get('version') == 3:
+        if combo.get('status') != 'complete' or any(
+                f['disposition'] == 'requires_implementation' for f in scope['plan']['factors']):
+            raise ValueError('Resolve unsupported parameters and finish the reviewed Bayesian script first')
+        return
+    rows = scope['coverage'] if evidence.get('combination_validation', {}).get('version') == 2 else coverage(evidence)
+    incomplete = [f for f in rows if not f['complete']]
     stops = proposal.get('parameter_search_stops') or []
     for row in incomplete:
         stop = next((s for s in stops if s['path'] == row['path'] and s['variant'] == row['variant']), None)
@@ -440,6 +468,12 @@ async def ensure(engine, harness, run_id):
         verify(engine, run_id, record)
         return None
     if not record:
+        # Adopt the new planner at creation of a scope, including the next
+        # dataset of an older live run. In-flight scopes use their archived input.
+        combo = evidence.get('combination_validation')
+        if combo and combo.get('required') and engine.store.get('runs', run_id, {}).get('mode') == 'live':
+            combo['version'] = max(2, combo.get('version', 1))
+            combo.pop('passes', None)
         evidence['tuning_inventory'] = inventory(evidence)
         ref = _archive(engine, run_id, evidence)
         record = {'id': identifier, 'run_id': run_id, 'binding': evidence['binding'], 'evidence': ref,
@@ -467,17 +501,29 @@ async def ensure(engine, harness, run_id):
             runtime_audit_scope='CPU capability evidence only; no training, stability or execution approval')
     from .tuning_scope_context import context as scope_context, GUIDANCE as scope_stage_guidance
     context = scope_context(engine, run_id, context)
+    if evidence.get('combination_validation', {}).get('version') == 3:
+        context['experiment_decision']['bayesian_script_authoring'] = 1
     def save(**kw):
         engine.check_active(run_id)
         record.update(kw, updated_at=now())
         engine.store.put(COLLECTION, identifier, record)
     async def ask(role, request):
         if 'answer' not in request:
-            request['answer'] = await harness.ask(run_id, role, request['purpose'], request['instruction'], request['context'], request['schema'])
+            if role in full_review.REVIEWERS and row.get(full_review.KEY):
+                vote = await full_review.ask(harness, run_id, role, request['purpose'], request['instruction'],
+                    request['context'], request['schema'], binding=row[full_review.KEY])
+                frozen = full_review.authenticate(engine.store, run_id, vote)
+                request.update({k: copy.deepcopy(frozen[k]) for k in ('instruction','context','schema')},
+                    purpose=engine.store.get('handoffs', vote[full_review.KEY]['handoff_id'])['purpose'],
+                    answer=full_review.answer(vote), full_review_receipt=vote)
+            else:
+                request['answer'] = await harness.ask(run_id, role, request['purpose'], request['instruction'], request['context'], request['schema'])
             save()
         owner(engine, run_id, role, request)
         return request['answer']
-    instruction = GUIDANCE + scope_stage_guidance + '''\n制定覆盖广泛、由你们决定取值、顺序和停止条件的调参计划。完整读取 /tuning_inventory；
+    batch_script = evidence.get('combination_validation', {}).get('version') == 3
+    procedure = ('按批准的贝叶斯脚本批量运行验证点；工程师选取实际支持的因素及有限值域。' if batch_script else GUIDANCE)
+    instruction = procedure + scope_stage_guidance + '''\n制定覆盖广泛、由你们决定取值、顺序和停止条件的调参计划。完整读取 /tuning_inventory；
 对每个发现的 path/variant 必须明确 search、fixed 或 requires_implementation，并提供理由，不能遗漏或用一个学习率网格概括。
 固定的安全边界/公式常量不是必须搜索；不要盲目穷举。可调容量（深度、宽度、embedding、dropout）、正则化、优化器、训练配置均须审视。
 现有硬编码能力如需开放必须写 requires_implementation，不能把字段出现当成可执行。首数据集支持经过审查的架构配置化，后续冻结架构。
@@ -490,6 +536,9 @@ CPU 证实某候选能进入真实优化器不等于科研效果已验证，但�
 shared 只用于双方有相同语义和相同原值的路径；模型特有参数用 baseline 或 proposed，保留另一侧对照。
 source_paths 写实际实现/配置校验文件；用 inspect_module 完整读取你引用的每个文件。read_receipts 返回 inventory 和这些源码的全部真实分页回执。
 不得修改历史计划、原证据、种子、划分或验收，不运行实验。只交付本次计划，交三方独立审核。'''
+    if evidence.get('combination_validation', {}).get('required'):
+        from .combination_settings import settings_guidance
+        instruction += '\n' + settings_guidance(evidence)
     source = engine.store.get('experiment_sources', evidence['code_sources']['id'])
     if sha(source['files']) != evidence['code_sources']['sha256']:
         raise ValueError('Tuning scope source code changed')
@@ -544,6 +593,9 @@ source_paths 写实际实现/配置校验文件；用 inspect_module 完整读�
         from .tuning_scope_reads import ReadEvidenceError
         try:
             validate_scope(plan, evidence, source['files'])
+            if evidence.get('combination_validation', {}).get('version') == 3:
+                from .bayesian_script_tool import verified as verify_script
+                verify_script(engine, run_id, evidence, plan['combination_settings'])
         except (ValueError, ValidationError) as exc:
             row.update(error=str(exc), needs_reconciliation=True)
             if getattr(exc, 'issues', None):
@@ -557,6 +609,12 @@ source_paths 写实际实现/配置校验文件；用 inspect_module 完整读�
         if row.get('error'):
             row.setdefault('validation_history', []).append({'error': row.pop('error'), 'revalidated_at': now()})
         voting_evidence = {**enriched, 'tuning_scope_plan': plan}
+        if evidence.get('combination_validation', {}).get('version') == 3:
+            from .bayesian_script_tool import verified as verify_script
+            artifact = verify_script(engine, run_id, evidence, plan['combination_settings'])
+            from pathlib import Path
+            voting_evidence['bayesian_script_file'] = {'relative_path': artifact['body']['relative_path'],
+                'sha256': artifact['body']['file_sha256'], 'source': Path(artifact['body']['path']).read_text(encoding='utf-8')}
         ref = _archive(engine, run_id, voting_evidence)
         ctx = {**copy.deepcopy(context), 'validation_evidence': ref, 'evidence_sha256': ref['sha256'],
                'proposal_sha256': sha(plan)}
@@ -564,16 +622,27 @@ source_paths 写实际实现/配置校验文件；用 inspect_module 完整读�
             'rationale': TEXT, 'issues': {'type': 'array', 'maxItems': 8, 'items': TEXT},
             'read_receipts': schema(evidence)['properties']['read_receipts']})
         votes = row.setdefault('votes', {})
-        for role in ROLES:
+        if not row.get(full_review.KEY) and votes and not (set(votes) == set(ROLES) and all('answer' in active_vote(v) for v in votes.values())):
+            row.setdefault('legacy_review_history', []).append(copy.deepcopy(votes))
+            votes = row['votes'] = {}
+        if not votes:
+            row[full_review.KEY] = full_review.make_binding({'proposal_sha256': sha(plan),
+                'evidence': ref, 'binding': record['binding']}, 'tuning_scope')
+        review_roles = full_review.REVIEWERS if row.get(full_review.KEY) else ROLES
+        for role in review_roles:
             new_assignment = role not in votes
             votes.setdefault(role, {'purpose': 'experiment_vote:tuning-scope:' + sha(plan) + ':round:' + str(index),
                 'instruction': '独立完整读取 /tuning_inventory、/tuning_scope_plan 及计划引用的全部 source_paths，返回全部真实分页回执。'
                     '若给出 runtime_audit_path，还须完整读取该 CPU 能力证据及 runtime_route_paths，区分已有可用路由与真正硬编码能力。'
                     '检查覆盖是否充分、固定理由是否成立、候选范围及资源是否合理、源码是否实际支持。'
-                    '拟搜索且当前不支持的参数须列 requires_implementation；本轮保持不变的参数可列 fixed，不能虚报可调。批准仅是范围与后续实现待办，不是任何实验执行。'
-                    '需修改则列具体 issues；同意 approve=true 且 issues=[]。\n' + GUIDANCE + scope_stage_guidance,
+                    '拟搜索且当前不支持的参数须列 requires_implementation；本轮保持不变的参数可列 fixed，不能虚报可调。'
+                    + ('批准后按本脚本与预算批量执行验证集搜索。' if batch_script else '批准仅是范围与后续实现待办，不是任何实验执行。')
+                    + '需修改则列具体 issues；同意 approve=true 且 issues=[]。\n' + procedure + scope_stage_guidance,
                 'context': copy.deepcopy(ctx), 'schema': vote_schema})
             if new_assignment:
+                if 'bayesian_script_file' in voting_evidence:
+                    votes[role]['instruction'] += '\n完整读取 /bayesian_script_file 的实际命令行脚本，核对选点、范围、预算、验证集隔离与停止；批准即授权整批执行。'
+                    votes[role]['context']['experiment_decision']['tuning_scope_design']['batch_script_path'] = '/bayesian_script_file'
                 from .tuning_scope_reads import retained_index
                 index_ = await engine._read_consensus_check(
                     run_id, retained_index, engine, run_id, role, record, ctx, plan)
@@ -644,14 +713,14 @@ source_paths 写实际实现/配置校验文件；用 inspect_module 完整读�
                 # A role-local unknown receipt must not cancel another already
                 # authorized review and create yet another unknown receipt.
                 return {'role': role, 'request_error': redact(str(exc))}
-        tasks = [asyncio.create_task(independent_review(role)) for role in ROLES]
+        tasks = [asyncio.create_task(independent_review(role)) for role in review_roles]
         try:
-            errors = [error for error in await asyncio.gather(*tasks) if error]
+            errors = [error for error in await gather_owned(*tasks) if error]
         except BaseException:
             for task in tasks:
                 if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                    cancel_owned(task)
+            await gather_owned(*tasks, return_exceptions=True)
             raise
         request_errors = [error for error in errors if error.get('request_error')]
         if request_errors:

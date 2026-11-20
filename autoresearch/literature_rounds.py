@@ -136,6 +136,13 @@ def shared_packet(engine, run_id, output, intelligence):
         'papers': rows, 'audience': ['director', 'engineer', 'scout'],
         'scope': ('同一份已核验片段笔记和用户选定上传seed供三方提出创新点；'
                   '明确归属的外部RAG分析保留未核验状态，不计本任务新阅读。架构不明时保留缺失，不把索引或摘要当作全文阅读。')}
+    from .literature_discovery import enabled as discovery_first
+    if discovery_first(engine.store.get('runs', run_id).get('config', {})):
+        # New packets use the unified catalog path and retain every adverse
+        # qualification. Historical paid packets remain byte-for-byte frozen.
+        payload.update({key: copy.deepcopy(output.get(key, {})) for key in
+                        ('analysis', 'reading_gate', 'reading_plan', 'coverage')})
+        payload['notes'] = []
     return {**persist_index(engine, intelligence, run_id, 'idea-reading', payload),
             'round': 'idea', 'paper_count': len(rows), 'as_of_date': payload['date_policy']['as_of_date'],
             'audience': payload['audience']}

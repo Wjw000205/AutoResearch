@@ -304,7 +304,7 @@ class PaperRAG:
 
     def _publish(self, engine, run_id, notes=None):
         from .literature_notes import notes_view, _memory_text
-        from .literature_reading import _run_papers, _verified, uploaded_reading_status
+        from .literature_reading import _run_papers, _verified, uploaded_reading_status, uploaded_rag_evidence
         from .reference_papers import is_uploaded_paper
         run = self.store.get('runs', run_id)
         if not run or run.get('mode') != 'live' or self.store.get('run_deletions', run_id):
@@ -315,6 +315,7 @@ class PaperRAG:
         uploaded_state = uploaded_reading_status(engine, run_id)
         uploaded_complete = {row['paper_id']: row for row in uploaded_state['papers']
                              if row['status'] == 'read_and_noted'}
+        uploaded_reused = uploaded_rag_evidence(engine, run_id)
         result = {'published': 0, 'pending': 0}
         for note in valid:
             if note.get('generation') != 'ai_extraction' or selected is not None and note['id'] not in selected:
@@ -331,7 +332,7 @@ class PaperRAG:
                 if not _verified(paper):
                     raise ValueError('Paper identity is not verified')
                 uploaded = is_uploaded_paper(self.store, run_id, paper)
-                if uploaded and paper['id'] not in uploaded_complete:
+                if uploaded and paper['id'] not in uploaded_complete and paper['id'] not in uploaded_reused:
                     self.store.put('paper_rag_jobs', job_id, {**job, 'status': 'pending',
                         'reason': 'uploaded_full_reading_incomplete'})
                     result['pending'] += 1
@@ -341,6 +342,10 @@ class PaperRAG:
                 source = self.store.get('artifacts', document.get('source_alias_id', note['source_id']))
                 # Retain source metadata and pages, without task-local filesystem paths.
                 document = {**copy.deepcopy(source['evidence']), 'text': document['text']}
+                supplement = None
+                if uploaded and paper['id'] not in uploaded_complete:
+                    from .uploaded_rag_publication import reused_supplement
+                    supplement = reused_supplement(self, run_id, paper, note, document, uploaded_reused[paper['id']])
                 if document.get('ocr_performed') and document.get('parent_source_id'):
                     parent = engine.sources.document(run_id, document['parent_source_id'])
                     if parent['content_sha256'] != document['content_sha256']:
@@ -376,7 +381,9 @@ class PaperRAG:
                         'document': document, 'original': original, 'origin_run_id': run_id,
                         'origin_note_id': note['id'], 'origin_source_id': note['source_id'],
                         'analysis_created_at': note['created_at'], 'provenance': 'validated_live_analysis'}
-                    if uploaded:
+                    if supplement is not None:
+                        payload.update(supplement)
+                    elif uploaded:
                         completion = uploaded_complete[paper['id']]
                         payload.update(uploaded_analysis_complete=True,
                             uploaded_reading_completion={k: copy.deepcopy(completion[k]) for k in
@@ -402,7 +409,7 @@ class PaperRAG:
                         'created_at': now(), 'origin_run_id': run_id, 'memory_document_id': memory['document_id']})
                     old = view.get('paper_rag', entry_id, {})
                     latest = old.get('provenance') == 'external_agent_analysis' or note['created_at'] >= old.get('analysis_created_at', '')
-                    view.put('paper_rag', entry_id, {'id': entry_id, 'paper': copy.deepcopy(paper) if latest else old['paper'],
+                    view.put('paper_rag', entry_id, {'id': entry_id, 'paper': copy.deepcopy(payload['paper']) if latest else old['paper'],
                         'latest_version': version_id if latest else old['latest_version'],
                         'versions': sorted(set(old.get('versions', [])) | {version_id}),
                         'created_at': old.get('created_at', now()), 'updated_at': now(),
@@ -556,10 +563,32 @@ class PaperRAG:
                 version_id = self.store.get('paper_rag', entry_id, {}).get('latest_version')
         if not version_id:
             return None
+        from .related_work_restart import excluded_versions
+        excluded = excluded_versions(self.store, run_id)
+        if version_id in excluded:
+            return None
         payload = self.load(version_id)
         def complete_uploaded_analysis(value):
             return (value.get('paper', {}).get('identity_kind') != 'uploaded_document'
                     or value.get('uploaded_analysis_complete') is True)
+        from .literature_discovery import enabled as discovery_first, source_matches
+        if (discovery_first(self.store.get('runs', run_id).get('config', {}))
+                and not is_uploaded_paper(self.store, run_id, paper)):
+            versions = self.store.get('paper_rag', self.canonical_id(payload['entry_id']), {}).get('versions', [])
+            for candidate in dict.fromkeys([version_id, *reversed(versions)]):
+                if candidate in excluded:
+                    continue
+                try:
+                    other = payload if candidate == version_id else self.load(candidate)
+                except (ValueError, OSError, KeyError, TypeError):
+                    continue
+                if (same_paper(self.store, paper, other['paper']) and source_matches(paper, other)
+                        and complete_uploaded_analysis(other)
+                        and (not require_fulltext or has_fulltext(other['document']))):
+                    version_id, payload = candidate, other
+                    break
+            else:
+                return None  # Keep historical notes; acquire this selected revision.
         if not complete_uploaded_analysis(payload):
             versions = self.store.get('paper_rag', self.canonical_id(payload['entry_id']), {}).get('versions', [])
             for candidate in reversed(versions):

@@ -14,6 +14,9 @@ import psutil
 
 
 TOOL_LABELS = {
+    'reviews.read_material': '读取必读代码与实现文档',
+    'reviews.record_notes': '保存核对结论与未决问题',
+    'materials.request_read': '按需补读任务原文',
     'documents.read': '读取文档原文', 'documents.list': '读取文档目录',
     'documents.search': '定位文档内容', 'implementation.write_document': '校验并保存实现文档',
     'implementation.edit_document': '修改并保存实现文档',
@@ -22,7 +25,8 @@ TOOL_LABELS = {
     'literature.record_notes': '保存阅读笔记', 'pdf.read': '读取论文正文',
     'web.search': '检索资料', 'evidence.read': '读取研究证据',
 }
-_IMPLEMENTATION = {'implementation_spec', 'implementation_document_review', 'spec_review', 'code_review',
+_IMPLEMENTATION = {'implementation_spec', 'implementation_document_review', 'implementation_acceptance_review', 'spec_review', 'code_review',
+                   'implementation_acceptance_whole_review', 'implementation_acceptance_whole_clarification',
                    'code_repair_map', 'code_repair_audit', 'code_repair_amend'}
 
 
@@ -30,10 +34,12 @@ def generation_condition():
     """Exact workflow ownership for author/reviewer assignments after a reset."""
     return """(substr(json_extract(records.data,'$.purpose'),1,
         instr(json_extract(records.data,'$.purpose')||':',':')-1)
-        NOT IN ('implementation_spec','implementation_document_review') OR EXISTS(
+        NOT IN ('implementation_spec','implementation_document_review','implementation_acceptance_review',
+                'implementation_acceptance_whole_review','implementation_acceptance_whole_clarification') OR EXISTS(
         SELECT 1 FROM records i JOIN records w ON w.collection='codex_workflows'
             AND w.key=coalesce(json_extract(i.data,'$.context.implementation_document_authoring.workflow_id'),
-                json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id'))
+                json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id'),
+                json_extract(i.data,'$.context.acceptance_workflow_id'))
         WHERE i.collection='handoff_inputs' AND i.key=records.key
             AND json_extract(i.data,'$.run_id')=json_extract(records.data,'$.run_id')
             AND json_extract(w.data,'$.run_id')=json_extract(records.data,'$.run_id')
@@ -46,7 +52,10 @@ def _meta(db, run_id, hid):
         'revision',coalesce(json_extract(i.data,'$.context.implementation_document_authoring.revision'),
             json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.revision')),
         'workflow_id',coalesce(json_extract(i.data,'$.context.implementation_document_authoring.workflow_id'),
-            json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id')),
+            json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id'),
+            json_extract(i.data,'$.context.acceptance_workflow_id')),
+        'acceptance_review_round',coalesce(json_extract(i.data,'$.context.implementation_document_delivery.current_document.review_round'),
+            json_extract(i.data,'$.context.implementation_report_amendment.review_round')),
         'generation',json_extract(w.data,'$.implementation_generation'),
         'workflow_run_id',json_extract(w.data,'$.run_id'),
         'request_status',CASE WHEN json_extract(p.data,'$.mode')='final_only'
@@ -64,6 +73,12 @@ def _meta(db, run_id, hid):
         'request_error',substr(CASE WHEN json_extract(p.data,'$.mode')='final_only'
             THEN json_extract(p.data,'$.finalization.error') ELSE json_extract(p.data,'$.normal_request.error') END,1,500),
         'tool_turn',json_extract(p.data,'$.turn'),
+        'acceptance_delivery_repair',json_type(i.data,'$.context.implementation_acceptance_delivery_repair.version')='integer'
+            AND json_extract(i.data,'$.context.implementation_acceptance_delivery_repair.version') IN (1,2),
+        'acceptance_bounded_amendment',json_type(i.data,'$.context.implementation_report_amendment.version')='integer'
+            AND json_extract(i.data,'$.context.implementation_report_amendment.version')=1,
+        'acceptance_source_recheck',json_type(i.data,'$.context.implementation_source_read_recovery.version')='integer'
+            AND json_extract(i.data,'$.context.implementation_source_read_recovery.version')=1,
         'save_only',json_extract(i.data,'$.context.implementation_document_completion_protocol')=1,
         'pending_tool',json_extract(p.data,'$.pending_tool_calls['||coalesce(json_extract(p.data,'$.tool_cursor'),0)||'].name'),
         'draft_document_id',json_extract(d.data,'$.row.document.document_id'),
@@ -84,7 +99,8 @@ def _meta(db, run_id, hid):
             AND json_extract(p.data,'$.run_id')=? AND json_extract(p.data,'$.id')=i.key
         LEFT JOIN records w ON w.collection='codex_workflows'
             AND w.key=coalesce(json_extract(i.data,'$.context.implementation_document_authoring.workflow_id'),
-                json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id'))
+                json_extract(i.data,'$.context.implementation_indexed_review_contract.binding.workflow_id'),
+                json_extract(i.data,'$.context.acceptance_workflow_id'))
         LEFT JOIN records d ON d.collection='implementation_document_drafts' AND d.key=i.key
             AND json_extract(d.data,'$.run_id')=?
             AND json_extract(d.data,'$.workflow_id')=w.key
@@ -329,7 +345,93 @@ def _directories(db, run_id, hid):
             FROM json_each(doc.value,'$.sections') s))
         FROM documents doc""",
         (run_id, hid, run_id))
-    return [json.loads(row[0]) for row in rows]
+    return _whole_review_directories(db, run_id, hid, [json.loads(row[0]) for row in rows])
+
+
+def _whole_review_directories(db, run_id, hid, directories):
+    """Display scope comes from the immutable assignment, not its growing catalog.
+
+    Receipt/delivery validation below still authenticates actual ranges. This
+    navigation projection never authorizes a research or execution gate.
+    """
+    row = db.execute("""WITH frozen AS MATERIALIZED (
+        SELECT json_extract(i.data,'$.context') context,json_extract(h.data,'$.to_role') role
+        FROM records i JOIN records h ON h.collection='handoffs' AND h.key=i.key
+        WHERE i.collection='handoff_inputs' AND i.key=?
+            AND json_extract(i.data,'$.run_id')=? AND json_extract(h.data,'$.run_id')=?
+            AND json_extract(h.data,'$.purpose') LIKE 'implementation_acceptance_whole_review:%')
+        SELECT json_object(
+            'protocol_type',json_type(context,'$.implementation_whole_document_review_protocol'),
+            'protocol',json_extract(context,'$.implementation_whole_document_review_protocol'),
+            'version_type',json_type(context,'$.implementation_whole_document_review.version'),
+            'version',json_extract(context,'$.implementation_whole_document_review.version'),
+            'workflow',json_extract(context,'$.acceptance_workflow_id'),
+            'marker_workflow',json_extract(context,'$.implementation_whole_document_review.workflow_id'),
+            'role',role,'reviewer',json_extract(context,'$.implementation_whole_document_review.reviewer'),
+            'document_id',json_extract(context,'$.implementation_whole_document_review.document.document_id'),
+            'document_sha256',json_extract(context,'$.implementation_whole_document_review.document.sha256'),
+            'document_chars',json_extract(context,'$.implementation_whole_document_review.document.total_chars'),
+            'document_sections',(SELECT json_group_array(json_object(
+                'id',CASE WHEN s.type='object' THEN json_extract(s.value,'$.id') END,
+                'start',CASE WHEN s.type='object' THEN json_extract(s.value,'$.start') END,
+                'end',CASE WHEN s.type='object' THEN json_extract(s.value,'$.end') END))
+                FROM json_each(context,'$.implementation_whole_document_review.document.sections') s),
+            'architecture_id',json_extract(context,'$.implementation_whole_document_review.architecture.document_id'),
+            'architecture_sha256',json_extract(context,'$.implementation_whole_document_review.architecture.sha256'),
+            'architecture_chars',json_extract(context,'$.implementation_whole_document_review.architecture.total_chars'),
+            'architecture_sections',(SELECT json_group_array(json_object(
+                'id',CASE WHEN s.type='object' THEN json_extract(s.value,'$.id') END,
+                'start',CASE WHEN s.type='object' THEN json_extract(s.value,'$.start') END,
+                'end',CASE WHEN s.type='object' THEN json_extract(s.value,'$.end') END))
+                FROM json_each(context,'$.implementation_whole_document_review.architecture.sections') s),
+            'required_sources_type',json_type(context,'$.implementation_whole_document_review.required_sources'),
+            'required_sources',(SELECT json_group_array(json_object(
+                'document_id',CASE WHEN s.type='object' THEN json_extract(s.value,'$.document_id') END,
+                'sha256',CASE WHEN s.type='object' THEN json_extract(s.value,'$.sha256') END,
+                'total_chars',CASE WHEN s.type='object' THEN json_extract(s.value,'$.total_chars') END,
+                'sections',CASE WHEN s.type='object' THEN json_extract(s.value,'$.sections') END))
+                FROM json_each(context,'$.implementation_whole_document_review.required_sources') s))
+        FROM frozen""", (hid, run_id, run_id)).fetchone()
+    if not row:
+        return directories
+    scope = json.loads(row[0])
+    pairs = [(scope['document_id'], scope['document_sha256']),
+             (scope['architecture_id'], scope['architecture_sha256'])]
+    required = set(pairs) if all(isinstance(v, str) and v for pair in pairs for v in pair) else set()
+    valid = (scope['protocol_type'] == scope['version_type'] == 'integer'
+        and scope['protocol'] == scope['version'] == 1
+        and isinstance(scope['workflow'], str) and bool(scope['workflow']) and scope['workflow'] == scope['marker_workflow']
+        and scope['role'] in ('director', 'scout') and scope['role'] == scope['reviewer']
+        and len(required) == 2 and scope['required_sources_type'] == 'array'
+        and len(scope['required_sources']) == 1
+        and scope['required_sources'][0]['document_id'] == scope['architecture_id']
+        and scope['required_sources'][0]['sha256'] == scope['architecture_sha256'])
+    def navigation(sections):
+        if not isinstance(sections, list) or not sections or any(not isinstance(s, dict)
+                or not isinstance(s.get('id'), str) or type(s.get('start')) is not int
+                or type(s.get('end')) is not int for s in sections):
+            return None
+        return sorted((s['id'], s['start'], s['end']) for s in sections)
+    frozen_directories = {
+        (scope['document_id'], scope['document_sha256']): (scope['document_chars'], navigation(scope['document_sections'])),
+        (scope['architecture_id'], scope['architecture_sha256']): (scope['architecture_chars'], navigation(scope['architecture_sections']))
+    } if required else {}
+    if valid:
+        source = scope['required_sources'][0]
+        valid = (type(source['total_chars']) is int and source['total_chars'] == scope['architecture_chars']
+            and navigation(source['sections']) is not None
+            and navigation(source['sections']) == navigation(scope['architecture_sections']))
+    for identity in required:
+        matches = [d for d in directories if (d.get('document_id'), d.get('sha256')) == identity]
+        # An incomplete/conflicting directory must not shrink the denominator
+        # into a false 100%. Identical aliases remain deduplicable.
+        chars, sections = frozen_directories[identity]
+        valid = (valid and type(chars) is int and chars > 0 and sections is not None and bool(matches)
+            and all(type(d.get('total_chars')) is int and d['total_chars'] == chars
+                and navigation(d.get('sections')) == sections for d in matches))
+    return [{**d, 'progress_required': int(valid and isinstance(d.get('document_id'), str)
+        and isinstance(d.get('sha256'), str) and (d['document_id'], d['sha256']) in required),
+        'progress_scope': 'whole_document_sources' if valid else 'unavailable_whole_document_sources'} for d in directories]
 
 
 def _reading(db, run_id, hid, directories, *, store=None, role=None):
@@ -340,6 +442,9 @@ def _reading(db, run_id, hid, directories, *, store=None, role=None):
             and type(doc.get('total_chars')) is int and doc['total_chars'] > 0
             and doc.get('progress_required', 1)}
     if not docs:
+        if any(d.get('progress_scope') == 'unavailable_whole_document_sources' for d in directories):
+            from .assignment_reading_cache import pending
+            return {**pending('unavailable'), 'scope': 'whole_document_sources'}
         return None
     rows = db.execute("""SELECT json_object(
         'document_id',json_extract(t.value,'$.result.document_id'),'sha256',json_extract(t.value,'$.result.sha256'),
@@ -351,7 +456,21 @@ def _reading(db, run_id, hid, directories, *, store=None, role=None):
         FROM records p,json_each(p.data,'$.tool_results') t
         WHERE p.collection='handoff_progress' AND p.key=? AND json_extract(p.data,'$.run_id')=?
             AND json_extract(p.data,'$.id')=p.key
-            AND json_extract(t.value,'$.call.name')='documents.read'
+            AND (json_extract(t.value,'$.call.name')='documents.read' OR (
+                json_extract(t.value,'$.call.name')='materials.request_read'
+                AND json_extract(t.value,'$.call.arguments.kind')='document'
+                AND json_type(t.value,'$.result.supplemental_read.version')='integer'
+                AND json_extract(t.value,'$.result.supplemental_read.version')=1
+                AND json_extract(t.value,'$.result.supplemental_read.reading_only')=1
+                AND json_extract(t.value,'$.result.supplemental_read.run_id')=json_extract(p.data,'$.run_id')
+                AND json_extract(t.value,'$.result.supplemental_read.handoff_id')=p.key
+                AND json_extract(t.value,'$.result.supplemental_read.role')=?
+                AND json_extract(t.value,'$.result.supplemental_read.call.name')='documents.read'
+                AND json_extract(t.value,'$.result.supplemental_read.call.arguments.document_id')=json_extract(t.value,'$.call.arguments.document_id')
+                AND json_extract(t.value,'$.result.supplemental_read.call.arguments.expected_sha256')=json_extract(t.value,'$.call.arguments.expected_sha256')
+                AND json_extract(t.value,'$.result.supplemental_read.call.arguments.section_id')=json_extract(t.value,'$.call.arguments.section_id')
+                AND json_extract(t.value,'$.result.supplemental_read.call.arguments.offset')=json_extract(t.value,'$.call.arguments.offset')
+                AND json_extract(t.value,'$.result.supplemental_read.call.arguments.limit')=json_extract(t.value,'$.call.arguments.limit')))
             AND json_extract(t.value,'$.predecessor_handoff_id') IS NULL
             AND json_extract(t.value,'$.result.error') IS NULL
             AND json_extract(t.value,'$.result.provenance')='exact_document_section'
@@ -359,7 +478,7 @@ def _reading(db, run_id, hid, directories, *, store=None, role=None):
             AND json_extract(t.value,'$.call.arguments.document_id')=json_extract(t.value,'$.result.document_id')
             AND json_extract(t.value,'$.call.arguments.expected_sha256')=json_extract(t.value,'$.result.sha256')
             AND json_extract(t.value,'$.call.arguments.section_id')=json_extract(t.value,'$.result.section_id')""",
-        (hid, run_id))
+        (hid, run_id, role))
     # Legacy receipts retain their existing, explicitly labelled projection.
     # A tracked assignment must additionally prove delivery to this role's
     # acknowledged requests; a read result alone only proves retrieval.
@@ -411,12 +530,15 @@ def _reading(db, run_id, hid, directories, *, store=None, role=None):
         and doc.get('kind') != 'document_working_notes'
         and (doc['document_id'], doc['sha256']) not in docs}
     percent = 100 if completed == total else min(99.9, round(completed * 100 / total, 1))
+    whole_scope = all(d.get('progress_scope') == 'whole_document_sources' for d in docs.values())
     return {'percent': percent, 'completed': completed, 'total': total,
             'unit': 'characters', 'documents_completed': documents_completed,
             'documents_total': len(docs), 'reported': True,
             'source': 'same_handoff_delivered_receipts' if tracked else 'same_handoff_read_receipts',
-            'scope': 'current_task_sources', 'optional_documents': len(optional),
-            'optional_chars': sum(doc['total_chars'] for doc in optional.values())}
+            'scope': 'whole_document_sources' if whole_scope else 'current_task_sources',
+            'optional_documents': len(optional), 'optional_chars': sum(doc['total_chars'] for doc in optional.values()),
+            **({'catalog_documents': len(docs) + len(optional),
+                'catalog_chars': total + sum(doc['total_chars'] for doc in optional.values())} if whole_scope else {})}
 
 
 def _tool(db, run_id, hid, role, directories, request_at=None):
@@ -430,6 +552,13 @@ def _tool(db, run_id, hid, role, directories, request_at=None):
             'result_document_id',json_extract(data,'$.result.document_id'),
             'result_section_id',json_extract(data,'$.result.section_id'),
             'section_title',substr(json_extract(data,'$.result.title'),1,160),
+            'supplemental_document',json_type(data,'$.result.supplemental_read.version')='integer'
+                AND json_extract(data,'$.result.supplemental_read.version')=1
+                AND json_extract(data,'$.result.supplemental_read.reading_only')=1
+                AND json_extract(data,'$.result.supplemental_read.run_id')=run_id
+                AND json_extract(data,'$.result.supplemental_read.handoff_id')=json_extract(data,'$.handoff_id')
+                AND json_extract(data,'$.result.supplemental_read.role')=json_extract(data,'$.role')
+                AND json_extract(data,'$.result.supplemental_read.call.name')='documents.read',
             'offset',json_extract(data,'$.arguments.offset'),'limit',json_extract(data,'$.arguments.limit'),
             'char_start',json_extract(data,'$.result.char_start'),'char_end',json_extract(data,'$.result.char_end'),
             'validation_code',CASE WHEN message IN ('implementation.write_document','implementation.edit_document')
@@ -487,12 +616,14 @@ def _tool(db, run_id, hid, role, directories, request_at=None):
             (args['document_id'], run_id, sha)).fetchone()
         document_title = manifest[0] if manifest else None
     section_label = section.get('title')
+    document_read = (latest['message'] == 'documents.read' or
+                     latest['message'] == 'materials.request_read' and result['supplemental_document'])
     if (not section_label and identity_matches and latest['kind'] == 'tool.completed'
-            and latest['message'] == 'documents.read' and not result['error']):
+            and document_read and not result['error']):
         section_label = result['section_title']
     limit = args['limit']
     page_start, page_end = latest['meta']['char_start'], latest['meta']['char_end']
-    actual_read = (latest['kind'] == 'tool.completed' and latest['message'] == 'documents.read'
+    actual_read = (latest['kind'] == 'tool.completed' and document_read and identity_matches
                    and not latest['meta']['error'] and type(page_start) is int and type(page_end) is int and page_end > page_start)
     if actual_read:
         limit = page_end - page_start
@@ -647,10 +778,66 @@ def _deferred_reading(store, run_id, hid, role, workflow_id, directories):
     return cache.CACHE.get(identity, token, calculate)
 
 
+def _local_validation(store, run, current, role):
+    if run.get('status') != 'running':
+        return None
+    with store._read_db() as db:
+        row = db.execute("SELECT h.data FROM records h JOIN records r ON r.collection='runs' AND r.key=? "
+            "WHERE h.collection='harness_local_activity' AND h.key LIKE ? "
+            "AND json_extract(h.data,'$.run_id')=r.key AND json_extract(r.data,'$.status')='running' "
+            "AND json_extract(h.data,'$.owner_instance')=json_extract(r.data,'$.owner_instance') "
+            "AND json_extract(h.data,'$.status')='running' AND json_extract(h.data,'$.handoff_id')=? "
+            "AND json_extract(h.data,'$.role')=? ORDER BY h.updated_at DESC LIMIT 1",
+            (run['id'], run['id'] + ':%', current['id'], role)).fetchone()
+    if not row:
+        return None
+    check = json.loads(row[0])
+    return {'handoff_id': current['id'], 'phase': 'local_validation', 'state': 'validating',
+        'label': '宿主正在核验已返回的审核意见',
+        'detail': (check.get('label') or '核验原始回执') + '；这是本地校验，不代表模型仍在读取或科研验收通过。',
+        'model_dispatched': False, 'updated_at': check.get('heartbeat_at') or check.get('updated_at'),
+        'progress': {'kind': 'validation', 'label': check.get('label'), 'percent': None,
+            'completed': check.get('completed'), 'total': check.get('total'), 'unit': check.get('unit'),
+            'reported': False, 'source': 'host_local_validation'},
+        'reading': None, 'tool': None, 'request_status': None}
+
+
+def _full_review_phase(db, run_id, hid, role):
+    row = db.execute("WITH current AS (SELECT json_extract(i.data,'$.context.independent_full_review.sha256') policy, "
+        "CASE WHEN json_extract(p.data,'$.mode')='final_only' THEN "
+        "json_extract(p.data,'$.finalization.prepared.context') ELSE "
+        "json_extract(p.data,'$.normal_request.prepared.context') END prepared "
+        "FROM records i JOIN records p ON p.collection='handoff_progress' AND p.key=i.key "
+        "WHERE i.collection='handoff_inputs' AND i.key=? AND json_extract(i.data,'$.run_id')=? "
+        "AND json_type(i.data,'$.context.independent_full_review.version')='integer' "
+        "AND json_extract(i.data,'$.context.independent_full_review.version')=1) "
+        "SELECT policy, json_extract(prepared,'$._full_review_closeout'), "
+        "json_extract(prepared,'$._full_review_reading_progress') FROM current",
+        (hid, run_id)).fetchone()
+    if not row or not row[0] or not any(row[1:]):
+        return None
+    # Only the host controls leave SQLite; source and tool bodies stay there.
+    for raw in row[1:]:
+        marker = json.loads(raw) if raw else {}
+        if (isinstance(marker, dict) and type(marker.get('version')) is int and marker['version'] == 1
+                and marker.get('run_id') == run_id
+                and marker.get('role') == role and marker.get('handoff_id') == hid
+                and marker.get('contract_sha256') == row[0] and marker.get('scientific_approval') is False
+                and marker.get('phase') in {'targeted_reading', 'consolidating', 'final'}):
+            return marker['phase']
+    return None
+
+
 def view(store, run, current, status, role, *, defer_reading=False):
     """Project the actual assignment, keeping paused/blocked phase visible."""
     if not current:
         return None
+    validation = _local_validation(store, run, current, role)
+    if validation is not None:
+        from .full_review_reading_progress import project as full_reading_progress
+        reading = full_reading_progress(store, run['id'], current['id'], role, deferred=defer_reading)
+        if reading is not None: validation['reading'] = reading
+        return validation
     purpose = (current.get('purpose') or '').split(':')[0]
     hid = current['id']
     # One request-local SQLite snapshot keeps directory and delivery metadata
@@ -663,7 +850,7 @@ def view(store, run, current, status, role, *, defer_reading=False):
         else:
             meta = _meta(db, run['id'], hid)
         generation = run.get('state', {}).get('implementation_generation')
-        if (purpose in {'implementation_spec', 'implementation_document_review'} and generation is not None
+        if (purpose in {'implementation_spec', 'implementation_document_review', 'implementation_acceptance_review'} and generation is not None
                 and (meta.get('generation') != generation or meta.get('workflow_run_id') != run['id'])):
             return None
         author_revision = _author_revision(db, run['id'], hid, meta) if purpose == 'implementation_spec' else None
@@ -685,7 +872,12 @@ def view(store, run, current, status, role, *, defer_reading=False):
         tool = _tool(db, run['id'], hid, role, directories, meta.get('request_at'))
         recovery = _recovery(db, run, current, status, role, meta)
         memory = _revision_memory(db, run['id'], hid) if purpose == 'implementation_spec' else None
-    if purpose == 'code_review' and reading:
+        full_phase = _full_review_phase(db, run['id'], hid, role)
+        from .full_review_reading_progress import project as full_reading_progress
+        required_reading = full_reading_progress(snapshot, run['id'], hid, role, deferred=defer_reading)
+        if required_reading is not None:
+            reading = required_reading
+    if purpose in {'code_review', 'implementation_acceptance_review'} and reading and required_reading is None:
         # Code review authenticates the cited ranges for each issue, not every
         # document in its navigation catalog. Preserve receipt counts, but never
         # present catalog coverage as required reading or task completion.
@@ -703,7 +895,7 @@ def view(store, run, current, status, role, *, defer_reading=False):
             'catalog_documents': len(catalog),
             'catalog_chars': sum(doc['total_chars'] for doc in catalog.values()),
             'catalog_groups': sorted(groups.values(), key=lambda group: (-group['characters'], group['kind']))}
-    if purpose not in _IMPLEMENTATION and purpose != 'implementation' and not tool:
+    if purpose not in _IMPLEMENTATION and purpose != 'implementation' and not tool and required_reading is None:
         return None
     revision = meta.get('revision')
     version = revision + 1 if type(revision) is int and revision >= 0 else None
@@ -711,17 +903,21 @@ def view(store, run, current, status, role, *, defer_reading=False):
     author = purpose == 'implementation_spec'
     phase = ('document_revision' if author_revision is not None or batch_revision is not None else 'document_checking' if saved else 'document_saving' if meta.get('save_only') or ':save:' in current.get('purpose', '')
              else 'document_revision' if version and version > 1 else 'document_authoring') if author else (
-        'document_review' if purpose in {'implementation_document_review', 'spec_review'} else
+        'document_review' if purpose in {'implementation_document_review', 'implementation_acceptance_review',
+            'implementation_acceptance_whole_review', 'implementation_acceptance_whole_clarification', 'spec_review'} else
         'code_repair' if purpose in {'code_repair_map', 'code_repair_audit', 'code_repair_amend'} else
         'code_review' if purpose == 'code_review' else 'code_generation' if purpose == 'implementation' else 'general')
+    if required_reading is not None and phase == 'general': phase = 'full_review'
     noun = {'document_authoring': '实现文档编写', 'document_revision': '实现文档修订',
             'document_checking': '已保存文档核对与提交', 'document_review': '实现文档全文审核',
             'document_saving': '实现文档整理与保存',
-            'code_generation': '代码实现', 'code_review': '实际代码审核', 'code_repair': '代码修改依据核对'}.get(phase, '当前任务')
+            'code_generation': '代码实现', 'code_review': '实际代码审核', 'code_repair': '代码修改依据核对',
+            'full_review': '必读材料复核'}.get(phase, '当前任务')
     running_labels = {'document_authoring': '正在编写实现文档', 'document_revision': '正在修订实现文档',
         'document_checking': '正在核对已保存文档并提交', 'document_review': '正在阅读全文审核',
         'document_saving': '正在整理并保存实现文档',
-        'code_generation': '正在实现代码', 'code_review': '正在审核实际代码', 'code_repair': '正在核对修改依据'}
+        'code_generation': '正在实现代码', 'code_review': '正在审核实际代码', 'code_repair': '正在核对修改依据',
+        'full_review': '正在核对必读代码与文档'}
     # The current prepared request owns this display, including an old request
     # still in flight. Reading receipts and a newer progress marker cannot prove
     # delivery or silently turn a tool-capable request into final submission.
@@ -732,6 +928,17 @@ def view(store, run, current, status, role, *, defer_reading=False):
         running_labels['document_review'] = '正在提交最终审核意见'
     elif review_consolidating:
         running_labels['document_review'] = '正在汇总审核记录与必要核对'
+    elif purpose == 'implementation_acceptance_review':
+        running_labels['document_review'] = ('正在局部补正验收答复' if meta.get('acceptance_bounded_amendment') else
+            '正在修正验收答复' if meta.get('acceptance_delivery_repair') else
+            '正在补读并复核实现文档' if meta.get('acceptance_source_recheck') else '正在验收实现文档')
+        noun = '实现文档验收'
+    elif purpose == 'implementation_acceptance_whole_review':
+        running_labels['document_review'] = '正在对照架构整篇独立审核'
+        noun = '整篇文档独立审核'
+    elif purpose == 'implementation_acceptance_whole_clarification':
+        running_labels['document_review'] = '正在澄清整篇审核的来源缺口'
+        noun = '作者来源澄清'
     label = (running_labels.get(phase, '正在执行当前任务') if status == 'running' else
         noun + {'paused': '已暂停', 'blocked': '等待处理', 'failed': '失败', 'cancelled': '已取消',
                 'interrupted': '已中断', 'completed': '已完成', 'queued': '待开始'}.get(status, '等待执行'))
@@ -759,7 +966,8 @@ def view(store, run, current, status, role, *, defer_reading=False):
                         'completed': 1 if saved else None, 'total': 1 if saved else None, 'unit': 'documents',
                         'reported': saved, 'source': 'saved_document_receipt' if saved else None}
     elif phase == 'document_review' and reading:
-        progress = {**reading, 'kind': 'reading', 'label': '审核阅读进度'}
+        progress = {**reading, 'kind': 'reading', 'label':
+            '已交付原文读取记录' if purpose == 'implementation_acceptance_review' else '审核阅读进度'}
     detail = ('正在保留成功修改并处理剩余意见。' if batch_revision is not None else
         '正在处理当前修订任务。' if author_revision is not None else
         '已保存本版完整文档；正在核对与提交。' if saved else '本版文档尚未保存，编写百分比未上报。' if author else
@@ -775,6 +983,9 @@ def view(store, run, current, status, role, *, defer_reading=False):
             '根据当前来源编写实现文档。' if author and not saved else
             '提交当前文档的最终审核意见。' if review_final else
             '汇总审核记录并完成必要核对。' if review_consolidating else
+            '依据已认证原文补正指定字段，其余验收判断保留。' if purpose == 'implementation_acceptance_review' and meta.get('acceptance_bounded_amendment') else
+            '修正验收答复的证据引用与交付范围。' if purpose == 'implementation_acceptance_review' and meta.get('acceptance_delivery_repair') else
+            '根据已补读原文独立复核验收项。' if purpose == 'implementation_acceptance_review' and meta.get('acceptance_source_recheck') else
             '补读核对并整理当前文档的审核记录。' if phase == 'document_review' else '处理当前任务。')
     elif meta.get('request_status') == 'response_saved':
         detail = '模型回复已保存，正在整理本次输出。'
@@ -797,6 +1008,12 @@ def view(store, run, current, status, role, *, defer_reading=False):
                   ('恢复后继续当前' + noun + '。'))[:500]
     elif status == 'completed':
         detail = '当前交接的输出已保存，等待下一次任务分派。'
+    if status == 'running' and full_phase:
+        label, detail = {
+            'targeted_reading': ('正在定向核对剩余缺口', '按宿主认证的精确版本与范围补齐证据，已交付页面不代表新增进度。'),
+            'consolidating': ('正在整合完整审核意见', '必读证据已认证交付，正在有界核对并保留所有未解决意见。'),
+            'final': ('正在提交最终审核意见', '本轮读取已收口，按原输出合同提交完整判断；读完不代表批准。')
+        }[full_phase]
     original_status = status
     if recovery:
         status = 'recovering'
@@ -806,7 +1023,8 @@ def view(store, run, current, status, role, *, defer_reading=False):
                                       (tool or {}).get('updated_at'), (recovery or {}).get('started_at')) if value) if any(
         (current.get('updated_at'), meta.get('updated_at'), (tool or {}).get('updated_at'), (recovery or {}).get('started_at'))) else None
     return {'handoff_id': hid, 'phase': phase, 'label': label, 'state': status, 'detail': detail,
-            'version': version, 'round': version if phase == 'document_review' else None,
+            'version': version, 'round': (meta.get('acceptance_review_round') if purpose == 'implementation_acceptance_review'
+                                        else version if phase == 'document_review' else None),
             'updated_at': updated, 'progress': progress, 'reading': reading,
             **({'revision_memory': memory} if memory else {}),
             'tool': tool, 'request_status': meta.get('request_status'), 'tool_turn': meta.get('tool_turn'),

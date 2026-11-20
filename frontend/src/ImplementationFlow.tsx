@@ -2,9 +2,11 @@ import { BookOpen, Check, CircleAlert, Code2, FileCheck2, LoaderCircle } from 'l
 import { useId, useState, type ReactNode } from 'react';
 import { date, type Json } from './api';
 import { IndexedDocument } from './IndexedDocument';
-import { AcceptanceProgress } from './ImplementationProgress';
+import { AcceptanceProgress, WholeDocumentProgress, wholeReviewSummary } from './ImplementationProgress';
 import { ActivityRows, PreviousAttempt } from './NativeCodeProgress';
 import { CodeWorkspaceAccess } from './CodeWorkspaceAccess';
+import { codeReviewCounts } from './implementationCodeReview';
+export { sidebarDetailMatches } from './implementationProjection';
 
 const rows = (value: unknown): Json[] => Array.isArray(value) ? value.filter(item => item && typeof item === 'object') : [];
 const responseHash = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
@@ -18,18 +20,8 @@ const stateNames: Record<string, string> = {
   queued: '待接收', blocked: '等待处理', paused: '已暂停', failed: '失败', interrupted: '已中断',
 };
 const hasFindings = (review: Json) => ['issues', 'fixes', 'required_changes'].some(key => Array.isArray(review[key]) && review[key].length > 0);
-const passed = (review: Json) => review.binding_valid === true && ['approved', 'passed'].includes(review.status) && !hasFindings(review);
 const requested = (status: unknown) => ['changes_requested', 'changes_required'].includes(String(status));
 const mismatch = (status: unknown) => ['version_mismatch', 'binding_mismatch', 'conflicting_records'].includes(String(status));
-
-export function sidebarDetailMatches(progress: Json, response: Json | null | undefined, runId: string): boolean {
-  if (!response || response.run_id !== runId || progress.run_id !== runId || response.phase !== progress.phase) return false;
-  const expected = progress.workflow?.id;
-  if (!expected || response.workflow?.id !== expected || response.details?.identity?.workflow_id !== expected) return false;
-  if (progress.workflow?.document_sha256 && response.details?.identity?.document_sha256 !== progress.workflow.document_sha256) return false;
-  return !['document_authoring', 'document_review'].includes(progress.phase)
-    || response.details?.identity?.document_revision === progress.workflow?.revision;
-}
 
 /** All sections require the current three-role full-document review. */
 export function sectionAuditStatus(section: Json, audit?: Json | null): string {
@@ -42,13 +34,20 @@ export function sectionAuditStatus(section: Json, audit?: Json | null): string {
 }
 
 export function implementationSteps(progress: Json, detail?: Json | null) {
+  const codeReview = codeReviewCounts(detail?.code_delivery);
   const current = { protocol_review: 'preparing', completed: 'code_review' }[progress.phase as string] ?? progress.phase;
   const document = detail?.document;
   const delivery = detail?.code_delivery;
+  const whole = wholeReviewSummary(progress);
   const complete: Record<string, boolean> = {
     preparing: progress.protocol?.status === 'approved' || !!document?.document_id,
     document_authoring: document?.status === 'submitted',
-    document_review: detail?.document_audit?.mode === 'acceptance_contract'
+    document_review: progress.workflow?.review_mode === 'whole_document'
+      ? !!whole && whole.complete === true && ['APPROVED', 'APPROVED_WITH_NOTES'].includes(whole.outcome)
+        && whole.counts.approved_reviews === 2 && whole.revision === document?.revision
+        && whole.document_id === document?.document_id && whole.document_sha256 === document?.sha256
+        && whole.spec_hash === document?.spec_hash
+      : detail?.document_audit?.mode === 'acceptance_contract'
       ? detail.document_audit.binding_valid === true && ['APPROVED', 'APPROVED_WITH_NOTES'].includes(detail.document_audit.status)
         && detail.document_audit.run_id === progress.run_id && detail.document_audit.workflow_id === progress.workflow?.id
         && detail.document_audit.document_sha256 === document?.sha256 && detail.document_audit.spec_hash === document?.spec_hash
@@ -65,9 +64,7 @@ export function implementationSteps(progress: Json, detail?: Json | null) {
     code_generation: progress.code_generation_started === true && rows(delivery?.files).length > 0,
     acceptance: delivery?.acceptance?.binding_valid === true && delivery.acceptance.status === 'passed',
     code_review: delivery?.review_scope !== 'definition_followup'
-      && delivery?.review_status === 'passed' && rows(delivery.reviews).length === 3
-      && new Set(rows(delivery.reviews).map(review => review.role)).size === 3
-      && rows(delivery.reviews).every(review => Object.hasOwn(roles, review.role) && passed(review)),
+      && delivery?.review_status === 'passed' && !!codeReview && codeReview.approved === codeReview.expected,
   };
   return [['preparing', '实现准备'], ['document_authoring', '撰写文档'], ['document_review', '文档审计'],
     ['code_generation', '代码实现'], ['acceptance', '本地验收'], ['code_review', '代码复审']].map(([id, label]) => ({
@@ -106,14 +103,14 @@ function Fix({ value }: { value: Json }) {
     .filter(([key]) => typeof value[key] === 'string' && value[key]).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{value[key]}</dd></div>)}</dl>;
 }
 
-function DocumentProgress({ document }: { document: Json }) {
+function DocumentProgress({ document, whole = false }: { document: Json; whole?: boolean }) {
   const sections = rows(document.sections);
   const authoring = document.authoring;
   const latestRead = rows(authoring?.recent_reads)[0];
   const saved = document.document_id && ['draft', 'submitted'].includes(document.status);
   return <section className="implementation-flow-card" aria-label="文档撰写与章节进度">
     <header><h4><BookOpen size={17} />文档撰写与章节</h4><span className="implementation-pill">版本 {Number(document.revision ?? 0) + 1} · {saved ? document.status === 'submitted' ? '已提交审计' : '草稿已保存' : '待保存'}</span></header>
-    {saved ? <p>已保存 {sections.length} 个章节。目录记录保存情况，当前版本三方全文意见在审核记录中显示。</p>
+    {saved ? <p>已保存 {sections.length} 个章节。目录记录保存情况，{whole ? '总监与研究员的整篇意见绑定各自审核的版本。' : '当前版本三方全文意见在审核记录中显示。'}</p>
       : <><p>{document.status === 'save_unconfirmed' ? '已记录草稿目录，保存回执仍待核对。' : '当前稿尚未保存。工程师完成后会一次保存整份实现文档。'}</p>
         {authoring && <p>已记录 {authoring.tool_turns ?? 0} 轮工具交互 · {authoring.request_status === 'dispatching' ? '正在等待工程师回复' : '沿用已保存的读取与工具回执'}</p>}
         {latestRead && <p>最近实际读取：<strong>{latestRead.title ?? latestRead.section_id}</strong> · 字符 {latestRead.char_start}–{latestRead.char_end}{latestRead.predecessor_handoff_id ? '（继承记录）' : ''}</p>}
@@ -188,8 +185,8 @@ function FunctionProgress({ functions, delivery }: { functions: Json[]; delivery
     <header><h4><Code2 size={17} />功能与验收项</h4><span className="implementation-pill">{functions.length} 项要求</span></header>
     <p>每项展示计划位置、实际交付映射和验证说明。{delivery?.review_scope === 'definition_followup'
       ? `本轮仅复审补充定义及相关 ${strings(delivery.review_requirement_ids).join('、')} 问题；其他验收项不在本轮范围。`
-      : '代码审查针对整体交付；逐功能独立验证结果尚未单独记录。'}</p>
-    {delivery && <p>{delivery.review_scope === 'definition_followup' ? '补充定义代码复审' : '整体交付代码复审'}：<strong>{stateNames[delivery.review_status] ?? '尚未开始'}</strong> · 本地验收：<strong>{stateNames[delivery.acceptance?.status] ?? '待验收'}</strong></p>}
+      : delivery?.review_scope === 'code_changes' ? '本轮复审覆盖上一轮评审意见和本次代码差异。' : '代码审查针对整体交付；逐功能独立验证结果尚未单独记录。'}</p>
+    {delivery && <p>{delivery.review_scope === 'definition_followup' ? '补充定义代码复审' : delivery.review_scope === 'code_changes' ? '修改复审' : '整体交付代码复审'}：<strong>{stateNames[delivery.review_status] ?? '尚未开始'}</strong> · 本地验收：<strong>{stateNames[delivery.acceptance?.status] ?? '待验收'}</strong></p>}
     {functions.length ? <div className="implementation-function-list">{functions.map((item, index) => <details key={`${item.id}:${index}`}>
       <summary><span><code>{item.id}</code><strong>{item.requirement}</strong></span><span className={`implementation-pill mapping-${item.mapping_status}`}>{mappingNames[item.mapping_status] ?? '待核对映射'}</span></summary>
       <dl className="implementation-fix-fields"><div><dt>计划实现位置</dt><dd>{strings(item.planned_locations).length ? strings(item.planned_locations).map((location, n) => <code key={n}>{location}</code>) : '尚无位置计划'}</dd></div>
@@ -240,11 +237,10 @@ function CodeProgress({ delivery, started, phase, active, runId, workflowId }: {
   const checks = rows(delivery?.acceptance?.smoke).length ? rows(delivery?.acceptance?.smoke) : rows(host?.checks);
   const issues = [...new Set(strings(delivery?.acceptance?.issues).concat(strings(delivery?.issues)))];
   const accepted = delivery?.acceptance?.binding_valid === true && delivery?.acceptance?.status === 'passed';
-  const reviewCount = Object.keys(roles).filter(role => {
-    const votes = reviews.filter(review => review.role === role);
-    return votes.length === 1 && passed(votes[0]);
-  }).length;
-  const currentAction = !active && phase !== 'completed' ? '代码流程已停止，以下为最近执行记录' : host?.label ?? ({ acceptance: '正在核对代码与运行结果', code_review: '正在进行三方独立审核',
+  const review = codeReviewCounts(delivery);
+  const revised = delivery?.code_revision_review_version === 1;
+  const wholeCode = revised || delivery?.whole_code_review_version === 1;
+  const currentAction = !active && phase !== 'completed' ? '代码流程已停止，以下为最近执行记录' : host?.label ?? ({ acceptance: '正在核对代码与运行结果', code_review: '正在进行实际代码独立审核',
     completed: '代码交付流程已完成' }[phase] ?? (delivery?.checkpoint_status === 'completed' ? '代码已返回，等待交付核验' : '正在编写与验证代码'));
   return <section className="implementation-flow-card implementation-execution" aria-label="实际代码交付进度">
     <header><h4><Code2 size={17} />代码实现与验收</h4><span className="implementation-pill">{started ? delivery ? `第 ${Number(delivery.index ?? 0) + 1} 次实现` : '已派发实现' : '待文档审计通过'}</span></header>
@@ -258,7 +254,7 @@ function CodeProgress({ delivery, started, phase, active, runId, workflowId }: {
       <div className="implementation-execution-stats" aria-label="交付与验收概况">
         <div><span>本次代码交付</span><strong>{count ? sourceDelivery ? `${count} 项交付文件` : '旧版完整目录' : '待提交'}</strong><small>{count ? sourceDelivery ? `${selection.runtime_file_count} 项运行源码与配置 · ${selection.test_result_count} 份测试结果` : '历史快照包含开发运行产物，文件数不等于源码数' : '当前仍在编写和检查'}</small></div>
         <div><span>本地验收</span><strong>{accepted ? '已通过' : delivery.acceptance?.present ? '需要修复' : phase === 'acceptance' ? '正在检查' : '待运行'}</strong><small>{phase === 'acceptance' ? host?.label ?? '核对交付与输出契约' : '固定分支与输出检查'}</small></div>
-        <div><span>独立代码审核</span><strong>{reviewCount} / 3</strong><small>同一交付版本的通过票</small></div>
+        <div><span>独立代码审核</span><strong>{review ? `${review.approved} / ${review.expected}` : '协议待核对'}</strong><small>同一交付版本的通过票</small></div>
       </div>
       <CodeWorkspaceAccess key={`${runId}:${workflowId}`} runId={runId} workflowId={workflowId} />
       <div className="implementation-execution-grid">
@@ -275,8 +271,8 @@ function CodeProgress({ delivery, started, phase, active, runId, workflowId }: {
             <strong className={check.passed ? 'is-passed' : 'is-failed'}>{check.passed === true || check.passed === 1 ? '通过' : '未通过'}</strong>
             {typeof check.duration_seconds === 'number' && <small>{Math.round(check.duration_seconds)} 秒</small>}</li>)}</ul>
             : <p className="muted">{phase === 'acceptance' ? '本地检查结果将逐项同步到这里。' : '本次交付完成后，开始固定分支验收。'}</p>}
-          <h5>三方实际代码复审</h5><div className="implementation-reviewers">{reviews.map((review, index) => <ReviewStatus key={`${review.role}:${index}`} review={review} active={active} />)}</div>
-          {!reviews.some(review => review.rationale || hasFindings(review)) && <p className="muted">尚无独立审核结论。验收通过后，三个角色分别核对实际代码。</p>}
+          <h5>{!review ? '代码审核协议待核对' : wholeCode ? '总监与研究员独立代码审核' : '三方实际代码复审'}</h5><div className="implementation-reviewers">{reviews.map((review, index) => <ReviewStatus key={`${review.role}:${index}`} review={review} active={active} />)}</div>
+          {!reviews.some(review => review.rationale || hasFindings(review)) && <p className="muted">{!review ? '当前审核协议或角色记录不一致，等待核对。' : revised ? '总监与研究员分别核对上一轮意见和本次变更。' : wholeCode ? '总监与研究员分别核对同一版本的完整代码，最终意见尚未返回。' : '尚无独立审核结论。验收通过后，三个角色分别核对实际代码。'}</p>}
           {reviews.filter(review => review.rationale || hasFindings(review)).map((review, index) => <details key={`${review.role}:${index}`}><summary><span>{roles[review.role] ?? review.role} · 代码复审意见</span></summary>
             <p>{review.rationale}</p><Findings value={review} /></details>)}
         </div>
@@ -321,8 +317,25 @@ function FlowDisclosure({ label, meta, children }: { label: string; meta?: strin
 
 export function ImplementationFlow({ progress, detail, runId }: { progress: Json; detail?: Json | null; runId: string }) {
   if (progress.run_id !== runId) return null;
+  if (progress.workflow?.review_mode === 'document_code') {
+    if (!detail || detail.identity?.workflow_id !== progress.workflow.id) return <p role="status">正在读取当前版本…</p>;
+    const ballots = (items: unknown) => rows(items).map(vote => <div key={vote.role}>
+      <span>{roles[vote.role]} · {vote.approve === true ? '通过' : stateNames[vote.status] || vote.status}</span>
+      {strings(vote.issues).map((issue,i) => <p key={i}>{issue}</p>)}
+    </div>);
+    return <div className="implementation-flow">
+      <section><h3>实现文档</h3>{detail.document?.document_id
+        ? <IndexedDocument runId={runId} document={detail.document} /> : <p>等待作者提交</p>}
+        {ballots(detail.document_audit?.roles)}</section>
+      <section><h3>代码交付</h3>{detail.code_delivery?.index != null &&
+        <p>第 {Number(detail.code_delivery.index)+1} 版 · {detail.code_delivery.acceptance?.approved ? '本地检查通过' : '本地检查待完成'}</p>}
+        {strings(detail.code_delivery?.acceptance?.issues).map((issue,i) => <p key={i}>{issue}</p>)}
+        {ballots(detail.code_delivery?.reviews)}</section>
+    </div>;
+  }
   const document = detail?.document;
-  const originalAudit = detail?.document_audit?.mode === 'indexed_review' ? detail.document_audit : null;
+  const wholeMode = progress.workflow?.review_mode === 'whole_document';
+  const originalAudit = !wholeMode && detail?.document_audit?.mode === 'indexed_review' ? detail.document_audit : null;
   const audit = originalAudit && (originalAudit.run_id !== runId
     || originalAudit.workflow_id !== progress.workflow?.id || originalAudit.revision !== document?.revision
     || originalAudit.document_id !== document?.document_id || originalAudit.document_sha256 !== document?.sha256
@@ -332,7 +345,7 @@ export function ImplementationFlow({ progress, detail, runId }: { progress: Json
   const authoring = progress.phase === 'document_authoring';
   const reviewing = progress.phase === 'document_review';
   const coding = ['code_generation', 'acceptance', 'code_review', 'completed'].includes(progress.phase);
-  const documentView = document && <DocumentProgress document={document} />;
+  const documentView = document && <DocumentProgress document={document} whole={wholeMode} />;
   const acceptance = progress.workflow?.review_mode === 'acceptance_contract' ? progress.workflow.acceptance : null;
   const definition = detail?.document_audit?.mode === 'definition_repair' && detail.document_audit.run_id === runId
     && detail.document_audit.workflow_id === progress.workflow?.id && detail.document_audit.document_sha256 === document?.sha256
@@ -343,11 +356,11 @@ export function ImplementationFlow({ progress, detail, runId }: { progress: Json
       <ReviewStatus review={review} active={progress.run_status === 'running' && reviewing} />
       {strings(review.issues).map((issue, index) => <p key={index}>{issue}</p>)}
     </div>)}
-  </section> : acceptance ? <AcceptanceProgress value={acceptance} /> : audit && <IndexedReviewProgress audit={audit} runId={runId} active={progress.run_status === 'running' && reviewing} />;
+  </section> : wholeMode ? <WholeDocumentProgress progress={progress} /> : acceptance ? <AcceptanceProgress value={acceptance} /> : audit && <IndexedReviewProgress audit={audit} runId={runId} active={progress.run_status === 'running' && reviewing} />;
   const codeView = <CodeProgress delivery={detail?.code_delivery} started={progress.code_generation_started === true} phase={progress.phase} active={progress.run_status === 'running'} runId={runId} workflowId={progress.workflow?.id} />;
   const cards = [
     { id: 'document', priority: authoring ? 0 : 3, view: documentView && (authoring ? documentView : <FlowDisclosure label="文档撰写与章节" meta={`章节目录 · ${rows(document.sections).length} 项`}>{documentView}</FlowDisclosure>) },
-    { id: 'audit', priority: reviewing ? 0 : 4, view: auditView && (reviewing ? auditView : <FlowDisclosure label="实现文档审核" meta={acceptance?.outcome === 'APPROVED' ? '文档已通过' : acceptance?.outcome ?? stateNames[audit?.status] ?? '待审计'}>{auditView}</FlowDisclosure>) },
+    { id: 'audit', priority: reviewing || wholeMode && authoring ? 0 : 4, view: auditView && (reviewing || wholeMode && authoring ? auditView : <FlowDisclosure label="实现文档审核" meta={acceptance?.outcome === 'APPROVED' ? '文档已通过' : acceptance?.outcome ?? stateNames[audit?.status] ?? '待审计'}>{auditView}</FlowDisclosure>) },
     { id: 'code', priority: coding ? 0 : 5, view: coding || progress.code_generation_started === true ? codeView
       : <FlowDisclosure label="代码实现与验收" meta="待文档审核通过">{codeView}</FlowDisclosure> },
   ].sort((a, b) => a.priority - b.priority);

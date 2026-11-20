@@ -45,14 +45,22 @@ def _without_extra_fields(value, shape):
     return copy.deepcopy(value)
 
 
-def _preserved_design(base, response):
+def _delivery_shape(pending):
+    from .engine import DESIGN
+    if pending.get('context', {}).get('dataset_catalog'):
+        return pending['schema']['properties']['design']
+    return DESIGN
+
+
+def _preserved_design(base, response, pending=None):
     from .engine import DESIGN, ResearchBlocked
     from .intelligence import ProviderError
     from .architecture_integration import apply
     cleaned = copy.deepcopy(response)
-    cleaned['design'] = _without_extra_fields(cleaned.get('design', {}), DESIGN)
+    cleaned['design'] = _without_extra_fields(cleaned.get('design', {}), _delivery_shape(pending or {}))
     try:
-        return apply(base, cleaned, expected_hash=response['integration_base_hash'])
+        return apply(base, cleaned, expected_hash=response['integration_base_hash'],
+                     dataset_catalog=(pending or {}).get('context', {}).get('dataset_catalog'))
     except (ProviderError, ResearchBlocked, TypeError, ValueError) as exc:
         raise ResearchBlocked('原交付除额外字段外仍有无法无歧义映射的错误；不能以结构补正猜测科学参数。') from exc
 
@@ -81,7 +89,7 @@ def _checked(engine, run_id, audit_id, *, audit_record=None):
             or assignment.get('status') != 'completed' or assignment.get('output_hash') != payload.get('response_sha256')
             or digest(engine.store.get('handoff_progress', hid, {})) != payload.get('progress_sha256')
             or payload.get('provider_identity') != _provider_identity(engine.store.get('handoff_progress', hid, {}))
-            or payload.get('preserved_constraints') != _extra_fields(payload.get('response', {}).get('design', {}), DESIGN)):
+            or payload.get('preserved_constraints') != _extra_fields(payload.get('response', {}).get('design', {}), _delivery_shape(pending))):
         raise ResearchBlocked('架构交付补正的原答复、冻结输入或读取回执发生变化。')
     source = check(engine, run_id, pending['context']['integration_audit_id'])
     if (payload.get('base_design') != source['payload']['base_design']
@@ -89,7 +97,7 @@ def _checked(engine, run_id, audit_id, *, audit_record=None):
             or digest(payload.get('base_design')) != payload.get('base_design_hash')):
         raise ResearchBlocked('架构交付补正的原参数基点发生变化。')
     try:
-        preserved = _preserved_design(payload['base_design'], payload['response'])
+        preserved = _preserved_design(payload['base_design'], payload['response'], pending)
     except ResearchBlocked as exc:
         if payload.get('repair_unavailable_reason') != str(exc) or payload.get('preserved_design') is not None:
             raise ResearchBlocked('不可补正交付缺少原始校验诊断。') from exc
@@ -116,10 +124,10 @@ def record_failure(engine, run_id, revision, pending, result, error):
     payload = {'pending': copy.deepcopy(pending), 'response': copy.deepcopy(result),
         'response_sha256': digest(result), 'base_design': copy.deepcopy(source['payload']['base_design']),
         'base_design_hash': source['payload']['base_design_hash'], 'progress_sha256': digest(progress),
-        'diagnostic': str(error), 'preserved_constraints': _extra_fields(result.get('design', {}), DESIGN),
+        'diagnostic': str(error), 'preserved_constraints': _extra_fields(result.get('design', {}), _delivery_shape(pending)),
         'provider_identity': _provider_identity(progress)}
     try:
-        payload['preserved_design'] = _preserved_design(payload['base_design'], result)
+        payload['preserved_design'] = _preserved_design(payload['base_design'], result, pending)
     except ResearchBlocked as exc:
         payload.update(preserved_design=None, repair_unavailable_reason=str(exc))
     audit_id = revision['id'] + ':delivery-validation-v1:' + digest(pending['handoff_id'])
@@ -184,7 +192,9 @@ def activate(engine, h, run_id, revision):
         'acceptance 只允许 criteria、complete、limitations；额外核验条件由宿主附加，模型不改写 evaluation。')
     # STR/STRS are shared constants in the existing schema factory. Bind this
     # request on a deep copy, never mutate another role's output contract.
-    shape = copy.deepcopy(schema())
+    shape = copy.deepcopy(payload['pending']['schema'] if context.get('dataset_catalog') else schema())
+    if context.get('dataset_catalog'):
+        instruction = instruction.replace('architecture、dataset、evaluation', 'architecture、dataset_description、dataset_ref、evaluation')
     for field in ('integration_base_hash', 'proposal_hash', 'parent_design_hash', 'resolved_issue_ids', 'requires_new_consensus', 'unset_paths'):
         shape['properties'][field] = {**shape['properties'][field],
                                       'const': copy.deepcopy(payload['response'][field])}
